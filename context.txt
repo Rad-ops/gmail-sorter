@@ -1,0 +1,55 @@
+Project: Gmail sorter / inbox cleanup
+Repo: /home/rzangeneh/codebase/sorter
+Remote: https://github.com/Rad-ops/gmail-sorter.git
+Branch: main
+Current head: 1106364 (Improve dashboard visuals)
+
+What is already done:
+- Local repo initialized and pushed to GitHub.
+- Gmail API credentials are in `secrets/` and ignored by git.
+- Virtualenv exists at `.venv/` and required Python packages are installed there.
+- Dashboard/reporting was expanded with:
+  - metric cards
+  - ranked bars
+  - action preview
+  - clickable unsubscribe links
+  - unsubscribable domain grouping
+  - attachment review
+  - top sender bulk preview
+- Year-chunked label apply runs completed successfully for:
+  - 2024: 12,102 messages labeled
+  - 2023: 15,653 messages labeled
+  - 2022: 9,192 messages labeled
+  - 2021: 8,610 messages labeled
+  - 2020: 6,340 messages labeled
+- Dry runs were also done for June 2026 and for 2025.
+- Broad single-query runs were too slow / throttled; year-chunking worked reliably.
+
+Current code state:
+- `src/gmail_sorter.py` has uncommitted edits in the working tree.
+- Those edits add:
+  - stronger pre-2020 trash scoring
+  - lower trash threshold for pre-2020 mail
+  - a dedicated pre-2020 aggressive trash section in the dashboard
+  - clickable unsubscribe links
+  - deduped unsubscribe targets grouped by sender domain
+  - unsubscribe prioritization / scoring
+  - a pre-2020 trash threshold CLI flag
+- The repo is currently dirty because of that file change and generated ignored artifacts.
+
+Important runtime notes:
+- Use `.venv/bin/python` for the sorter.
+- Prefer year chunks and conservative worker counts. `--workers 6` and `--sleep 0.1` have been more stable than broader/faster runs.
+- The sorter writes reports to `reports/`, checkpoints to `data/`, and manifests to `manifests/`.
+- Pre-2020 work should be treated as more aggressive trash cleanup, but still respect protected messages / mixed threads / attachments.
+
+Useful commands already validated:
+```bash
+cd /home/rzangeneh/codebase/sorter
+.venv/bin/python src/gmail_sorter.py --help
+```
+
+Suggested next focus:
+- Finish the pre-2020 pass with aggressive trash settings.
+- Keep the unsubscribe dashboard section as the main review surface.
+- If needed, split pre-2020 into smaller year or quarter chunks to avoid Gmail throttling.

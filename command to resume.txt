@@ -1,0 +1,19 @@
+cd /home/rzangeneh/codebase/sorter
+.venv/bin/python src/gmail_sorter.py \
+  --stage trash \
+  --apply \
+  --trash-obvious-ads \
+  --i-understand-trash \
+  --resume \
+  --workers 6 \
+  --sleep 0.1 \
+  --attachment-details \
+  --query "before:2020/01/01 -in:trash" \
+  --out-prefix reports/gmail_sorter_pre_2020_trash \
+  --progress-file data/gmail_sorter_pre_2020_progress.json \
+  --manifest-dir manifests/pre_2020
+
+Notes:
+- This is the aggressive pre-2020 cleanup pass.
+- If Gmail throttles again, reduce workers to 4 and increase sleep to 0.2.
+- Review the dashboard HTML in `reports/` before broadening anything further.

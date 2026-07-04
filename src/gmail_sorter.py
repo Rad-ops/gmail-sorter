@@ -359,10 +359,19 @@ def age_score_boost(message_date: str) -> int:
     except ValueError:
         return 0
     if year < 2020:
-        return 10
+        return 25
     if year < 2023:
         return 5
     return 0
+
+
+def is_before_year(message_date: str, year: int) -> bool:
+    if not message_date:
+        return False
+    try:
+        return int(message_date[:4]) < year
+    except ValueError:
+        return False
 
 
 def list_message_ids(
@@ -518,7 +527,10 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
 
     planned_actions = [f"label:{category}" for category in categories]
     can_archive = not protected and ("Newsletters Bulk" in categories or ad_confidence >= args.ad_threshold)
-    can_trash = not protected and ad_confidence >= args.trash_threshold and "Ads Promotions" in categories
+    trash_threshold = args.pre_2020_trash_threshold if is_before_year(message_date, 2020) else args.trash_threshold
+    can_trash = not protected and ad_confidence >= trash_threshold and "Ads Promotions" in categories
+    if is_before_year(message_date, 2020) and "Ads Promotions" in categories:
+        reasons.append(f"pre_2020_trash_threshold:{trash_threshold}")
     if args.stage in {"archive", "trash"} and can_archive:
         planned_actions.append("archive")
     if args.stage == "trash" and args.trash_obvious_ads and can_trash:
@@ -822,7 +834,30 @@ def extract_unsubscribe_targets(header_value: str) -> list[str]:
     return [target.strip() for target in targets if target.strip()]
 
 
-def render_unsubscribable_domains(items: list[Decision], limit: int = 100) -> str:
+def normalize_unsubscribe_target(target: str) -> str:
+    cleaned = target.strip().strip("<>").strip()
+    if cleaned.lower().startswith("mailto:"):
+        return cleaned.lower()
+    return cleaned.split("#", 1)[0]
+
+
+def render_unsubscribe_target(target: str) -> str:
+    cleaned = normalize_unsubscribe_target(target)
+    lowered = cleaned.lower()
+    if lowered.startswith(("http://", "https://", "mailto:")):
+        return f'<a href="{esc(cleaned)}" target="_blank" rel="noopener noreferrer">{esc(cleaned)}</a>'
+    return esc(cleaned)
+
+
+def unsubscribe_domain_score(entry: dict[str, Any]) -> float:
+    avg_confidence = entry["confidence"] / max(1, entry["count"])
+    duplicate_bonus = max(0, entry["count"] - len(entry["targets"])) * 1.5
+    volume_bonus = min(30, entry["count"] * 0.8)
+    recent_bonus = 8 if entry["latest"] >= "2023-01-01" else 0
+    return min(100.0, avg_confidence * 0.55 + volume_bonus + duplicate_bonus + recent_bonus)
+
+
+def grouped_unsubscribe_domains(items: list[Decision]) -> dict[str, dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for item in items:
         domain = item.sender_domain or "(unknown)"
@@ -843,23 +878,35 @@ def render_unsubscribable_domains(items: list[Decision], limit: int = 100) -> st
         entry["senders"][item.sender] += 1
         entry["subjects"][item.subject] += 1
         for target in extract_unsubscribe_targets(item.list_unsubscribe):
-            entry["targets"][target] += 1
+            entry["targets"][normalize_unsubscribe_target(target)] += 1
+    return grouped
+
+
+def render_unsubscribable_domains(items: list[Decision], limit: int = 100) -> str:
+    grouped = grouped_unsubscribe_domains(items)
 
     rows = []
     def priority(pair: tuple[str, dict[str, Any]]) -> tuple[float, int, str]:
         _, entry = pair
-        avg_confidence = entry["confidence"] / max(1, entry["count"])
-        return (avg_confidence, entry["count"], entry["latest"])
+        return (unsubscribe_domain_score(entry), entry["count"], entry["latest"])
 
     for domain, entry in sorted(grouped.items(), key=priority, reverse=True)[:limit]:
-        targets = "<br>".join(esc(target) for target, _ in entry["targets"].most_common(5))
+        targets = "<br>".join(
+            f"{render_unsubscribe_target(target)} <span class=\"muted-count\">x{count}</span>"
+            for target, count in entry["targets"].most_common(5)
+        )
         senders = "<br>".join(esc(sender) for sender, _ in entry["senders"].most_common(3))
         samples = "<br>".join(esc(subject) for subject, _ in entry["subjects"].most_common(3))
         avg_confidence = entry["confidence"] / max(1, entry["count"])
+        duplicate_count = max(0, entry["count"] - len(entry["targets"]))
+        score = unsubscribe_domain_score(entry)
         rows.append(
             "<tr>"
             f"<td>{esc(domain)}</td>"
+            f"<td><span class=\"score {'high' if score >= 75 else 'medium' if score >= 50 else 'low'}\">{score:.0f}</span></td>"
             f"<td>{esc(entry['count'])}</td>"
+            f"<td>{esc(len(entry['targets']))}</td>"
+            f"<td>{esc(duplicate_count)}</td>"
             f"<td>{avg_confidence:.1f}</td>"
             f"<td>{esc(entry['latest'])}</td>"
             f"<td>{senders}</td>"
@@ -869,10 +916,39 @@ def render_unsubscribable_domains(items: list[Decision], limit: int = 100) -> st
         )
     return (
         "<table><thead><tr>"
-        "<th>Domain</th><th>Messages</th><th>Avg Ad Confidence</th><th>Last Seen</th><th>Senders</th><th>Unsubscribe Links</th><th>Sample Subjects</th>"
+        "<th>Domain</th><th>Score</th><th>Messages</th><th>Unique Links</th><th>Duplicate Headers</th><th>Avg Ad Confidence</th><th>Last Seen</th><th>Senders</th><th>Clickable Unsubscribe Links</th><th>Sample Subjects</th>"
         "</tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
+    )
+
+
+def render_unsubscribe_priority(items: list[Decision], limit: int = 20) -> str:
+    grouped = grouped_unsubscribe_domains(items)
+    rows = []
+    for domain, entry in sorted(
+        grouped.items(),
+        key=lambda pair: (unsubscribe_domain_score(pair[1]), pair[1]["count"], pair[1]["latest"]),
+        reverse=True,
+    )[:limit]:
+        score = unsubscribe_domain_score(entry)
+        top_target = entry["targets"].most_common(1)[0][0] if entry["targets"] else ""
+        rows.append(
+            "<tr>"
+            f"<td>{esc(domain)}</td>"
+            f"<td><span class=\"score {'high' if score >= 75 else 'medium' if score >= 50 else 'low'}\">{score:.0f}</span></td>"
+            f"<td>{esc(entry['count'])}</td>"
+            f"<td>{esc(len(entry['targets']))}</td>"
+            f"<td>{esc(entry['latest'])}</td>"
+            f"<td>{render_unsubscribe_target(top_target)}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class=\"table-wrap priority\"><table><thead><tr>"
+        "<th>Domain</th><th>Unsubscribe Score</th><th>Messages</th><th>Unique Links</th><th>Last Seen</th><th>Best Link</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
     )
 
 
@@ -977,6 +1053,11 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
     high_confidence = sum(1 for item in decisions if item.ad_confidence >= 85)
     archive_count = sum(1 for item in decisions if "archive" in item.planned_actions)
     trash_count = sum(1 for item in decisions if "trash" in item.planned_actions)
+    pre_2020_trash_items = [
+        item for item in decisions if is_before_year(item.date, 2020) and "trash" in item.planned_actions
+    ]
+    unsubscribe_grouped = grouped_unsubscribe_domains(unsubscribe_items)
+    unsubscribe_duplicate_headers = sum(max(0, entry["count"] - len(entry["targets"])) for entry in unsubscribe_grouped.values())
 
     stat_cards = [
         render_metric_card("Messages", total, None, "neutral"),
@@ -985,6 +1066,8 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
         render_metric_card("Protected", protected_count, total, "safe"),
         render_metric_card("Attachments", len(attachment_items), total, "neutral"),
         render_metric_card("Unsubscribe Domains", len({item.sender_domain for item in unsubscribe_items}), None, "accent"),
+        render_metric_card("Deduped Unsub Headers", unsubscribe_duplicate_headers, len(unsubscribe_items) or None, "accent"),
+        render_metric_card("Pre-2020 Trash", len(pre_2020_trash_items), total, "danger"),
     ]
     cards_html = "".join(stat_cards)
     category_html = render_rank_list(category_counts.most_common(), total, "accent")
@@ -1014,6 +1097,7 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
     th{background:#edf2f7;color:#334155;position:sticky;top:0;z-index:1;font-size:12px;text-transform:uppercase;letter-spacing:.04em}tr:hover td{background:#fafcff}
     .pill{display:inline-block;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:999px;padding:2px 7px;margin:1px 3px 1px 0;font-size:12px;white-space:nowrap}
     .score,.status{display:inline-flex;align-items:center;justify-content:center;min-width:40px;border-radius:999px;padding:3px 8px;font-weight:700;font-variant-numeric:tabular-nums}.score.high{background:#fee2e2;color:#991b1b}.score.medium{background:#fef3c7;color:#92400e}.score.low{background:#dcfce7;color:#166534}.status.yes{background:#e0f2fe;color:#075985}.status.no{background:#f1f5f9;color:#475569}
+    a{color:#1d4ed8;text-decoration:none;overflow-wrap:anywhere}a:hover{text-decoration:underline}.muted-count{color:#64748b;font-size:12px}.priority table{min-width:760px}
     @media(max-width:720px){header,main{padding-left:16px;padding-right:16px}.metric span{font-size:28px}table{min-width:760px}}
     """
     path.write_text(
@@ -1034,12 +1118,16 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 <h2 class="section-title danger-text">Trash / Thread Review</h2>
 <p class="note">Review these before running the trash stage. Mixed threads and protected items are kept out of trash actions.</p>
 {render_table(trash_items, ["ad_confidence", "review_priority", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
+<h2 class="section-title danger-text">Pre-2020 Aggressive Trash Candidates</h2>
+<p class="note">Older promotional mail uses a lower trash threshold and stronger age boost, while still respecting protected messages and mixed-thread protection.</p>
+{render_table(pre_2020_trash_items, ["date", "ad_confidence", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
 <h2 class="section-title">Protected Ad Review</h2>
 {render_table(protected_ads, ["ad_confidence", "sender_domain", "subject", "categories", "negative_reasons"], 100)}
 <h2 class="section-title">Attachment Review</h2>
 {render_table(attachment_items, ["date", "sender_domain", "subject", "categories", "ad_confidence", "attachment_names", "attachment_mime_types"], 100)}
 <h2 class="section-title">Unsubscribable Domains</h2>
 <p class="note">Grouped by sender domain with extracted List-Unsubscribe targets, prioritized by ad confidence, volume, and last-seen date. Review these before manually unsubscribing.</p>
+{render_unsubscribe_priority(unsubscribe_items, 20)}
 {render_unsubscribable_domains(unsubscribe_items, 100)}
 <h2 class="section-title">Unsubscribe Candidates</h2>
 {render_table(unsubscribe_items, ["sender_domain", "sender", "subject", "ad_confidence", "list_unsubscribe"], 100)}
@@ -1062,6 +1150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--ad-threshold", type=int, default=65)
     parser.add_argument("--trash-threshold", type=int, default=90)
+    parser.add_argument("--pre-2020-trash-threshold", type=int, default=75)
     parser.add_argument("--stage", choices=["classify", "label", "archive", "trash"], default="classify")
     parser.add_argument("--workers", type=int, default=8, help="Parallel read/classification workers. Writes remain sequential.")
     parser.add_argument("--batch-size", type=int, default=100)
