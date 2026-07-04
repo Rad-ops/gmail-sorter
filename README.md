@@ -1,6 +1,6 @@
 # Gmail Sorter
 
-Dashboard-centered Gmail cleanup tool for older mail. It scans messages before 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
+Dashboard-centered Gmail cleanup tool for older mail. It scans messages before December 30, 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
 
 ## Folder Layout
 

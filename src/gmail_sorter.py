@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage-based Gmail sorter for pre-2025 mail.
+"""Stage-based Gmail sorter for mail before December 30, 2025.
 
 Default mode is a dry-run classification pass. The HTML dashboard is the main
 review surface; use it before running any --apply stage.
@@ -26,7 +26,7 @@ from typing import Any
 
 READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
-DEFAULT_QUERY = "before:2025/01/01 -in:trash"
+DEFAULT_QUERY = "before:2025/12/30 -in:trash"
 ROOT_LABEL = "Sorter"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 
@@ -987,7 +987,7 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Categorize Gmail messages before 2025 with dashboard-centered review.")
+    parser = argparse.ArgumentParser(description="Categorize Gmail messages before December 30, 2025 with dashboard-centered review.")
     parser.add_argument("--credentials", default=str(PROJECT_DIR / "secrets" / "credentials.json"))
     parser.add_argument("--token-readonly", default=str(PROJECT_DIR / "secrets" / "token_sorter_readonly.json"))
     parser.add_argument("--token-modify", default=str(PROJECT_DIR / "secrets" / "token_sorter_modify.json"))
