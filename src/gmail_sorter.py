@@ -811,6 +811,10 @@ def esc(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
+def pct(part: int | float, total: int | float) -> float:
+    return 0.0 if not total else (float(part) / float(total)) * 100
+
+
 def extract_unsubscribe_targets(header_value: str) -> list[str]:
     targets = re.findall(r"<([^>]+)>", header_value)
     if not targets and header_value:
@@ -913,10 +917,48 @@ def render_table(items: list[Decision], columns: list[str], limit: int = 50) -> 
             value = data[column]
             if isinstance(value, list):
                 value = ", ".join(str(part) for part in value)
-            cells.append(f"<td>{esc(value)}</td>")
+            cells.append(f"<td>{render_cell(column, value)}</td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
     headers = "".join(f"<th>{esc(column.replace('_', ' ').title())}</th>" for column in columns)
-    return f"<table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    return f"<div class=\"table-wrap\"><table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+
+
+def render_cell(column: str, value: Any) -> str:
+    if isinstance(value, list):
+        if column in {"categories", "planned_actions", "reasons", "negative_reasons"}:
+            return "".join(f"<span class=\"pill\">{esc(part)}</span>" for part in value)
+        value = ", ".join(str(part) for part in value)
+    if column in {"ad_confidence", "avg_ad_confidence"}:
+        try:
+            score = float(value)
+            level = "high" if score >= 85 else "medium" if score >= 65 else "low"
+            return f"<span class=\"score {level}\">{score:.0f}</span>"
+        except (TypeError, ValueError):
+            return esc(value)
+    if column in {"protected", "has_attachment"}:
+        return f"<span class=\"status {'yes' if value else 'no'}\">{esc(value)}</span>"
+    return esc(value)
+
+
+def render_metric_card(label: str, value: int | str, total: int | None = None, tone: str = "neutral") -> str:
+    bar = ""
+    if total:
+        width = min(100, max(0, pct(int(value), total))) if isinstance(value, int) else 0
+        bar = f"<div class=\"bar\"><span class=\"{tone}\" style=\"width:{width:.1f}%\"></span></div>"
+    return f"<section class=\"metric {tone}\"><strong>{esc(label)}</strong><span>{esc(value)}</span>{bar}</section>"
+
+
+def render_rank_list(items: list[tuple[str, int]], total: int, tone: str = "neutral", limit: int = 12) -> str:
+    rows = []
+    for name, count in items[:limit]:
+        width = min(100, max(2, pct(count, total)))
+        rows.append(
+            "<li>"
+            f"<div><span>{esc(name)}</span><b>{count}</b></div>"
+            f"<em><i class=\"{tone}\" style=\"width:{width:.1f}%\"></i></em>"
+            "</li>"
+        )
+    return "<ul class=\"rank-list\">" + "".join(rows) + "</ul>"
 
 
 def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namespace) -> None:
@@ -929,57 +971,79 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
     attachment_items = [item for item in decisions if item.has_attachment]
     unsubscribe_items = [item for item in decisions if item.list_unsubscribe]
     top_noisy = sender_counts.most_common(20)
+    total = len(decisions)
+    ad_count = category_counts["Ads Promotions"]
+    protected_count = sum(1 for item in decisions if item.protected)
+    high_confidence = sum(1 for item in decisions if item.ad_confidence >= 85)
+    archive_count = sum(1 for item in decisions if "archive" in item.planned_actions)
+    trash_count = sum(1 for item in decisions if "trash" in item.planned_actions)
 
     stat_cards = [
-        ("Messages", len(decisions)),
-        ("Ad/Promo", category_counts["Ads Promotions"]),
-        ("Trash Review", len(trash_items)),
-        ("Protected Ad Review", len(protected_ads)),
-        ("Attachments", len(attachment_items)),
-        ("Unsubscribe Sources", len({item.sender_domain for item in unsubscribe_items})),
+        render_metric_card("Messages", total, None, "neutral"),
+        render_metric_card("Ad/Promo", ad_count, total, "warn"),
+        render_metric_card("High Confidence Ads", high_confidence, total, "danger"),
+        render_metric_card("Protected", protected_count, total, "safe"),
+        render_metric_card("Attachments", len(attachment_items), total, "neutral"),
+        render_metric_card("Unsubscribe Domains", len({item.sender_domain for item in unsubscribe_items}), None, "accent"),
     ]
-    cards_html = "".join(f"<section><strong>{esc(label)}</strong><span>{esc(value)}</span></section>" for label, value in stat_cards)
-    category_html = "".join(f"<li><span>{esc(name)}</span><b>{count}</b></li>" for name, count in category_counts.most_common())
-    sender_html = "".join(f"<li><span>{esc(name)}</span><b>{count}</b></li>" for name, count in top_noisy)
-    review_html = "".join(f"<li><span>{esc(name)}</span><b>{count}</b></li>" for name, count in review_counts.most_common())
+    cards_html = "".join(stat_cards)
+    category_html = render_rank_list(category_counts.most_common(), total, "accent")
+    sender_html = render_rank_list(top_noisy, total, "warn")
+    review_html = render_rank_list(review_counts.most_common(), total, "safe")
+    action_html = render_rank_list(
+        [("Would label", total), ("Would archive", archive_count), ("Would trash", trash_count), ("Protected", protected_count)],
+        total,
+        "danger",
+    )
 
     css = """
-    body{font-family:Inter,Arial,sans-serif;margin:0;background:#f6f7f9;color:#1f2933}
-    header{background:#17202a;color:white;padding:24px 32px} h1{margin:0 0 8px;font-size:28px}
-    main{padding:24px 32px;max-width:1400px;margin:auto}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
-    section{background:white;border:1px solid #d8dee6;border-radius:8px;padding:16px}section span{display:block;font-size:28px;margin-top:8px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin:18px 0}
-    ul{list-style:none;margin:0;padding:0}li{display:flex;justify-content:space-between;border-bottom:1px solid #edf0f3;padding:8px 0}
-    table{width:100%;border-collapse:collapse;background:white;margin:12px 0 28px}th,td{border-bottom:1px solid #e5e9ef;padding:8px;text-align:left;vertical-align:top;font-size:13px}
-    th{background:#edf2f7;position:sticky;top:0}.note{color:#4b5563}.danger{color:#a11d1d}
+    :root{--bg:#f3f5f7;--panel:#fff;--line:#d9e0e7;--text:#1f2933;--muted:#657181;--ink:#18212f;--accent:#2563eb;--warn:#d97706;--danger:#c2410c;--safe:#0f766e}
+    *{box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;margin:0;background:var(--bg);color:var(--text);letter-spacing:0}
+    header{background:#111827;color:white;padding:28px 32px 22px;border-bottom:4px solid #f59e0b}
+    header h1{margin:0 0 8px;font-size:30px;font-weight:750}header .meta{color:#cbd5e1;font-size:14px;line-height:1.5}
+    main{padding:24px 32px;max-width:1520px;margin:auto}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:18px}
+    .metric,.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+    .metric{padding:16px;min-height:118px}.metric strong{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.metric span{display:block;font-size:34px;font-weight:760;margin:10px 0 12px;color:var(--ink)}
+    .bar, .rank-list em{display:block;height:8px;background:#e8edf3;border-radius:999px;overflow:hidden}.bar span,.rank-list i{display:block;height:100%;border-radius:999px}
+    .accent{background:var(--accent)}.warn{background:var(--warn)}.danger{background:var(--danger)}.safe{background:var(--safe)}.neutral{background:#475569}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin:18px 0}.panel{padding:16px}.panel h2{font-size:16px;margin:0 0 12px;color:var(--ink)}
+    .rank-list{list-style:none;margin:0;padding:0}.rank-list li{border-top:1px solid #edf1f5;padding:10px 0}.rank-list li:first-child{border-top:0}.rank-list div{display:flex;justify-content:space-between;gap:12px;font-size:14px}.rank-list span{overflow-wrap:anywhere}.rank-list b{font-variant-numeric:tabular-nums;color:var(--ink)}
+    h2.section-title{font-size:19px;margin:30px 0 6px;color:var(--ink)}.note{color:var(--muted);margin:0 0 10px;font-size:14px}.danger-text{color:#9a3412}
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px;background:white;margin:12px 0 28px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+    table{width:100%;border-collapse:collapse;min-width:900px}th,td{border-bottom:1px solid #e7ecf1;padding:10px 11px;text-align:left;vertical-align:top;font-size:13px;line-height:1.35}
+    th{background:#edf2f7;color:#334155;position:sticky;top:0;z-index:1;font-size:12px;text-transform:uppercase;letter-spacing:.04em}tr:hover td{background:#fafcff}
+    .pill{display:inline-block;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:999px;padding:2px 7px;margin:1px 3px 1px 0;font-size:12px;white-space:nowrap}
+    .score,.status{display:inline-flex;align-items:center;justify-content:center;min-width:40px;border-radius:999px;padding:3px 8px;font-weight:700;font-variant-numeric:tabular-nums}.score.high{background:#fee2e2;color:#991b1b}.score.medium{background:#fef3c7;color:#92400e}.score.low{background:#dcfce7;color:#166534}.status.yes{background:#e0f2fe;color:#075985}.status.no{background:#f1f5f9;color:#475569}
+    @media(max-width:720px){header,main{padding-left:16px;padding-right:16px}.metric span{font-size:28px}table{min-width:760px}}
     """
     path.write_text(
         f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Gmail Sorter Dashboard</title><style>{css}</style></head>
-<body><header><h1>Gmail Sorter Dashboard</h1><div>Query: {esc(args.query)} | Stage: {esc(args.stage)} | Apply: {esc(args.apply)}</div></header>
+<body><header><h1>Gmail Sorter Dashboard</h1><div class="meta">Query: {esc(args.query)}<br>Stage: {esc(args.stage)} | Apply: {esc(args.apply)} | Messages: {total}</div></header>
 <main>
 <div class="cards">{cards_html}</div>
 <div class="grid">
-<section><h2>Review Queues</h2><ul>{review_html}</ul></section>
-<section><h2>Categories</h2><ul>{category_html}</ul></section>
-<section><h2>Noisy Senders</h2><ul>{sender_html}</ul></section>
+<section class="panel"><h2>Review Queues</h2>{review_html}</section>
+<section class="panel"><h2>Categories</h2>{category_html}</section>
+<section class="panel"><h2>Noisy Senders</h2>{sender_html}</section>
+<section class="panel"><h2>Action Preview</h2>{action_html}</section>
 </div>
-<h2>Top Sender Bulk Preview</h2>
+<h2 class="section-title">Top Sender Bulk Preview</h2>
 <p class="note">Shows the impact of archive/trash decisions by sender domain before you apply a stage.</p>
 {render_bulk_preview(decisions, 50)}
-<h2 class="danger">Trash / Thread Review</h2>
+<h2 class="section-title danger-text">Trash / Thread Review</h2>
 <p class="note">Review these before running the trash stage. Mixed threads and protected items are kept out of trash actions.</p>
 {render_table(trash_items, ["ad_confidence", "review_priority", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
-<h2>Protected Ad Review</h2>
+<h2 class="section-title">Protected Ad Review</h2>
 {render_table(protected_ads, ["ad_confidence", "sender_domain", "subject", "categories", "negative_reasons"], 100)}
-<h2>Attachment Review</h2>
+<h2 class="section-title">Attachment Review</h2>
 {render_table(attachment_items, ["date", "sender_domain", "subject", "categories", "ad_confidence", "attachment_names", "attachment_mime_types"], 100)}
-<h2>Unsubscribable Domains</h2>
+<h2 class="section-title">Unsubscribable Domains</h2>
 <p class="note">Grouped by sender domain with extracted List-Unsubscribe targets, prioritized by ad confidence, volume, and last-seen date. Review these before manually unsubscribing.</p>
 {render_unsubscribable_domains(unsubscribe_items, 100)}
-<h2>Unsubscribe Candidates</h2>
+<h2 class="section-title">Unsubscribe Candidates</h2>
 {render_table(unsubscribe_items, ["sender_domain", "sender", "subject", "ad_confidence", "list_unsubscribe"], 100)}
-<h2>Recent Sample</h2>
+<h2 class="section-title">Recent Sample</h2>
 {render_table(decisions, ["date", "ad_confidence", "review_priority", "sender_domain", "subject", "categories", "planned_actions"], 100)}
 </main></body></html>""",
         encoding="utf-8",
