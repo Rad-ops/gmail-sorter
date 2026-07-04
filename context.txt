@@ -26,8 +26,9 @@ What is already done:
 - Broad single-query runs were too slow / throttled; year-chunking worked reliably.
 
 Current code state:
-- `src/gmail_sorter.py` has uncommitted edits in the working tree.
-- Those edits add:
+- The handoff and unsubscribe-scoring changes are committed and pushed.
+- Latest commit at shutdown: f11f99a (Add handoff files and unsubscribe scoring)
+- The committed code includes:
   - stronger pre-2020 trash scoring
   - lower trash threshold for pre-2020 mail
   - a dedicated pre-2020 aggressive trash section in the dashboard
@@ -35,7 +36,7 @@ Current code state:
   - deduped unsubscribe targets grouped by sender domain
   - unsubscribe prioritization / scoring
   - a pre-2020 trash threshold CLI flag
-- The repo is currently dirty because of that file change and generated ignored artifacts.
+- The tracked worktree should be clean. Generated reports, checkpoints, manifests, secrets, and `.venv/` are intentionally ignored and remain local.
 
 Important runtime notes:
 - Use `.venv/bin/python` for the sorter.
