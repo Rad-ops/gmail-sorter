@@ -1,0 +1,2 @@
+# One sender email or domain per line. Anything listed here is treated as junk unless protected.
+# promo.example.com

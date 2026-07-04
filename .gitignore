@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Gmail OAuth secrets and generated tokens.
+secrets/*.json
+!secrets/.gitkeep
+
+# Generated mailbox data. These can contain private email metadata.
+reports/*
+manifests/*
+data/*
+!reports/.gitkeep
+!manifests/.gitkeep
+!data/.gitkeep
+*.csv
+*.html

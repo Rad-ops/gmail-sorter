@@ -1,0 +1,1094 @@
+#!/usr/bin/env python3
+"""Stage-based Gmail sorter for pre-2025 mail.
+
+Default mode is a dry-run classification pass. The HTML dashboard is the main
+review surface; use it before running any --apply stage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import html
+import json
+import re
+import sys
+import threading
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from email.utils import getaddresses, parsedate_to_datetime
+from pathlib import Path
+from typing import Any
+
+
+READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+DEFAULT_QUERY = "before:2025/01/01 -in:trash"
+ROOT_LABEL = "Sorter"
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+
+AD_SUBJECT_KEYWORDS = [
+    "sale",
+    "deal",
+    "deals",
+    "discount",
+    "promo",
+    "promotion",
+    "coupon",
+    "offer",
+    "limited time",
+    "save ",
+    "% off",
+    "free shipping",
+    "clearance",
+    "flash sale",
+    "black friday",
+    "cyber monday",
+    "newsletter",
+    "new arrivals",
+    "just dropped",
+    "shop now",
+    "last chance",
+    "ends tonight",
+    "exclusive",
+]
+
+AD_BODY_KEYWORDS = [
+    "unsubscribe",
+    "manage preferences",
+    "email preferences",
+    "view in browser",
+    "view this email in your browser",
+    "you are receiving this email because",
+    "marketing email",
+    "promotional email",
+    "privacy policy",
+]
+
+AD_SENDER_KEYWORDS = ["newsletter", "marketing", "promo", "promotions", "offers", "deals"]
+
+TRANSACTIONAL_KEYWORDS = [
+    "2fa",
+    "account alert",
+    "appointment",
+    "bank",
+    "bill",
+    "booking",
+    "code",
+    "confirm your email",
+    "delivery",
+    "document",
+    "e-transfer",
+    "invoice",
+    "login",
+    "mfa",
+    "order",
+    "password",
+    "payment",
+    "payroll",
+    "receipt",
+    "refund",
+    "reset",
+    "security",
+    "shipment",
+    "shipped",
+    "statement",
+    "tax",
+    "ticket",
+    "transaction",
+    "verification",
+    "verify",
+]
+
+IMPORTANT_LABELS = {"CATEGORY_PRIMARY", "STARRED", "IMPORTANT"}
+PROTECTED_CATEGORIES = {
+    "Account Security",
+    "Finance",
+    "Government Legal",
+    "Health",
+    "Insurance",
+    "Receipts Orders",
+    "Utilities",
+}
+
+CATEGORY_RULES = [
+    ("Finance", ["bank", "credit card", "debit", "statement", "payment", "payroll", "invoice", "tax", "cra", "irs", "etransfer", "e-transfer"]),
+    ("Receipts Orders", ["receipt", "order", "purchase", "shipment", "shipped", "delivered", "delivery", "tracking", "refund", "return"]),
+    ("Account Security", ["password", "reset", "verification", "verify", "security alert", "new login", "sign-in", "2fa", "mfa", "authentication", "code"]),
+    ("Travel", ["flight", "airline", "hotel", "reservation", "booking", "boarding", "itinerary", "rental car", "airbnb", "uber", "lyft"]),
+    ("Health", ["appointment", "clinic", "doctor", "dentist", "pharmacy", "prescription", "medical", "health"]),
+    ("Government Legal", ["government", "court", "legal", "visa", "immigration", "passport", "license", "notice"]),
+    ("Work School", ["meeting", "calendar", "deadline", "project", "assignment", "university", "college", "school", "course", "class"]),
+    ("Social", ["facebook", "instagram", "linkedin", "twitter", "x.com", "reddit", "discord", "snapchat", "tiktok"]),
+    ("Subscriptions", ["subscription", "renewal", "membership", "plan", "trial", "billing cycle"]),
+    ("Shopping", ["cart", "wishlist", "store", "shop", "retailer", "coupon", "discount"]),
+    ("Job Search", ["application", "resume", "interview", "recruiter", "job alert", "candidate", "position"]),
+    ("Housing", ["rent", "lease", "landlord", "tenant", "mortgage", "property", "apartment", "condo"]),
+    ("Utilities", ["utility", "hydro", "internet", "mobile", "phone bill", "electricity", "gas bill"]),
+    ("Insurance", ["insurance", "policy", "claim", "premium", "coverage"]),
+    ("Crypto Finance Risk", ["crypto", "bitcoin", "ethereum", "wallet", "exchange", "trading"]),
+    ("Old Account Evidence", ["welcome to", "confirm your account", "activate your account", "account created", "username", "registered"]),
+]
+
+
+@dataclass
+class Config:
+    allow_domains: set[str] = field(default_factory=set)
+    block_domains: set[str] = field(default_factory=set)
+    allow_senders: set[str] = field(default_factory=set)
+    block_senders: set[str] = field(default_factory=set)
+
+
+@dataclass
+class Decision:
+    message_id: str
+    thread_id: str
+    date: str
+    sender: str
+    sender_email: str
+    sender_domain: str
+    subject: str
+    snippet: str
+    existing_labels: list[str] = field(default_factory=list)
+    categories: list[str] = field(default_factory=list)
+    ad_confidence: int = 0
+    reasons: list[str] = field(default_factory=list)
+    negative_reasons: list[str] = field(default_factory=list)
+    planned_actions: list[str] = field(default_factory=list)
+    has_attachment: bool = False
+    list_unsubscribe: str = ""
+    attachment_names: list[str] = field(default_factory=list)
+    attachment_mime_types: list[str] = field(default_factory=list)
+    protected: bool = False
+    review_priority: str = "normal"
+    action_done: str = "no"
+    scanned_at: str = ""
+
+
+class AdaptiveThrottle:
+    def __init__(self, base_sleep: float, max_sleep: float = 10.0) -> None:
+        self.base_sleep = max(0.0, base_sleep)
+        self.current_sleep = self.base_sleep
+        self.max_sleep = max_sleep
+        self.lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self.lock:
+            delay = self.current_sleep
+        if delay:
+            time.sleep(delay)
+
+    def record_success(self) -> None:
+        with self.lock:
+            if self.current_sleep > self.base_sleep:
+                self.current_sleep = max(self.base_sleep, self.current_sleep * 0.85)
+
+    def record_retryable_error(self) -> None:
+        with self.lock:
+            self.current_sleep = min(self.max_sleep, max(0.25, self.current_sleep * 2 or 0.25))
+
+
+def load_google_libraries() -> tuple[Any, Any, Any, Any, Any]:
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
+    except ImportError as error:
+        raise SystemExit("Missing Google API packages. Run: python -m pip install -r requirements.txt") from error
+    return Request, Credentials, InstalledAppFlow, build, HttpError
+
+
+def get_credentials(credentials_path: Path, token_path: Path, scopes: list[str], open_browser: bool, google_libs: tuple[Any, Any, Any, Any, Any]) -> Any:
+    Request, Credentials, InstalledAppFlow, _, _ = google_libs
+    creds = None
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not credentials_path.exists():
+                raise FileNotFoundError(f"Missing {credentials_path}")
+            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), scopes)
+            creds = flow.run_local_server(port=0, open_browser=open_browser)
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+    return creds
+
+
+def load_list(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    items = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip().lower()
+        if line and not line.startswith("#"):
+            items.add(line)
+    return items
+
+
+def load_config(allowlist: Path, blocklist: Path) -> Config:
+    allow = load_list(allowlist)
+    block = load_list(blocklist)
+    return Config(
+        allow_domains={item for item in allow if "@" not in item},
+        block_domains={item for item in block if "@" not in item},
+        allow_senders={item for item in allow if "@" in item},
+        block_senders={item for item in block if "@" in item},
+    )
+
+
+def ensure_default_config_files(allowlist: Path, blocklist: Path) -> None:
+    if not allowlist.exists():
+        allowlist.write_text(
+            "# One sender email or domain per line. Anything listed here is protected from archive/trash.\n"
+            "# example-bank.com\n"
+            "# person@example.com\n",
+            encoding="utf-8",
+        )
+    if not blocklist.exists():
+        blocklist.write_text(
+            "# One sender email or domain per line. Anything listed here is treated as junk unless protected.\n"
+            "# promo.example.com\n",
+            encoding="utf-8",
+        )
+
+
+def execute_with_retries(
+    request: Any,
+    retries: int,
+    retry_sleep: float,
+    throttle: AdaptiveThrottle | None = None,
+) -> dict[str, Any]:
+    for attempt in range(retries + 1):
+        try:
+            if throttle:
+                throttle.wait()
+            response = request.execute()
+            if throttle:
+                throttle.record_success()
+            return response
+        except Exception as error:
+            lowered = str(error).lower()
+            retryable = (
+                "429" in lowered
+                or ("403" in lowered and "quota" in lowered)
+                or "rate" in lowered
+                or "quota exceeded" in lowered
+                or "backenderror" in lowered
+                or "temporarily unavailable" in lowered
+            )
+            if attempt >= retries or not retryable:
+                raise
+            if throttle:
+                throttle.record_retryable_error()
+            delay = retry_sleep * (2**attempt)
+            print(f"Retryable Gmail API error; sleeping {delay:.1f}s...", file=sys.stderr)
+            time.sleep(delay)
+    raise RuntimeError("unreachable retry state")
+
+
+def header_map(payload: dict[str, Any]) -> dict[str, str]:
+    return {item.get("name", "").lower(): item.get("value", "") for item in payload.get("headers", [])}
+
+
+def parse_sender(address: str) -> tuple[str, str]:
+    parsed = getaddresses([address])
+    email = parsed[0][1].lower() if parsed else ""
+    domain = email.rsplit("@", 1)[1].strip(".") if "@" in email else ""
+    return email, domain
+
+
+def parse_date(raw_date: str, internal_date: str | None) -> str:
+    try:
+        dt = parsedate_to_datetime(raw_date)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).date().isoformat()
+    except Exception:
+        pass
+    if internal_date:
+        try:
+            return datetime.fromtimestamp(int(internal_date) / 1000, tz=timezone.utc).date().isoformat()
+        except Exception:
+            return ""
+    return ""
+
+
+def contains_any(text: str, keywords: list[str]) -> list[str]:
+    lowered = text.lower()
+    return [keyword for keyword in keywords if keyword in lowered]
+
+
+def payload_has_attachment(payload: dict[str, Any]) -> bool:
+    filename = payload.get("filename") or ""
+    body = payload.get("body", {})
+    if filename or body.get("attachmentId"):
+        return True
+    return any(payload_has_attachment(part) for part in payload.get("parts", []) or [])
+
+
+def collect_attachment_details(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
+    names: list[str] = []
+    mime_types: list[str] = []
+    filename = payload.get("filename") or ""
+    body = payload.get("body", {})
+    if filename or body.get("attachmentId"):
+        if filename:
+            names.append(filename)
+        mime_type = payload.get("mimeType") or ""
+        if mime_type:
+            mime_types.append(mime_type)
+    for part in payload.get("parts", []) or []:
+        child_names, child_mime_types = collect_attachment_details(part)
+        names.extend(child_names)
+        mime_types.extend(child_mime_types)
+    return sorted(set(names)), sorted(set(mime_types))
+
+
+def age_score_boost(message_date: str) -> int:
+    if not message_date:
+        return 0
+    try:
+        year = int(message_date[:4])
+    except ValueError:
+        return 0
+    if year < 2020:
+        return 10
+    if year < 2023:
+        return 5
+    return 0
+
+
+def list_message_ids(
+    service: Any,
+    query: str,
+    max_messages: int | None,
+    retries: int,
+    retry_sleep: float,
+    throttle: AdaptiveThrottle | None = None,
+) -> list[str]:
+    ids: list[str] = []
+    page_token = None
+    while True:
+        response = execute_with_retries(
+            service.users().messages().list(userId="me", q=query or None, pageToken=page_token, maxResults=500),
+            retries,
+            retry_sleep,
+            throttle,
+        )
+        ids.extend(item["id"] for item in response.get("messages", []))
+        if max_messages and len(ids) >= max_messages:
+            return ids[:max_messages]
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return ids
+
+
+def get_message_metadata(
+    service: Any,
+    message_id: str,
+    retries: int,
+    retry_sleep: float,
+    throttle: AdaptiveThrottle | None = None,
+    include_attachment_details: bool = False,
+) -> dict[str, Any]:
+    return execute_with_retries(
+        service.users().messages().get(
+            userId="me",
+            id=message_id,
+            format="full" if include_attachment_details else "metadata",
+            metadataHeaders=["From", "Subject", "Date", "List-Unsubscribe", "List-Id", "Precedence", "X-Campaign", "X-Mailer"],
+        ),
+        retries,
+        retry_sleep,
+        throttle,
+    )
+
+
+def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_domain: str, subject: str, snippet: str, config: Config) -> tuple[int, list[str], list[str]]:
+    searchable = " ".join([sender, sender_domain, subject, snippet])
+    score = 0
+    reasons: list[str] = []
+    negative_reasons: list[str] = []
+
+    if sender_domain in config.block_domains:
+        score += 60
+        reasons.append("blocklisted_domain")
+    sender_email, _ = parse_sender(sender)
+    if sender_email in config.block_senders:
+        score += 60
+        reasons.append("blocklisted_sender")
+    if sender_domain in config.allow_domains or sender_email in config.allow_senders:
+        score -= 100
+        negative_reasons.append("allowlisted_sender_or_domain")
+
+    if "CATEGORY_PROMOTIONS" in labels:
+        score += 50
+        reasons.append("gmail_category_promotions")
+    if headers.get("list-unsubscribe"):
+        score += 30
+        reasons.append("list_unsubscribe_header")
+    if headers.get("list-id"):
+        score += 15
+        reasons.append("list_id_header")
+    if headers.get("precedence", "").lower() in {"bulk", "list"}:
+        score += 15
+        reasons.append("bulk_or_list_precedence")
+    if headers.get("x-campaign"):
+        score += 15
+        reasons.append("campaign_header")
+
+    for prefix, hits, weight, cap in [
+        ("sender", contains_any(sender, AD_SENDER_KEYWORDS), 8, 25),
+        ("subject", contains_any(subject, AD_SUBJECT_KEYWORDS), 10, 35),
+        ("snippet", contains_any(snippet, AD_BODY_KEYWORDS), 12, 30),
+    ]:
+        if hits:
+            score += min(cap, weight * len(hits))
+            reasons.extend(f"{prefix}:{hit}" for hit in hits)
+
+    negative_hits = contains_any(searchable, TRANSACTIONAL_KEYWORDS)
+    if negative_hits:
+        score -= min(70, 18 * len(negative_hits))
+        negative_reasons.extend(f"transactional:{hit}" for hit in negative_hits)
+    if any(label in labels for label in IMPORTANT_LABELS):
+        score -= 25
+        negative_reasons.append("important_or_primary_label")
+    if subject.lower().startswith(("re:", "fwd:", "fw:")):
+        score -= 25
+        negative_reasons.append("reply_or_forward")
+    return max(0, min(100, score)), reasons, negative_reasons
+
+
+def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[str]:
+    categories: list[str] = []
+    if ad_confidence >= 65:
+        categories.append("Ads Promotions")
+    elif "CATEGORY_PROMOTIONS" in labels:
+        categories.append("Newsletters Bulk")
+    for name, keywords in CATEGORY_RULES:
+        if contains_any(searchable, keywords):
+            categories.append(name)
+    if "CATEGORY_SOCIAL" in labels:
+        categories.append("Social")
+    if "CATEGORY_UPDATES" in labels and not categories:
+        categories.append("Updates")
+    if "CATEGORY_FORUMS" in labels:
+        categories.append("Forums")
+    if not categories:
+        categories.append("Review")
+    return sorted(set(categories))
+
+
+def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) -> Decision:
+    payload = message.get("payload", {})
+    headers = header_map(payload)
+    labels = message.get("labelIds", [])
+    sender = headers.get("from", "")
+    sender_email, sender_domain = parse_sender(sender)
+    subject = headers.get("subject", "")
+    snippet = message.get("snippet", "")
+    message_date = parse_date(headers.get("date", ""), message.get("internalDate"))
+    searchable = " ".join([sender, sender_domain, subject, snippet])
+    ad_confidence, reasons, negative_reasons = score_ad(headers, labels, sender, sender_domain, subject, snippet, config)
+    age_boost = age_score_boost(message_date)
+    if age_boost and ad_confidence >= args.ad_threshold:
+        ad_confidence = min(100, ad_confidence + age_boost)
+        reasons.append(f"older_mail_boost:{age_boost}")
+    categories = categorize(searchable, labels, ad_confidence)
+    has_attachment = payload_has_attachment(payload)
+    attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
+    protected = (
+        sender_domain in config.allow_domains
+        or sender_email in config.allow_senders
+        or has_attachment
+        or bool(PROTECTED_CATEGORIES.intersection(categories))
+        or any(label in labels for label in IMPORTANT_LABELS)
+    )
+    if has_attachment:
+        negative_reasons.append("has_attachment")
+    if PROTECTED_CATEGORIES.intersection(categories):
+        negative_reasons.append("protected_category")
+
+    planned_actions = [f"label:{category}" for category in categories]
+    can_archive = not protected and ("Newsletters Bulk" in categories or ad_confidence >= args.ad_threshold)
+    can_trash = not protected and ad_confidence >= args.trash_threshold and "Ads Promotions" in categories
+    if args.stage in {"archive", "trash"} and can_archive:
+        planned_actions.append("archive")
+    if args.stage == "trash" and args.trash_obvious_ads and can_trash:
+        planned_actions.append("trash")
+
+    review_priority = "normal"
+    if "trash" in planned_actions or ad_confidence >= args.trash_threshold:
+        review_priority = "trash_review"
+    elif sender_domain in config.block_domains or sender_email in config.block_senders:
+        review_priority = "blocked_sender_review"
+    elif protected and ad_confidence >= args.ad_threshold:
+        review_priority = "protected_ad_review"
+    elif has_attachment:
+        review_priority = "attachment_review"
+
+    return Decision(
+        message_id=message["id"],
+        thread_id=message.get("threadId", ""),
+        date=message_date,
+        sender=sender,
+        sender_email=sender_email,
+        sender_domain=sender_domain,
+        subject=subject,
+        snippet=snippet,
+        existing_labels=labels,
+        categories=categories,
+        ad_confidence=ad_confidence,
+        reasons=reasons,
+        negative_reasons=negative_reasons,
+        planned_actions=planned_actions,
+        has_attachment=has_attachment,
+        list_unsubscribe=headers.get("list-unsubscribe", ""),
+        attachment_names=attachment_names,
+        attachment_mime_types=attachment_mime_types,
+        protected=protected,
+        review_priority=review_priority,
+        scanned_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def get_thread_message_ids(service: Any, thread_id: str, retries: int, retry_sleep: float) -> list[str]:
+    thread = execute_with_retries(
+        service.users().threads().get(userId="me", id=thread_id, format="metadata", metadataHeaders=["Subject", "From"]),
+        retries,
+        retry_sleep,
+    )
+    return [item["id"] for item in thread.get("messages", [])]
+
+
+def protect_mixed_threads(service: Any, decisions: list[Decision], retries: int, retry_sleep: float, limit: int) -> None:
+    checked = 0
+    by_thread: dict[str, list[Decision]] = defaultdict(list)
+    for item in decisions:
+        if "trash" in item.planned_actions:
+            by_thread[item.thread_id].append(item)
+    for thread_id, items in by_thread.items():
+        if checked >= limit:
+            return
+        checked += 1
+        thread_ids = get_thread_message_ids(service, thread_id, retries, retry_sleep)
+        if len(thread_ids) > len(items):
+            for item in items:
+                item.planned_actions = [action for action in item.planned_actions if action != "trash"]
+                item.negative_reasons.append("mixed_thread_protected")
+                item.review_priority = "thread_review"
+                item.protected = True
+
+
+def decision_from_dict(data: dict[str, Any]) -> Decision:
+    valid = Decision.__dataclass_fields__.keys()
+    return Decision(**{key: data[key] for key in valid if key in data})
+
+
+def load_progress(path: Path) -> dict[str, Decision]:
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {item["message_id"]: decision_from_dict(item) for item in data}
+
+
+def save_progress(path: Path, decisions: dict[str, Decision]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([asdict(item) for item in decisions.values()], indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def should_refresh(decision: Decision, args: argparse.Namespace) -> bool:
+    if args.refresh_existing:
+        return True
+    if not args.refresh_after_days or not decision.scanned_at:
+        return False
+    try:
+        scanned_at = datetime.fromisoformat(decision.scanned_at)
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - scanned_at > timedelta(days=args.refresh_after_days)
+
+
+def scan_messages(
+    message_ids: list[str],
+    progress: dict[str, Decision],
+    creds: Any,
+    build_func: Any,
+    args: argparse.Namespace,
+    config: Config,
+) -> dict[str, Decision]:
+    throttle = AdaptiveThrottle(args.sleep)
+    pending = [
+        message_id
+        for message_id in message_ids
+        if message_id not in progress or should_refresh(progress[message_id], args)
+    ]
+    if not pending:
+        return progress
+
+    progress_path = Path(args.progress_file)
+    completed = 0
+    thread_local = threading.local()
+
+    def service_for_thread() -> Any:
+        if not hasattr(thread_local, "service"):
+            thread_local.service = build_func("gmail", "v1", credentials=creds)
+        return thread_local.service
+
+    def worker(message_id: str) -> tuple[str, Decision | None, str | None]:
+        try:
+            message = get_message_metadata(
+                service_for_thread(),
+                message_id,
+                args.retries,
+                args.retry_sleep,
+                throttle,
+                args.attachment_details,
+            )
+            return message_id, decide(message, args, config), None
+        except Exception as error:
+            return message_id, None, str(error)
+
+    if args.workers <= 1:
+        for message_id in pending:
+            _, decision, error = worker(message_id)
+            completed += 1
+            if error:
+                print(f"Skipping {message_id}: {error}", file=sys.stderr)
+            elif decision:
+                progress[message_id] = decision
+            if completed % args.save_every == 0:
+                save_progress(progress_path, progress)
+                print(f"Scanned {completed}/{len(pending)} pending; saved progress...")
+        return progress
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = [executor.submit(worker, message_id) for message_id in pending]
+        for future in as_completed(futures):
+            message_id, decision, error = future.result()
+            completed += 1
+            if error:
+                print(f"Skipping {message_id}: {error}", file=sys.stderr)
+            elif decision:
+                progress[message_id] = decision
+            if completed % args.save_every == 0:
+                save_progress(progress_path, progress)
+                print(f"Scanned {completed}/{len(pending)} pending; saved progress...")
+    return progress
+
+
+def create_label(service: Any, label_name: str, retries: int, retry_sleep: float) -> dict[str, Any]:
+    return execute_with_retries(
+        service.users().labels().create(userId="me", body={"name": label_name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}),
+        retries,
+        retry_sleep,
+    )
+
+
+def get_or_create_labels(service: Any, label_names: list[str], retries: int, retry_sleep: float) -> dict[str, str]:
+    existing = execute_with_retries(service.users().labels().list(userId="me"), retries, retry_sleep).get("labels", [])
+    label_ids = {label.get("name"): label.get("id") for label in existing}
+    for label_name in label_names:
+        if label_name not in label_ids:
+            created = create_label(service, label_name, retries, retry_sleep)
+            label_ids[label_name] = created["id"]
+    return {name: label_ids[name] for name in label_names}
+
+
+def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Namespace) -> None:
+    categories = sorted({category for item in decisions for category in item.categories})
+    label_ids = get_or_create_labels(service, [f"{ROOT_LABEL}/{category}" for category in categories], args.retries, args.retry_sleep)
+    grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[Decision]] = {}
+    trash_items: list[Decision] = []
+    for item in decisions:
+        if item.protected and ("trash" in item.planned_actions or "archive" in item.planned_actions):
+            item.planned_actions = [action for action in item.planned_actions if action not in {"trash", "archive"}]
+        if "trash" in item.planned_actions:
+            trash_items.append(item)
+            continue
+        add_ids = tuple(sorted(label_ids[f"{ROOT_LABEL}/{category}"] for category in item.categories))
+        remove_ids = ("INBOX",) if "archive" in item.planned_actions else ()
+        grouped.setdefault((add_ids, remove_ids), []).append(item)
+
+    for item in trash_items:
+        execute_with_retries(service.users().messages().trash(userId="me", id=item.message_id), args.retries, args.retry_sleep)
+        item.action_done = "yes"
+
+    for (add_ids, remove_ids), items in grouped.items():
+        for start in range(0, len(items), args.batch_size):
+            chunk = items[start : start + args.batch_size]
+            body: dict[str, list[str]] = {"ids": [item.message_id for item in chunk]}
+            if add_ids:
+                body["addLabelIds"] = list(add_ids)
+            if remove_ids:
+                body["removeLabelIds"] = list(remove_ids)
+            execute_with_retries(service.users().messages().batchModify(userId="me", body=body), args.retries, args.retry_sleep)
+            for item in chunk:
+                item.action_done = "yes"
+
+
+def write_csv(path: Path, decisions: list[Decision]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(Decision.__dataclass_fields__.keys())
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in decisions:
+            row = asdict(item)
+            for key, value in row.items():
+                if isinstance(value, list):
+                    row[key] = "; ".join(str(part) for part in value)
+            writer.writerow(row)
+
+
+def write_json(path: Path, decisions: list[Decision]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([asdict(item) for item in decisions], indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def write_unsubscribe_report(path: Path, decisions: list[Decision]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [item for item in decisions if item.list_unsubscribe]
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=["sender_domain", "sender", "count", "list_unsubscribe"])
+        writer.writeheader()
+        grouped: dict[tuple[str, str, str], int] = Counter((item.sender_domain, item.sender, item.list_unsubscribe) for item in rows)
+        for (domain, sender, unsub), count in grouped.most_common():
+            writer.writerow({"sender_domain": domain, "sender": sender, "count": count, "list_unsubscribe": unsub})
+
+
+def write_sender_report(path: Path, decisions: list[Decision]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, list[Decision]] = defaultdict(list)
+    for item in decisions:
+        grouped[item.sender_domain or "(unknown)"].append(item)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=["sender_domain", "count", "avg_ad_confidence", "categories", "sample_subject"])
+        writer.writeheader()
+        for domain, items in sorted(grouped.items(), key=lambda pair: len(pair[1]), reverse=True):
+            avg = sum(item.ad_confidence for item in items) / len(items)
+            cats = Counter(category for item in items for category in item.categories)
+            writer.writerow({
+                "sender_domain": domain,
+                "count": len(items),
+                "avg_ad_confidence": f"{avg:.1f}",
+                "categories": "; ".join(name for name, _ in cats.most_common(5)),
+                "sample_subject": items[0].subject,
+            })
+
+
+def write_action_manifests(path: Path, decisions: list[Decision]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    manifests = {
+        "label": [item for item in decisions if any(action.startswith("label:") for action in item.planned_actions)],
+        "archive": [item for item in decisions if "archive" in item.planned_actions],
+        "trash": [item for item in decisions if "trash" in item.planned_actions],
+    }
+    for name, items in manifests.items():
+        payload = {
+            "stage": name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "message_count": len(items),
+            "message_ids": [item.message_id for item in items],
+            "items": [asdict(item) for item in items],
+        }
+        (path / f"{name}_manifest.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_manifest_ids(path: Path) -> set[str]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return set(data.get("message_ids", []))
+
+
+def esc(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def extract_unsubscribe_targets(header_value: str) -> list[str]:
+    targets = re.findall(r"<([^>]+)>", header_value)
+    if not targets and header_value:
+        targets = [part.strip() for part in header_value.split(",")]
+    return [target.strip() for target in targets if target.strip()]
+
+
+def render_unsubscribable_domains(items: list[Decision], limit: int = 100) -> str:
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in items:
+        domain = item.sender_domain or "(unknown)"
+        entry = grouped.setdefault(
+            domain,
+            {
+                "count": 0,
+                "senders": Counter(),
+                "targets": Counter(),
+                "subjects": Counter(),
+                "confidence": 0,
+                "latest": "",
+            },
+        )
+        entry["count"] += 1
+        entry["confidence"] += item.ad_confidence
+        entry["latest"] = max(entry["latest"], item.date)
+        entry["senders"][item.sender] += 1
+        entry["subjects"][item.subject] += 1
+        for target in extract_unsubscribe_targets(item.list_unsubscribe):
+            entry["targets"][target] += 1
+
+    rows = []
+    def priority(pair: tuple[str, dict[str, Any]]) -> tuple[float, int, str]:
+        _, entry = pair
+        avg_confidence = entry["confidence"] / max(1, entry["count"])
+        return (avg_confidence, entry["count"], entry["latest"])
+
+    for domain, entry in sorted(grouped.items(), key=priority, reverse=True)[:limit]:
+        targets = "<br>".join(esc(target) for target, _ in entry["targets"].most_common(5))
+        senders = "<br>".join(esc(sender) for sender, _ in entry["senders"].most_common(3))
+        samples = "<br>".join(esc(subject) for subject, _ in entry["subjects"].most_common(3))
+        avg_confidence = entry["confidence"] / max(1, entry["count"])
+        rows.append(
+            "<tr>"
+            f"<td>{esc(domain)}</td>"
+            f"<td>{esc(entry['count'])}</td>"
+            f"<td>{avg_confidence:.1f}</td>"
+            f"<td>{esc(entry['latest'])}</td>"
+            f"<td>{senders}</td>"
+            f"<td>{targets}</td>"
+            f"<td>{samples}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr>"
+        "<th>Domain</th><th>Messages</th><th>Avg Ad Confidence</th><th>Last Seen</th><th>Senders</th><th>Unsubscribe Links</th><th>Sample Subjects</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def render_bulk_preview(items: list[Decision], limit: int = 50) -> str:
+    grouped: dict[str, list[Decision]] = defaultdict(list)
+    for item in items:
+        grouped[item.sender_domain or "(unknown)"].append(item)
+    rows = []
+    for domain, domain_items in sorted(grouped.items(), key=lambda pair: len(pair[1]), reverse=True)[:limit]:
+        archive_count = sum(1 for item in domain_items if "archive" in item.planned_actions)
+        trash_count = sum(1 for item in domain_items if "trash" in item.planned_actions)
+        protected_count = sum(1 for item in domain_items if item.protected)
+        avg_confidence = sum(item.ad_confidence for item in domain_items) / len(domain_items)
+        categories = Counter(category for item in domain_items for category in item.categories)
+        rows.append(
+            "<tr>"
+            f"<td>{esc(domain)}</td>"
+            f"<td>{len(domain_items)}</td>"
+            f"<td>{archive_count}</td>"
+            f"<td>{trash_count}</td>"
+            f"<td>{protected_count}</td>"
+            f"<td>{avg_confidence:.1f}</td>"
+            f"<td>{esc(', '.join(name for name, _ in categories.most_common(4)))}</td>"
+            f"<td>{esc(domain_items[0].subject)}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr>"
+        "<th>Domain</th><th>Total</th><th>Would Archive</th><th>Would Trash</th><th>Protected</th><th>Avg Ad Confidence</th><th>Top Categories</th><th>Sample Subject</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def render_table(items: list[Decision], columns: list[str], limit: int = 50) -> str:
+    rows = []
+    for item in items[:limit]:
+        data = asdict(item)
+        cells = []
+        for column in columns:
+            value = data[column]
+            if isinstance(value, list):
+                value = ", ".join(str(part) for part in value)
+            cells.append(f"<td>{esc(value)}</td>")
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    headers = "".join(f"<th>{esc(column.replace('_', ' ').title())}</th>" for column in columns)
+    return f"<table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+
+
+def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namespace) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    category_counts = Counter(category for item in decisions for category in item.categories)
+    sender_counts = Counter(item.sender_domain or "(unknown)" for item in decisions)
+    review_counts = Counter(item.review_priority for item in decisions)
+    trash_items = [item for item in decisions if item.review_priority in {"trash_review", "thread_review"}]
+    protected_ads = [item for item in decisions if item.review_priority == "protected_ad_review"]
+    attachment_items = [item for item in decisions if item.has_attachment]
+    unsubscribe_items = [item for item in decisions if item.list_unsubscribe]
+    top_noisy = sender_counts.most_common(20)
+
+    stat_cards = [
+        ("Messages", len(decisions)),
+        ("Ad/Promo", category_counts["Ads Promotions"]),
+        ("Trash Review", len(trash_items)),
+        ("Protected Ad Review", len(protected_ads)),
+        ("Attachments", len(attachment_items)),
+        ("Unsubscribe Sources", len({item.sender_domain for item in unsubscribe_items})),
+    ]
+    cards_html = "".join(f"<section><strong>{esc(label)}</strong><span>{esc(value)}</span></section>" for label, value in stat_cards)
+    category_html = "".join(f"<li><span>{esc(name)}</span><b>{count}</b></li>" for name, count in category_counts.most_common())
+    sender_html = "".join(f"<li><span>{esc(name)}</span><b>{count}</b></li>" for name, count in top_noisy)
+    review_html = "".join(f"<li><span>{esc(name)}</span><b>{count}</b></li>" for name, count in review_counts.most_common())
+
+    css = """
+    body{font-family:Inter,Arial,sans-serif;margin:0;background:#f6f7f9;color:#1f2933}
+    header{background:#17202a;color:white;padding:24px 32px} h1{margin:0 0 8px;font-size:28px}
+    main{padding:24px 32px;max-width:1400px;margin:auto}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+    section{background:white;border:1px solid #d8dee6;border-radius:8px;padding:16px}section span{display:block;font-size:28px;margin-top:8px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin:18px 0}
+    ul{list-style:none;margin:0;padding:0}li{display:flex;justify-content:space-between;border-bottom:1px solid #edf0f3;padding:8px 0}
+    table{width:100%;border-collapse:collapse;background:white;margin:12px 0 28px}th,td{border-bottom:1px solid #e5e9ef;padding:8px;text-align:left;vertical-align:top;font-size:13px}
+    th{background:#edf2f7;position:sticky;top:0}.note{color:#4b5563}.danger{color:#a11d1d}
+    """
+    path.write_text(
+        f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Gmail Sorter Dashboard</title><style>{css}</style></head>
+<body><header><h1>Gmail Sorter Dashboard</h1><div>Query: {esc(args.query)} | Stage: {esc(args.stage)} | Apply: {esc(args.apply)}</div></header>
+<main>
+<div class="cards">{cards_html}</div>
+<div class="grid">
+<section><h2>Review Queues</h2><ul>{review_html}</ul></section>
+<section><h2>Categories</h2><ul>{category_html}</ul></section>
+<section><h2>Noisy Senders</h2><ul>{sender_html}</ul></section>
+</div>
+<h2>Top Sender Bulk Preview</h2>
+<p class="note">Shows the impact of archive/trash decisions by sender domain before you apply a stage.</p>
+{render_bulk_preview(decisions, 50)}
+<h2 class="danger">Trash / Thread Review</h2>
+<p class="note">Review these before running the trash stage. Mixed threads and protected items are kept out of trash actions.</p>
+{render_table(trash_items, ["ad_confidence", "review_priority", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
+<h2>Protected Ad Review</h2>
+{render_table(protected_ads, ["ad_confidence", "sender_domain", "subject", "categories", "negative_reasons"], 100)}
+<h2>Attachment Review</h2>
+{render_table(attachment_items, ["date", "sender_domain", "subject", "categories", "ad_confidence", "attachment_names", "attachment_mime_types"], 100)}
+<h2>Unsubscribable Domains</h2>
+<p class="note">Grouped by sender domain with extracted List-Unsubscribe targets, prioritized by ad confidence, volume, and last-seen date. Review these before manually unsubscribing.</p>
+{render_unsubscribable_domains(unsubscribe_items, 100)}
+<h2>Unsubscribe Candidates</h2>
+{render_table(unsubscribe_items, ["sender_domain", "sender", "subject", "ad_confidence", "list_unsubscribe"], 100)}
+<h2>Recent Sample</h2>
+{render_table(decisions, ["date", "ad_confidence", "review_priority", "sender_domain", "subject", "categories", "planned_actions"], 100)}
+</main></body></html>""",
+        encoding="utf-8",
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Categorize Gmail messages before 2025 with dashboard-centered review.")
+    parser.add_argument("--credentials", default=str(PROJECT_DIR / "secrets" / "credentials.json"))
+    parser.add_argument("--token-readonly", default=str(PROJECT_DIR / "secrets" / "token_sorter_readonly.json"))
+    parser.add_argument("--token-modify", default=str(PROJECT_DIR / "secrets" / "token_sorter_modify.json"))
+    parser.add_argument("--query", default=DEFAULT_QUERY)
+    parser.add_argument("--out-prefix", default=str(PROJECT_DIR / "reports" / "gmail_sorter_report"))
+    parser.add_argument("--allowlist", default=str(PROJECT_DIR / "config" / "allowlist.txt"))
+    parser.add_argument("--blocklist", default=str(PROJECT_DIR / "config" / "blocklist.txt"))
+    parser.add_argument("--max-messages", type=int, default=None)
+    parser.add_argument("--ad-threshold", type=int, default=65)
+    parser.add_argument("--trash-threshold", type=int, default=90)
+    parser.add_argument("--stage", choices=["classify", "label", "archive", "trash"], default="classify")
+    parser.add_argument("--workers", type=int, default=8, help="Parallel read/classification workers. Writes remain sequential.")
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--sleep", type=float, default=0.05)
+    parser.add_argument("--retries", type=int, default=5)
+    parser.add_argument("--retry-sleep", type=float, default=5.0)
+    parser.add_argument("--resume", action="store_true", help="Reuse and update the progress JSON for interrupted scans.")
+    parser.add_argument("--refresh-existing", action="store_true", help="Refresh all cached decisions even when --resume is used.")
+    parser.add_argument("--refresh-after-days", type=int, default=7, help="Refresh cached decisions older than this many days.")
+    parser.add_argument("--progress-file", default=str(PROJECT_DIR / "data" / "gmail_sorter_progress.json"))
+    parser.add_argument("--save-every", type=int, default=250)
+    parser.add_argument("--thread-check-limit", type=int, default=500)
+    parser.add_argument("--manifest-dir", default=str(PROJECT_DIR / "manifests"))
+    parser.add_argument("--manifest", default="", help="Optional reviewed manifest JSON to restrict an apply stage.")
+    parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
+    parser.add_argument("--apply", action="store_true", help="Actually modify Gmail for the selected stage.")
+    parser.add_argument("--trash-obvious-ads", action="store_true", help="Allow trash actions during --stage trash.")
+    parser.add_argument("--i-understand-trash", action="store_true", help="Required with --apply --stage trash --trash-obvious-ads.")
+    parser.add_argument("--open-browser", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    allowlist = Path(args.allowlist)
+    blocklist = Path(args.blocklist)
+    ensure_default_config_files(allowlist, blocklist)
+    config = load_config(allowlist, blocklist)
+
+    if args.apply and args.stage == "classify":
+        print("--apply has no effect with --stage classify.", file=sys.stderr)
+        return 2
+    if args.apply and args.stage == "trash" and (not args.trash_obvious_ads or not args.i_understand_trash):
+        print("Refusing trash stage without --trash-obvious-ads --i-understand-trash.", file=sys.stderr)
+        return 2
+
+    google_libs = load_google_libraries()
+    _, _, _, build, HttpError = google_libs
+    scopes = [MODIFY_SCOPE] if args.apply else [READONLY_SCOPE]
+    token_path = Path(args.token_modify if args.apply else args.token_readonly).expanduser()
+    creds = get_credentials(Path(args.credentials).expanduser(), token_path, scopes, args.open_browser, google_libs)
+    service = build("gmail", "v1", credentials=creds)
+    list_throttle = AdaptiveThrottle(args.sleep)
+
+    try:
+        message_ids = list_message_ids(service, args.query, args.max_messages, args.retries, args.retry_sleep, list_throttle)
+    except HttpError as error:
+        print(f"Failed to list messages: {error}", file=sys.stderr)
+        return 1
+
+    progress_path = Path(args.progress_file)
+    progress = load_progress(progress_path) if args.resume else {}
+    print(f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}")
+    progress = scan_messages(message_ids, progress, creds, build, args, config)
+    save_progress(progress_path, progress)
+
+    decisions = list(progress.values())
+    if args.stage == "trash":
+        protect_mixed_threads(service, decisions, args.retries, args.retry_sleep, args.thread_check_limit)
+
+    if args.manifest:
+        manifest_ids = load_manifest_ids(Path(args.manifest))
+        decisions = [item for item in decisions if item.message_id in manifest_ids]
+        print(f"Restricted apply/report set to {len(decisions)} messages from manifest: {args.manifest}")
+
+    if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
+        print(f"Applying stage={args.stage} to {len(decisions)} messages...")
+        apply_decisions(service, decisions, args)
+
+    decisions.sort(key=lambda item: (item.ad_confidence, item.date, item.sender_domain), reverse=True)
+    out_prefix = Path(args.out_prefix)
+    write_csv(out_prefix.with_suffix(".csv"), decisions)
+    write_json(out_prefix.with_suffix(".json"), decisions)
+    write_sender_report(out_prefix.with_name(out_prefix.name + "_senders.csv"), decisions)
+    write_unsubscribe_report(out_prefix.with_name(out_prefix.name + "_unsubscribe.csv"), decisions)
+    write_action_manifests(Path(args.manifest_dir), decisions)
+    write_dashboard(out_prefix.with_suffix(".html"), decisions, args)
+
+    ads = sum(1 for item in decisions if "Ads Promotions" in item.categories)
+    trash = sum(1 for item in decisions if "trash" in item.planned_actions)
+    protected = sum(1 for item in decisions if item.protected)
+    mode = "APPLIED" if args.apply else "DRY RUN"
+    print(f"{mode}: processed {len(decisions)} messages; ads/promotions={ads}; planned trash={trash}; protected={protected}.")
+    print(f"Wrote {out_prefix.with_suffix('.html')}")
+    print(f"Wrote {out_prefix.with_suffix('.csv')}")
+    print(f"Wrote {out_prefix.with_suffix('.json')}")
+    print(f"Wrote {out_prefix.with_name(out_prefix.name + '_senders.csv')}")
+    print(f"Wrote {out_prefix.with_name(out_prefix.name + '_unsubscribe.csv')}")
+    print(f"Wrote manifests in {Path(args.manifest_dir)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

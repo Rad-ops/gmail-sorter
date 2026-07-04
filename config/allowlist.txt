@@ -1,0 +1,3 @@
+# One sender email or domain per line. Anything listed here is protected from archive/trash.
+# example-bank.com
+# person@example.com
