@@ -2,7 +2,7 @@ Project: Gmail sorter / inbox cleanup
 Repo: /home/rzangeneh/codebase/sorter
 Remote: https://github.com/Rad-ops/gmail-sorter.git
 Branch: main
-Current head: 937bdb3 (Improve Gmail trash scoring and reports)
+Latest release: v0.2.0
 
 What is already done:
 - Local repo initialized and pushed to GitHub.
