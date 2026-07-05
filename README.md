@@ -2,7 +2,7 @@
 
 Dashboard-centered Gmail cleanup tool for older mail. It scans messages before December 30, 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
 
-Current version: `0.3.0` (`20260705`).
+Current version: `0.3.1` (`20260705`).
 
 ## Folder Layout
 
@@ -246,14 +246,45 @@ To run the local Qwen/llama.cpp review automatically through the local OpenAI-co
   --out-prefix reports/trash_rescue_audit_local_qwen \
   --local-llm \
   --start-local-llm \
-  --local-llm-profile coder-big \
+  --local-llm-profile qwen36 \
   --local-llm-max 0 \
   --llm-body-chars 1200 \
   --sleep 0.1 \
   --http-timeout 120
 ```
 
-This uses `llm-switch coder-big` to start the `local-llm` systemd service and calls `http://127.0.0.1:8080/v1/chat/completions` with model `local`. It writes `reports/trash_rescue_audit_local_qwen_local_llm_results.jsonl` and merges those model decisions into the final HTML/CSV/JSON reports.
+This uses `llm-switch qwen36` to start the `local-llm` systemd service and calls `http://127.0.0.1:8080/v1/chat/completions` with model `local`. It writes `reports/trash_rescue_audit_local_qwen_local_llm_results.jsonl` and merges those model decisions into the final HTML/CSV/JSON reports.
+
+To review every audited Trash row with the local model instead of only the script's borderline subset, add `--local-llm-all`. Progress output includes local generation speed, prompt speed, and draft-token acceptance when llama.cpp returns those timings.
+
+For user-approved obvious-trash domains, generate a permanent-delete manifest and a smaller Qwen review file for the remaining messages:
+
+```bash
+.venv/bin/python src/apply_domain_trash_policy.py \
+  --audit-json reports/trash_rescue_audit_qwen36.json \
+  --out-prefix reports/domain_policy_obvious_trash
+```
+
+To permanently delete the manifest, the script uses a separate full-mail-scope Gmail token at `secrets/token_sorter_delete.json` because Gmail `messages.delete` requires `https://mail.google.com/`:
+
+```bash
+.venv/bin/python src/apply_domain_trash_policy.py \
+  --audit-json reports/trash_rescue_audit_qwen36.json \
+  --out-prefix reports/domain_policy_obvious_trash \
+  --apply \
+  --i-understand-permanent-delete \
+  --open-browser
+```
+
+To confirm Gmail no longer returns deleted manifest messages:
+
+```bash
+.venv/bin/python src/apply_domain_trash_policy.py \
+  --audit-json reports/trash_rescue_audit_qwen36.json \
+  --out-prefix reports/domain_policy_obvious_trash \
+  --verify-delete-status \
+  --verify-limit 300
+```
 
 The full runbook is in `docs/OVERNIGHT-LOCAL-QWEN-RUNBOOK.md`.
 

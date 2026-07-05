@@ -29,10 +29,11 @@ from typing import Any
 
 READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+MAIL_SCOPE = "https://mail.google.com/"
 DEFAULT_QUERY = "before:2025/12/30 -in:trash"
 ROOT_LABEL = "Sorter"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 VERSION_CODE = "20260705"
 
 AD_SUBJECT_KEYWORDS = [

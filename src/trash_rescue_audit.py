@@ -163,6 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-llm-model", default="local")
     parser.add_argument("--local-llm-profile", default="coder-big", help="Profile passed to llm-switch when --start-local-llm is used.")
     parser.add_argument("--start-local-llm", action="store_true", help="Run llm-switch before calling the local model.")
+    parser.add_argument("--local-llm-all", action="store_true", help="Send every audited Trash row to the local model, not only rescue/borderline rows.")
     parser.add_argument("--local-llm-max", type=int, default=0, help="Maximum audit rows to send to the local model; 0 means all rescue/borderline rows.")
     parser.add_argument("--local-llm-temperature", type=float, default=0.1)
     parser.add_argument("--local-llm-timeout", type=float, default=180.0)
@@ -631,6 +632,7 @@ def call_local_llm(packet: dict[str, Any], args: argparse.Namespace) -> tuple[di
         "temperature": args.local_llm_temperature,
         "top_p": 0.8,
         "max_tokens": 256,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     request = urllib.request.Request(
         args.local_llm_url,
@@ -652,6 +654,14 @@ def call_local_llm(packet: dict[str, Any], args: argparse.Namespace) -> tuple[di
     except json.JSONDecodeError as error:
         return None, f"invalid JSON response: {error}: {text[:300]}"
     parsed.setdefault("message_id", packet["message_id"])
+    timings = data.get("timings", {})
+    if isinstance(timings, dict):
+        parsed["_local_llm_timing"] = {
+            "prompt_tokens_per_second": timings.get("prompt_per_second"),
+            "generation_tokens_per_second": timings.get("predicted_per_second"),
+            "draft_tokens": timings.get("draft_n"),
+            "draft_tokens_accepted": timings.get("draft_n_accepted"),
+        }
     return parsed, ""
 
 
@@ -670,11 +680,19 @@ def run_local_llm_review(audits: list[RescueAudit], out_prefix: Path, args: argp
         if completed_ids:
             imported = import_model_results(results_path, audits)
             print(f"Resuming local LLM review with {len(completed_ids)} existing decisions imported ({imported} matched current audit).")
-    review_items = [
-        item
-        for item in sorted(audits, key=lambda row: (row.recommended_action == "rescue_review", row.deep_risk_score, row.original_confidence), reverse=True)
-        if model_should_review(item) and item.message_id not in completed_ids
-    ]
+    sorted_audits = sorted(
+        audits,
+        key=lambda row: (row.recommended_action == "rescue_review", row.deep_risk_score, row.original_confidence),
+        reverse=True,
+    )
+    if args.local_llm_all:
+        review_items = [item for item in sorted_audits if item.message_id not in completed_ids]
+    else:
+        review_items = [
+            item
+            for item in sorted_audits
+            if model_should_review(item) and item.message_id not in completed_ids
+        ]
     if args.local_llm_max:
         review_items = review_items[: args.local_llm_max]
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -692,7 +710,21 @@ def run_local_llm_review(audits: list[RescueAudit], out_prefix: Path, args: argp
                 }
             file.write(json.dumps(result, ensure_ascii=False) + "\n")
             if index == 1 or index == len(review_items) or index % 25 == 0:
-                print(f"Local LLM reviewed {index}/{len(review_items)} candidates...", flush=True)
+                timing = result.get("_local_llm_timing", {})
+                if timing:
+                    draft_tokens = timing.get("draft_tokens") or 0
+                    draft_accepted = timing.get("draft_tokens_accepted") or 0
+                    acceptance = (draft_accepted / draft_tokens) if draft_tokens else 0
+                    print(
+                        "Local LLM reviewed "
+                        f"{index}/{len(review_items)} candidates "
+                        f"(gen={float(timing.get('generation_tokens_per_second') or 0):.1f} tok/s, "
+                        f"prompt={float(timing.get('prompt_tokens_per_second') or 0):.1f} tok/s, "
+                        f"draft_accept={acceptance:.1%})...",
+                        flush=True,
+                    )
+                else:
+                    print(f"Local LLM reviewed {index}/{len(review_items)} candidates...", flush=True)
     imported = import_model_results(results_path, audits)
     print(f"Imported {imported} local LLM decisions from {results_path}")
     return results_path

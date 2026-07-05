@@ -27,7 +27,7 @@ echo "Log: $LOG_FILE" | tee -a "$LOG_FILE"
   --out-prefix reports/trash_rescue_audit_local_qwen \
   --local-llm \
   --start-local-llm \
-  --local-llm-profile coder-big \
+  --local-llm-profile qwen36 \
   --local-llm-max 0 \
   --llm-export \
   --llm-body-chars 1600 \

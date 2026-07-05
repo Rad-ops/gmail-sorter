@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 - 2026-07-05
+
+- Added `--local-llm-all` to let Qwen review every audited Trash row, not only script-selected rescue-review candidates.
+- Added llama.cpp timing capture and progress output for local LLM review speed, including prompt tok/sec, generation tok/sec, and draft-token acceptance when available.
+- Added Qwen3.6 as the default local Trash rescue review profile in overnight commands.
+- Added `apply_domain_trash_policy.py` for user-approved obvious-trash domains, with attachment and durable-record safeguards before permanent deletion.
+- Added a separate full-mail-scope delete token path for Gmail `messages.delete`, plus manifest verification that checks whether Gmail still returns deleted message IDs.
+
 ## 0.3.0 - 2026-07-05
 
 - Added separate `trash_rescue_audit.py` dry-run tool to double-check messages planned for Trash before permanently emptying Gmail Trash.
