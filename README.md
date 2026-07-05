@@ -49,7 +49,7 @@ manifests/archive_manifest.json
 manifests/trash_manifest.json
 ```
 
-Review the HTML dashboard first. The dashboard includes review queues, noisy senders, top sender bulk preview, attachment review, and unsubscribable domains.
+Review the HTML dashboard first. The dashboard includes review queues, noisy senders, top sender bulk preview, trash summary by domain, attachment review, perfect ad matches, header unsubscribe domains, and body unsubscribe links.
 
 ## Staged Apply
 
@@ -71,6 +71,28 @@ Trash very high-confidence ads only after reviewing the dashboard:
 python3 src/gmail_sorter.py --stage trash --apply --trash-obvious-ads --i-understand-trash --resume
 ```
 
+All-years trash apply with combined and yearly dashboards:
+
+```bash
+cd /home/rzangeneh/codebase/sorter
+.venv/bin/python src/gmail_sorter.py \
+  --stage trash \
+  --apply \
+  --trash-obvious-ads \
+  --i-understand-trash \
+  --resume \
+  --refresh-existing \
+  --workers 6 \
+  --sleep 0.1 \
+  --attachment-details \
+  --query "in:anywhere -in:trash" \
+  --out-prefix reports/gmail_sorter_all_years_trash_apply \
+  --progress-file data/gmail_sorter_all_years_progress.json \
+  --manifest-dir manifests/all_years
+```
+
+The combined dashboard is written to `reports/gmail_sorter_all_years_trash_apply.html`. Per-year dashboards are written beside it with suffixes such as `_2024.html`.
+
 Apply only a reviewed manifest:
 
 ```bash
@@ -91,6 +113,8 @@ python3 src/gmail_sorter.py --resume --workers 8
 
 `--attachment-details` fetches metadata-rich payloads to report attachment filenames and MIME types. It does not download attachment bytes.
 
+It also allows the report to inspect text/html and text/plain message parts for unsubscribe URLs. The script does not persist email body text; it stores only normalized unsubscribe/preference links in reports.
+
 ## Safety
 
 The default run is classification only. Gmail changes require `--apply`. Trash requires:
@@ -100,3 +124,5 @@ The default run is classification only. Gmail changes require `--apply`. Trash r
 ```
 
 Protected messages are kept out of archive/trash when they are allowlisted, important/starred/primary, have attachments, or match protected categories such as finance, account security, health, government/legal, utilities, insurance, or receipts/orders.
+
+`perfect_ad_match` means the message reached 100 ad confidence, has multiple independent bulk-mail signals such as Gmail promotions, List-Unsubscribe, List-Id, one-click unsubscribe, bulk precedence, or promotional sender local-parts, and has promotional body/subject content. Perfect matches still respect the same protected-message checks and mixed-thread protection.

@@ -26,23 +26,24 @@ What is already done:
 - Broad single-query runs were too slow / throttled; year-chunking worked reliably.
 
 Current code state:
-- The handoff and unsubscribe-scoring changes are committed and pushed.
-- Latest commit at shutdown: f11f99a (Add handoff files and unsubscribe scoring)
-- The committed code includes:
-  - stronger pre-2020 trash scoring
-  - lower trash threshold for pre-2020 mail
-  - a dedicated pre-2020 aggressive trash section in the dashboard
-  - clickable unsubscribe links
-  - deduped unsubscribe targets grouped by sender domain
-  - unsubscribe prioritization / scoring
-  - a pre-2020 trash threshold CLI flag
-- The tracked worktree should be clean. Generated reports, checkpoints, manifests, secrets, and `.venv/` are intentionally ignored and remain local.
+- Final scoring/reporting changes are ready to commit.
+- The code includes:
+  - stronger promotional scoring using one-click unsubscribe, List-Unsubscribe, List-Id, bulk/list precedence, campaign headers, promotional sender local-parts, and strong promo subject patterns
+  - `perfect_ad_match` for messages that score 100 and have multiple independent bulk/promotional signals while still respecting allowlists, important/primary labels, attachments, protected categories, and mixed-thread protection
+  - body unsubscribe link extraction from text/html and text/plain payloads when `--attachment-details` is used
+  - body text is not persisted; only normalized unsubscribe/preference links are written to reports
+  - separate dashboard sections for header unsubscribe domains, body unsubscribe links, and header unsubscribe candidates
+  - clickable unsubscribe links in dashboard tables
+  - combined all-years dashboard plus per-year dashboard HTML files generated from one scan
+  - progress/report filtering so reused progress files do not pollute the current query results
+- Generated reports, checkpoints, manifests, secrets, and `.venv/` are intentionally ignored and remain local.
 
 Important runtime notes:
 - Use `.venv/bin/python` for the sorter.
 - Prefer year chunks and conservative worker counts. `--workers 6` and `--sleep 0.1` have been more stable than broader/faster runs.
 - The sorter writes reports to `reports/`, checkpoints to `data/`, and manifests to `manifests/`.
-- Pre-2020 work should be treated as more aggressive trash cleanup, but still respect protected messages / mixed threads / attachments.
+- Trash stages use Gmail's Trash API, not permanent delete.
+- Final all-years run should use `in:anywhere -in:trash` and a dedicated all-years progress file.
 
 Useful commands already validated:
 ```bash
@@ -51,6 +52,5 @@ cd /home/rzangeneh/codebase/sorter
 ```
 
 Suggested next focus:
-- Finish the pre-2020 pass with aggressive trash settings.
-- Keep the unsubscribe dashboard section as the main review surface.
-- If needed, split pre-2020 into smaller year or quarter chunks to avoid Gmail throttling.
+- Run the final all-years trash apply command from `command to resume.txt`.
+- If Gmail throttles, reduce workers to 4 and increase sleep to 0.2.

@@ -5,15 +5,18 @@ cd /home/rzangeneh/codebase/sorter
   --trash-obvious-ads \
   --i-understand-trash \
   --resume \
+  --refresh-existing \
   --workers 6 \
   --sleep 0.1 \
   --attachment-details \
-  --query "before:2020/01/01 -in:trash" \
-  --out-prefix reports/gmail_sorter_pre_2020_trash \
-  --progress-file data/gmail_sorter_pre_2020_progress.json \
-  --manifest-dir manifests/pre_2020
+  --query "in:anywhere -in:trash" \
+  --out-prefix reports/gmail_sorter_all_years_trash_apply \
+  --progress-file data/gmail_sorter_all_years_progress.json \
+  --manifest-dir manifests/all_years
 
 Notes:
-- This is the aggressive pre-2020 cleanup pass.
+- This is the final all-years cleanup pass across all non-trash mail.
+- It writes one combined dashboard plus per-year dashboard HTML files.
+- Body unsubscribe links are scrubbed from message text and shown separately from header unsubscribe links.
 - If Gmail throttles again, reduce workers to 4 and increase sleep to 0.2.
-- Review the dashboard HTML in `reports/` before broadening anything further.
+- Gmail API Trash is used, not permanent delete.

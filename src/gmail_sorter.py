@@ -8,6 +8,7 @@ review surface; use it before running any --apply stage.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import html
 import json
@@ -69,6 +70,30 @@ AD_BODY_KEYWORDS = [
 ]
 
 AD_SENDER_KEYWORDS = ["newsletter", "marketing", "promo", "promotions", "offers", "deals"]
+
+STRONG_PROMO_SUBJECT_PATTERNS = [
+    r"\b\d{1,2}%\s*off\b",
+    r"\b\d{1,2}\s*percent\s*off\b",
+    r"\b(?:last chance|final hours|ends tonight|today only)\b",
+    r"\b(?:flash sale|clearance|warehouse sale|summer sale|winter sale)\b",
+    r"\b(?:black friday|cyber monday|boxing day)\b",
+    r"\b(?:free shipping|free delivery)\b",
+    r"\b(?:shop now|new arrivals|just dropped)\b",
+]
+
+PROMO_SENDER_LOCALPARTS = {
+    "deals",
+    "email",
+    "hello",
+    "info",
+    "marketing",
+    "newsletter",
+    "newsletters",
+    "offers",
+    "promo",
+    "promotions",
+    "sales",
+}
 
 TRANSACTIONAL_KEYWORDS = [
     "2fa",
@@ -160,9 +185,11 @@ class Decision:
     planned_actions: list[str] = field(default_factory=list)
     has_attachment: bool = False
     list_unsubscribe: str = ""
+    body_unsubscribe_links: list[str] = field(default_factory=list)
     attachment_names: list[str] = field(default_factory=list)
     attachment_mime_types: list[str] = field(default_factory=list)
     protected: bool = False
+    perfect_ad_match: bool = False
     review_priority: str = "normal"
     action_done: str = "no"
     scanned_at: str = ""
@@ -325,6 +352,70 @@ def contains_any(text: str, keywords: list[str]) -> list[str]:
     return [keyword for keyword in keywords if keyword in lowered]
 
 
+def regex_hits(text: str, patterns: list[str]) -> list[str]:
+    lowered = text.lower()
+    return [pattern for pattern in patterns if re.search(pattern, lowered)]
+
+
+def sender_localpart(sender_email: str) -> str:
+    return sender_email.split("@", 1)[0].lower() if "@" in sender_email else ""
+
+
+def has_one_click_unsubscribe(headers: dict[str, str]) -> bool:
+    return headers.get("list-unsubscribe-post", "").strip().lower() == "list-unsubscribe=one-click"
+
+
+def decode_payload_text(data: str) -> str:
+    if not data:
+        return ""
+    padding = "=" * (-len(data) % 4)
+    try:
+        return base64.urlsafe_b64decode(data + padding).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000) -> str:
+    chunks: list[str] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        if sum(len(chunk) for chunk in chunks) >= max_chars:
+            return
+        mime_type = (part.get("mimeType") or "").lower()
+        filename = part.get("filename") or ""
+        body = part.get("body", {})
+        data = body.get("data", "")
+        if data and not filename and mime_type in {"text/plain", "text/html"}:
+            chunks.append(decode_payload_text(data))
+        for child in part.get("parts", []) or []:
+            walk(child)
+
+    walk(payload)
+    return "\n".join(chunks)[:max_chars]
+
+
+def extract_body_unsubscribe_links(payload: dict[str, Any], limit: int = 20) -> list[str]:
+    # Keep reports privacy-light: inspect transient body text, persist only scrubbed unsubscribe targets.
+    body_text = html.unescape(collect_body_text(payload))
+    if not body_text:
+        return []
+    candidates = re.findall(r"""https?://[^\s"'<>\\)]+|mailto:[^\s"'<>\\)]+""", body_text, flags=re.IGNORECASE)
+    links = []
+    seen = set()
+    for candidate in candidates:
+        cleaned = candidate.rstrip(".,;:!?]").strip()
+        lowered = cleaned.lower()
+        if "unsubscribe" not in lowered and "email-preferences" not in lowered and "preferences" not in lowered:
+            continue
+        normalized = normalize_unsubscribe_target(cleaned)
+        if normalized not in seen:
+            seen.add(normalized)
+            links.append(normalized)
+        if len(links) >= limit:
+            break
+    return links
+
+
 def payload_has_attachment(payload: dict[str, Any]) -> bool:
     filename = payload.get("filename") or ""
     body = payload.get("body", {})
@@ -412,7 +503,18 @@ def get_message_metadata(
             userId="me",
             id=message_id,
             format="full" if include_attachment_details else "metadata",
-            metadataHeaders=["From", "Subject", "Date", "List-Unsubscribe", "List-Id", "Precedence", "X-Campaign", "X-Mailer"],
+            metadataHeaders=[
+                "From",
+                "Subject",
+                "Date",
+                "List-Unsubscribe",
+                "List-Unsubscribe-Post",
+                "List-Id",
+                "Precedence",
+                "X-Campaign",
+                "X-Mailer",
+                "Auto-Submitted",
+            ],
         ),
         retries,
         retry_sleep,
@@ -443,6 +545,9 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
     if headers.get("list-unsubscribe"):
         score += 30
         reasons.append("list_unsubscribe_header")
+    if has_one_click_unsubscribe(headers):
+        score += 25
+        reasons.append("one_click_unsubscribe_header")
     if headers.get("list-id"):
         score += 15
         reasons.append("list_id_header")
@@ -462,6 +567,16 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
             score += min(cap, weight * len(hits))
             reasons.extend(f"{prefix}:{hit}" for hit in hits)
 
+    subject_pattern_hits = regex_hits(subject, STRONG_PROMO_SUBJECT_PATTERNS)
+    if subject_pattern_hits:
+        score += min(35, 12 * len(subject_pattern_hits))
+        reasons.extend(f"subject_pattern:{hit}" for hit in subject_pattern_hits)
+
+    localpart = sender_localpart(sender_email)
+    if localpart in PROMO_SENDER_LOCALPARTS or any(token in localpart for token in ("deal", "promo", "offer", "newsletter")):
+        score += 18
+        reasons.append(f"promotional_sender_localpart:{localpart}")
+
     negative_hits = contains_any(searchable, TRANSACTIONAL_KEYWORDS)
     if negative_hits:
         score -= min(70, 18 * len(negative_hits))
@@ -472,7 +587,58 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
     if subject.lower().startswith(("re:", "fwd:", "fw:")):
         score -= 25
         negative_reasons.append("reply_or_forward")
+    auto_submitted = headers.get("auto-submitted", "").lower()
+    if auto_submitted and auto_submitted != "no":
+        score -= 25
+        negative_reasons.append("auto_submitted_system_mail")
     return max(0, min(100, score)), reasons, negative_reasons
+
+
+def is_perfect_ad_match(
+    headers: dict[str, str],
+    labels: list[str],
+    sender_email: str,
+    subject: str,
+    snippet: str,
+    ad_confidence: int,
+    categories: list[str],
+    negative_reasons: list[str],
+) -> bool:
+    # Treat "perfect" as auto-trash eligible only when independent bulk headers and promo content agree.
+    localpart = sender_localpart(sender_email)
+    positive_bulk_signals = sum(
+        bool(signal)
+        for signal in [
+            "CATEGORY_PROMOTIONS" in labels,
+            headers.get("list-unsubscribe"),
+            has_one_click_unsubscribe(headers),
+            headers.get("list-id"),
+            headers.get("precedence", "").lower() in {"bulk", "list"},
+            headers.get("x-campaign"),
+            localpart in PROMO_SENDER_LOCALPARTS,
+            any(token in localpart for token in ("deal", "promo", "offer", "newsletter")),
+        ]
+    )
+    promo_content_signals = (
+        len(contains_any(subject, AD_SUBJECT_KEYWORDS))
+        + len(regex_hits(subject, STRONG_PROMO_SUBJECT_PATTERNS))
+        + len(contains_any(snippet, AD_BODY_KEYWORDS))
+    )
+    disqualifiers = {
+        "allowlisted_sender_or_domain",
+        "important_or_primary_label",
+        "reply_or_forward",
+        "auto_submitted_system_mail",
+        "has_attachment",
+        "protected_category",
+    }
+    return (
+        ad_confidence >= 100
+        and "Ads Promotions" in categories
+        and positive_bulk_signals >= 3
+        and promo_content_signals >= 2
+        and not disqualifiers.intersection(negative_reasons)
+    )
 
 
 def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[str]:
@@ -512,6 +678,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         reasons.append(f"older_mail_boost:{age_boost}")
     categories = categorize(searchable, labels, ad_confidence)
     has_attachment = payload_has_attachment(payload)
+    body_unsubscribe_links = extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
     protected = (
         sender_domain in config.allow_domains
@@ -524,11 +691,28 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         negative_reasons.append("has_attachment")
     if PROTECTED_CATEGORIES.intersection(categories):
         negative_reasons.append("protected_category")
+    if body_unsubscribe_links:
+        reasons.append("body_unsubscribe_link")
+    perfect_ad_match = not protected and is_perfect_ad_match(
+        headers,
+        labels,
+        sender_email,
+        subject,
+        snippet,
+        ad_confidence,
+        categories,
+        negative_reasons,
+    )
+    if perfect_ad_match:
+        reasons.append("perfect_ad_match")
 
     planned_actions = [f"label:{category}" for category in categories]
     can_archive = not protected and ("Newsletters Bulk" in categories or ad_confidence >= args.ad_threshold)
     trash_threshold = args.pre_2020_trash_threshold if is_before_year(message_date, 2020) else args.trash_threshold
-    can_trash = not protected and ad_confidence >= trash_threshold and "Ads Promotions" in categories
+    can_trash = not protected and (
+        perfect_ad_match
+        or (ad_confidence >= trash_threshold and "Ads Promotions" in categories)
+    )
     if is_before_year(message_date, 2020) and "Ads Promotions" in categories:
         reasons.append(f"pre_2020_trash_threshold:{trash_threshold}")
     if args.stage in {"archive", "trash"} and can_archive:
@@ -563,9 +747,11 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         planned_actions=planned_actions,
         has_attachment=has_attachment,
         list_unsubscribe=headers.get("list-unsubscribe", ""),
+        body_unsubscribe_links=body_unsubscribe_links,
         attachment_names=attachment_names,
         attachment_mime_types=attachment_mime_types,
         protected=protected,
+        perfect_ad_match=perfect_ad_match,
         review_priority=review_priority,
         scanned_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -614,6 +800,11 @@ def load_progress(path: Path) -> dict[str, Decision]:
 def save_progress(path: Path, decisions: dict[str, Decision]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps([asdict(item) for item in decisions.values()], indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def decisions_for_current_query(progress: dict[str, Decision], message_ids: list[str]) -> list[Decision]:
+    """Return decisions in Gmail query order, excluding stale rows from reused progress files."""
+    return [progress[message_id] for message_id in message_ids if message_id in progress]
 
 
 def should_refresh(decision: Decision, args: argparse.Namespace) -> bool:
@@ -767,13 +958,23 @@ def write_json(path: Path, decisions: list[Decision]) -> None:
 
 def write_unsubscribe_report(path: Path, decisions: list[Decision]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [item for item in decisions if item.list_unsubscribe]
     with path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["sender_domain", "sender", "count", "list_unsubscribe"])
+        writer = csv.DictWriter(file, fieldnames=["source", "sender_domain", "sender", "count", "unsubscribe_target"])
         writer.writeheader()
-        grouped: dict[tuple[str, str, str], int] = Counter((item.sender_domain, item.sender, item.list_unsubscribe) for item in rows)
-        for (domain, sender, unsub), count in grouped.most_common():
-            writer.writerow({"sender_domain": domain, "sender": sender, "count": count, "list_unsubscribe": unsub})
+        header_grouped: dict[tuple[str, str, str], int] = Counter(
+            (item.sender_domain, item.sender, item.list_unsubscribe)
+            for item in decisions
+            if item.list_unsubscribe
+        )
+        body_grouped: dict[tuple[str, str, str], int] = Counter(
+            (item.sender_domain, item.sender, link)
+            for item in decisions
+            for link in item.body_unsubscribe_links
+        )
+        for (domain, sender, target), count in header_grouped.most_common():
+            writer.writerow({"source": "header", "sender_domain": domain, "sender": sender, "count": count, "unsubscribe_target": target})
+        for (domain, sender, target), count in body_grouped.most_common():
+            writer.writerow({"source": "body", "sender_domain": domain, "sender": sender, "count": count, "unsubscribe_target": target})
 
 
 def write_sender_report(path: Path, decisions: list[Decision]) -> None:
@@ -847,6 +1048,10 @@ def render_unsubscribe_target(target: str) -> str:
     if lowered.startswith(("http://", "https://", "mailto:")):
         return f'<a href="{esc(cleaned)}" target="_blank" rel="noopener noreferrer">{esc(cleaned)}</a>'
     return esc(cleaned)
+
+
+def render_unsubscribe_links(targets: list[str]) -> str:
+    return "<br>".join(render_unsubscribe_target(target) for target in targets)
 
 
 def unsubscribe_domain_score(entry: dict[str, Any]) -> float:
@@ -952,6 +1157,28 @@ def render_unsubscribe_priority(items: list[Decision], limit: int = 20) -> str:
     )
 
 
+def render_body_unsubscribe_links(items: list[Decision], limit: int = 100) -> str:
+    rows = []
+    body_items = [item for item in items if item.body_unsubscribe_links]
+    for item in body_items[:limit]:
+        rows.append(
+            "<tr>"
+            f"<td>{esc(item.sender_domain)}</td>"
+            f"<td>{esc(item.sender)}</td>"
+            f"<td>{esc(item.subject)}</td>"
+            f"<td>{render_cell('ad_confidence', item.ad_confidence)}</td>"
+            f"<td>{render_unsubscribe_links(item.body_unsubscribe_links)}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class=\"table-wrap\"><table><thead><tr>"
+        "<th>Domain</th><th>Sender</th><th>Subject</th><th>Ad Confidence</th><th>Clickable Body Unsubscribe Links</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+
+
 def render_bulk_preview(items: list[Decision], limit: int = 50) -> str:
     grouped: dict[str, list[Decision]] = defaultdict(list)
     for item in items:
@@ -984,6 +1211,53 @@ def render_bulk_preview(items: list[Decision], limit: int = 50) -> str:
     )
 
 
+def render_trash_domain_summary(items: list[Decision], limit: int = 50) -> str:
+    grouped: dict[str, list[Decision]] = defaultdict(list)
+    for item in items:
+        if "trash" in item.planned_actions:
+            grouped[item.sender_domain or "(unknown)"].append(item)
+    rows = []
+    for domain, domain_items in sorted(grouped.items(), key=lambda pair: len(pair[1]), reverse=True)[:limit]:
+        dates = [item.date for item in domain_items if item.date]
+        avg_confidence = sum(item.ad_confidence for item in domain_items) / len(domain_items)
+        reason_counts = Counter(reason for item in domain_items for reason in item.reasons)
+        sample_subjects = "<br>".join(esc(item.subject) for item in domain_items[:3])
+        rows.append(
+            "<tr>"
+            f"<td>{esc(domain)}</td>"
+            f"<td>{len(domain_items)}</td>"
+            f"<td>{avg_confidence:.1f}</td>"
+            f"<td>{esc(min(dates) if dates else '')}</td>"
+            f"<td>{esc(max(dates) if dates else '')}</td>"
+            f"<td>{esc(', '.join(reason for reason, _ in reason_counts.most_common(5)))}</td>"
+            f"<td>{sample_subjects}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr>"
+        "<th>Domain</th><th>Would Trash</th><th>Avg Ad Confidence</th><th>Oldest</th><th>Newest</th><th>Top Reasons</th><th>Sample Subjects</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def render_reason_summary(items: list[Decision], attr: str, limit: int = 20) -> str:
+    counts = Counter(reason for item in items for reason in getattr(item, attr))
+    rows = [
+        "<tr>"
+        f"<td>{esc(reason)}</td>"
+        f"<td>{count}</td>"
+        "</tr>"
+        for reason, count in counts.most_common(limit)
+    ]
+    return (
+        "<table><thead><tr><th>Reason</th><th>Messages</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
 def render_table(items: list[Decision], columns: list[str], limit: int = 50) -> str:
     rows = []
     for item in items[:limit]:
@@ -1001,6 +1275,8 @@ def render_table(items: list[Decision], columns: list[str], limit: int = 50) -> 
 
 def render_cell(column: str, value: Any) -> str:
     if isinstance(value, list):
+        if column == "body_unsubscribe_links":
+            return render_unsubscribe_links([str(part) for part in value])
         if column in {"categories", "planned_actions", "reasons", "negative_reasons"}:
             return "".join(f"<span class=\"pill\">{esc(part)}</span>" for part in value)
         value = ", ".join(str(part) for part in value)
@@ -1011,7 +1287,10 @@ def render_cell(column: str, value: Any) -> str:
             return f"<span class=\"score {level}\">{score:.0f}</span>"
         except (TypeError, ValueError):
             return esc(value)
-    if column in {"protected", "has_attachment"}:
+    if column == "list_unsubscribe":
+        targets = extract_unsubscribe_targets(str(value))
+        return render_unsubscribe_links(targets) if targets else esc(value)
+    if column in {"protected", "has_attachment", "perfect_ad_match"}:
         return f"<span class=\"status {'yes' if value else 'no'}\">{esc(value)}</span>"
     return esc(value)
 
@@ -1046,13 +1325,17 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
     protected_ads = [item for item in decisions if item.review_priority == "protected_ad_review"]
     attachment_items = [item for item in decisions if item.has_attachment]
     unsubscribe_items = [item for item in decisions if item.list_unsubscribe]
+    body_unsubscribe_items = [item for item in decisions if item.body_unsubscribe_links]
     top_noisy = sender_counts.most_common(20)
     total = len(decisions)
     ad_count = category_counts["Ads Promotions"]
     protected_count = sum(1 for item in decisions if item.protected)
     high_confidence = sum(1 for item in decisions if item.ad_confidence >= 85)
+    perfect_ad_count = sum(1 for item in decisions if item.perfect_ad_match)
     archive_count = sum(1 for item in decisions if "archive" in item.planned_actions)
     trash_count = sum(1 for item in decisions if "trash" in item.planned_actions)
+    applied_count = sum(1 for item in decisions if item.action_done == "yes")
+    stale_progress_count = max(0, len(load_progress(Path(args.progress_file))) - total) if args.resume else 0
     pre_2020_trash_items = [
         item for item in decisions if is_before_year(item.date, 2020) and "trash" in item.planned_actions
     ]
@@ -1063,11 +1346,15 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
         render_metric_card("Messages", total, None, "neutral"),
         render_metric_card("Ad/Promo", ad_count, total, "warn"),
         render_metric_card("High Confidence Ads", high_confidence, total, "danger"),
+        render_metric_card("Perfect Ad Matches", perfect_ad_count, total, "danger"),
         render_metric_card("Protected", protected_count, total, "safe"),
         render_metric_card("Attachments", len(attachment_items), total, "neutral"),
-        render_metric_card("Unsubscribe Domains", len({item.sender_domain for item in unsubscribe_items}), None, "accent"),
+        render_metric_card("Header Unsub Domains", len({item.sender_domain for item in unsubscribe_items}), None, "accent"),
+        render_metric_card("Body Unsub Links", sum(len(item.body_unsubscribe_links) for item in body_unsubscribe_items), None, "accent"),
         render_metric_card("Deduped Unsub Headers", unsubscribe_duplicate_headers, len(unsubscribe_items) or None, "accent"),
         render_metric_card("Pre-2020 Trash", len(pre_2020_trash_items), total, "danger"),
+        render_metric_card("Applied", applied_count, total, "safe"),
+        render_metric_card("Cached Outside Query", stale_progress_count, None, "neutral"),
     ]
     cards_html = "".join(stat_cards)
     category_html = render_rank_list(category_counts.most_common(), total, "accent")
@@ -1115,27 +1402,54 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 <h2 class="section-title">Top Sender Bulk Preview</h2>
 <p class="note">Shows the impact of archive/trash decisions by sender domain before you apply a stage.</p>
 {render_bulk_preview(decisions, 50)}
+<h2 class="section-title danger-text">Trash Summary By Domain</h2>
+<p class="note">Domain-level view of exactly what the trash stage would touch. Use this to spot a sender that needs allowlisting before applying.</p>
+{render_trash_domain_summary(decisions, 50)}
+<h2 class="section-title">Decision Reason Summary</h2>
+<div class="grid">
+<section class="panel"><h2>Positive Reasons</h2>{render_reason_summary(decisions, "reasons", 20)}</section>
+<section class="panel"><h2>Protection / Negative Reasons</h2>{render_reason_summary(decisions, "negative_reasons", 20)}</section>
+</div>
 <h2 class="section-title danger-text">Trash / Thread Review</h2>
 <p class="note">Review these before running the trash stage. Mixed threads and protected items are kept out of trash actions.</p>
-{render_table(trash_items, ["ad_confidence", "review_priority", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
+{render_table(trash_items, ["ad_confidence", "perfect_ad_match", "review_priority", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
 <h2 class="section-title danger-text">Pre-2020 Aggressive Trash Candidates</h2>
 <p class="note">Older promotional mail uses a lower trash threshold and stronger age boost, while still respecting protected messages and mixed-thread protection.</p>
-{render_table(pre_2020_trash_items, ["date", "ad_confidence", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
+{render_table(pre_2020_trash_items, ["date", "ad_confidence", "perfect_ad_match", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
 <h2 class="section-title">Protected Ad Review</h2>
 {render_table(protected_ads, ["ad_confidence", "sender_domain", "subject", "categories", "negative_reasons"], 100)}
 <h2 class="section-title">Attachment Review</h2>
 {render_table(attachment_items, ["date", "sender_domain", "subject", "categories", "ad_confidence", "attachment_names", "attachment_mime_types"], 100)}
-<h2 class="section-title">Unsubscribable Domains</h2>
-<p class="note">Grouped by sender domain with extracted List-Unsubscribe targets, prioritized by ad confidence, volume, and last-seen date. Review these before manually unsubscribing.</p>
+<h2 class="section-title">Header Unsubscribe Domains</h2>
+<p class="note">Separate section for List-Unsubscribe headers, grouped by sender domain and prioritized by ad confidence, volume, and last-seen date.</p>
 {render_unsubscribe_priority(unsubscribe_items, 20)}
 {render_unsubscribable_domains(unsubscribe_items, 100)}
-<h2 class="section-title">Unsubscribe Candidates</h2>
+<h2 class="section-title">Body Unsubscribe Links</h2>
+<p class="note">Separate section for unsubscribe links scrubbed from message body text. The report stores only normalized links, not email body content.</p>
+{render_body_unsubscribe_links(body_unsubscribe_items, 100)}
+<h2 class="section-title">Header Unsubscribe Candidates</h2>
 {render_table(unsubscribe_items, ["sender_domain", "sender", "subject", "ad_confidence", "list_unsubscribe"], 100)}
 <h2 class="section-title">Recent Sample</h2>
 {render_table(decisions, ["date", "ad_confidence", "review_priority", "sender_domain", "subject", "categories", "planned_actions"], 100)}
 </main></body></html>""",
         encoding="utf-8",
     )
+
+
+def write_yearly_dashboards(out_prefix: Path, decisions: list[Decision], args: argparse.Namespace) -> list[Path]:
+    grouped: dict[str, list[Decision]] = defaultdict(list)
+    for item in decisions:
+        year = item.date[:4] if item.date else "unknown"
+        grouped[year].append(item)
+    paths = []
+    for year, year_items in sorted(grouped.items(), reverse=True):
+        yearly_args = argparse.Namespace(**vars(args))
+        yearly_args.query = f"{args.query} | year:{year}"
+        yearly_args.resume = False
+        path = out_prefix.with_name(f"{out_prefix.name}_{year}").with_suffix(".html")
+        write_dashboard(path, year_items, yearly_args)
+        paths.append(path)
+    return paths
 
 
 def parse_args() -> argparse.Namespace:
@@ -1207,7 +1521,10 @@ def main() -> int:
     progress = scan_messages(message_ids, progress, creds, build, args, config)
     save_progress(progress_path, progress)
 
-    decisions = list(progress.values())
+    decisions = decisions_for_current_query(progress, message_ids)
+    stale_progress_count = len(progress) - len(decisions)
+    if stale_progress_count > 0:
+        print(f"Ignoring {stale_progress_count} cached decisions outside the current query/report set.")
     if args.stage == "trash":
         protect_mixed_threads(service, decisions, args.retries, args.retry_sleep, args.thread_check_limit)
 
@@ -1219,6 +1536,9 @@ def main() -> int:
     if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
         print(f"Applying stage={args.stage} to {len(decisions)} messages...")
         apply_decisions(service, decisions, args)
+        for item in decisions:
+            progress[item.message_id] = item
+        save_progress(progress_path, progress)
 
     decisions.sort(key=lambda item: (item.ad_confidence, item.date, item.sender_domain), reverse=True)
     out_prefix = Path(args.out_prefix)
@@ -1228,6 +1548,7 @@ def main() -> int:
     write_unsubscribe_report(out_prefix.with_name(out_prefix.name + "_unsubscribe.csv"), decisions)
     write_action_manifests(Path(args.manifest_dir), decisions)
     write_dashboard(out_prefix.with_suffix(".html"), decisions, args)
+    yearly_dashboards = write_yearly_dashboards(out_prefix, decisions, args)
 
     ads = sum(1 for item in decisions if "Ads Promotions" in item.categories)
     trash = sum(1 for item in decisions if "trash" in item.planned_actions)
@@ -1239,6 +1560,7 @@ def main() -> int:
     print(f"Wrote {out_prefix.with_suffix('.json')}")
     print(f"Wrote {out_prefix.with_name(out_prefix.name + '_senders.csv')}")
     print(f"Wrote {out_prefix.with_name(out_prefix.name + '_unsubscribe.csv')}")
+    print(f"Wrote {len(yearly_dashboards)} yearly dashboards")
     print(f"Wrote manifests in {Path(args.manifest_dir)}")
     return 0
 
