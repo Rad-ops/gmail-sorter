@@ -5,6 +5,7 @@
 - Added separate `trash_rescue_audit.py` dry-run tool to double-check messages planned for Trash before permanently emptying Gmail Trash.
 - Added rescue review reports, confidence-bucket labels, optional restore/apply flow, and optional OpenAI/web-assisted review for borderline candidates.
 - Added local-LLM JSONL export/import workflow for Qwen-style offline double checking without giving the local model Gmail access.
+- Added automated local llama.cpp review via `--local-llm`, with optional `llm-switch coder-big` startup and automatic result merge.
 - Added SQLite state storage for message decisions plus an append-only action ledger for successful label/archive/trash changes.
 - Added registered-domain sender intelligence so reports group noisy subdomains under one organization-level domain.
 - Added domain review workflow outputs in CSV/JSON with suggested actions, storage impact, planned actions, protected counts, and sample subjects.

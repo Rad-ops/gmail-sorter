@@ -208,6 +208,23 @@ Merge Qwen's output without re-fetching Gmail:
   --out-prefix reports/trash_rescue_audit_qwen
 ```
 
+To run the local Qwen/llama.cpp review automatically through the local OpenAI-compatible server:
+
+```bash
+.venv/bin/python src/trash_rescue_audit.py \
+  --progress-file data/gmail_sorter_all_years_progress.json \
+  --out-prefix reports/trash_rescue_audit_local_qwen \
+  --local-llm \
+  --start-local-llm \
+  --local-llm-profile coder-big \
+  --local-llm-max 0 \
+  --llm-body-chars 1200 \
+  --sleep 0.1 \
+  --http-timeout 120
+```
+
+This uses `llm-switch coder-big` to start the `local-llm` systemd service and calls `http://127.0.0.1:8080/v1/chat/completions` with model `local`. It writes `reports/trash_rescue_audit_local_qwen_local_llm_results.jsonl` and merges those model decisions into the final HTML/CSV/JSON reports.
+
 If you decide to restore rescue candidates after reviewing the report:
 
 ```bash

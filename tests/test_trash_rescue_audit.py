@@ -128,6 +128,12 @@ class TrashRescueAuditTests(unittest.TestCase):
         self.assertEqual(audit.recommended_action, "rescue_review")
         self.assertEqual(audit.model_decision, "rescue_review")
 
+    def test_local_llm_prompt_requires_strict_json(self):
+        packet = {"message_id": "m1", "subject": "IRCC update"}
+        prompt = trash_rescue_audit.local_llm_prompt(packet)
+        self.assertIn("Return exactly one JSON object", prompt)
+        self.assertIn('"message_id": "m1"', prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

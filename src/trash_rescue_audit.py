@@ -13,6 +13,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -154,6 +155,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-export", action="store_true", help="Write local-LLM review packets for Qwen or another local model.")
     parser.add_argument("--llm-body-chars", type=int, default=1200, help="Maximum normalized body excerpt characters per LLM packet.")
     parser.add_argument("--model-results", default="", help="Import local-model JSONL decisions and merge them into the report.")
+    parser.add_argument("--local-llm", action="store_true", help="Send review packets to the local llama.cpp OpenAI-compatible server and merge decisions.")
+    parser.add_argument("--local-llm-url", default="http://127.0.0.1:8080/v1/chat/completions")
+    parser.add_argument("--local-llm-model", default="local")
+    parser.add_argument("--local-llm-profile", default="coder-big", help="Profile passed to llm-switch when --start-local-llm is used.")
+    parser.add_argument("--start-local-llm", action="store_true", help="Run llm-switch before calling the local model.")
+    parser.add_argument("--local-llm-max", type=int, default=0, help="Maximum audit rows to send to the local model; 0 means all rescue/borderline rows.")
+    parser.add_argument("--local-llm-temperature", type=float, default=0.1)
+    parser.add_argument("--local-llm-timeout", type=float, default=180.0)
+    parser.add_argument("--local-llm-results", default="", help="Where to write local model JSONL results. Defaults beside out-prefix.")
     parser.add_argument("--apply", action="store_true", help="Untrash rescue candidates and apply review labels.")
     parser.add_argument("--label-only", action="store_true", help="Apply review labels without untrashing.")
     parser.add_argument("--i-understand-restore", action="store_true", help="Required with --apply.")
@@ -533,6 +543,103 @@ Keep the reason short and concrete. Do not output prose outside JSONL.
     print(f"Wrote local-LLM prompt {prompt_path}")
 
 
+def local_llm_prompt(packet: dict[str, Any]) -> str:
+    return (
+        "You are double-checking Gmail Trash before permanent deletion. "
+        "Return exactly one JSON object and no prose. "
+        "Schema: {\"message_id\": string, \"decision\": \"rescue_review\"|\"keep_trash\", "
+        "\"confidence\": number from 0 to 1, \"reason\": short string, \"signals\": array of short strings}. "
+        "Prefer rescue_review for immigration, visa, IRCC, legal/lawyer, studies, school, transcript, tuition, "
+        "government/legal, finance/security, receipts/orders, real attachments, or human conversation. "
+        "Prefer keep_trash for obvious marketing/newsletter/social-sale messages with unsubscribe/list/bulk evidence "
+        "and no durable value.\n\n"
+        f"Record:\n{json.dumps(packet, ensure_ascii=False)}"
+    )
+
+
+def ensure_local_llm(args: argparse.Namespace) -> None:
+    if args.start_local_llm:
+        subprocess.run(["llm-switch", args.local_llm_profile], check=True)
+        return
+    models_url = args.local_llm_url.rsplit("/", 2)[0] + "/models"
+    try:
+        with urllib.request.urlopen(models_url, timeout=5) as response:
+            response.read()
+    except Exception as error:
+        raise SystemExit(
+            f"Local LLM is not responding at {models_url}. "
+            f"Start it with: llm-switch {args.local_llm_profile} "
+            "or rerun with --start-local-llm."
+        ) from error
+
+
+def call_local_llm(packet: dict[str, Any], args: argparse.Namespace) -> tuple[dict[str, Any] | None, str]:
+    body = {
+        "model": args.local_llm_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": local_llm_prompt(packet),
+            }
+        ],
+        "temperature": args.local_llm_temperature,
+        "top_p": 0.8,
+        "max_tokens": 256,
+    }
+    request = urllib.request.Request(
+        args.local_llm_url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=args.local_llm_timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        return None, str(error)
+    text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None, f"no JSON object in response: {text[:300]}"
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError as error:
+        return None, f"invalid JSON response: {error}: {text[:300]}"
+    parsed.setdefault("message_id", packet["message_id"])
+    return parsed, ""
+
+
+def run_local_llm_review(audits: list[RescueAudit], out_prefix: Path, args: argparse.Namespace) -> Path:
+    ensure_local_llm(args)
+    results_path = Path(args.local_llm_results) if args.local_llm_results else out_prefix.with_name(out_prefix.name + "_local_llm_results.jsonl")
+    review_items = [
+        item
+        for item in sorted(audits, key=lambda row: (row.recommended_action == "rescue_review", row.deep_risk_score, row.original_confidence), reverse=True)
+        if model_should_review(item)
+    ]
+    if args.local_llm_max:
+        review_items = review_items[: args.local_llm_max]
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    with results_path.open("w", encoding="utf-8") as file:
+        for index, item in enumerate(review_items, 1):
+            packet = llm_packet(item)
+            result, error = call_local_llm(packet, args)
+            if result is None:
+                result = {
+                    "message_id": item.message_id,
+                    "decision": "",
+                    "confidence": 0,
+                    "reason": error,
+                    "signals": ["local_llm_error"],
+                }
+            file.write(json.dumps(result, ensure_ascii=False) + "\n")
+            if index == 1 or index == len(review_items) or index % 25 == 0:
+                print(f"Local LLM reviewed {index}/{len(review_items)} candidates...", flush=True)
+    imported = import_model_results(results_path, audits)
+    print(f"Imported {imported} local LLM decisions from {results_path}")
+    return results_path
+
+
 def import_model_results(path: Path, audits: list[RescueAudit]) -> int:
     by_id = {item.message_id: item for item in audits}
     imported = 0
@@ -680,6 +787,8 @@ def main() -> int:
         if args.model_results:
             imported = import_model_results(Path(args.model_results), audits)
             print(f"Imported {imported} local-model decisions from {args.model_results}")
+        if args.local_llm:
+            run_local_llm_review(audits, out_prefix, args)
         if args.llm_export:
             write_llm_export(out_prefix, audits)
         write_reports(out_prefix, audits)
@@ -754,6 +863,8 @@ def main() -> int:
     if args.model_results:
         imported = import_model_results(Path(args.model_results), audits)
         print(f"Imported {imported} local-model decisions from {args.model_results}")
+    if args.local_llm:
+        run_local_llm_review(audits, out_prefix, args)
 
     audits.sort(key=lambda item: (item.recommended_action == "rescue_review", item.deep_risk_score, item.original_confidence), reverse=True)
     write_reports(out_prefix, audits)
