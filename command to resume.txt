@@ -1,24 +1,10 @@
 cd /home/rzangeneh/codebase/sorter
-.venv/bin/python src/gmail_sorter.py \
-  --stage trash \
-  --apply \
-  --trash-obvious-ads \
-  --i-understand-trash \
-  --resume \
-  --workers 6 \
-  --sleep 0.1 \
-  --attachment-details \
-  --query "in:anywhere -in:trash" \
-  --out-prefix reports/gmail_sorter_all_years_trash_apply \
-  --progress-file data/gmail_sorter_all_years_progress.json \
-  --manifest-dir manifests/all_years
+/home/rzangeneh/codebase/local-ai-gmail-interpreter/commands/run-overnight-trash-rescue.sh
 
 Notes:
-- This is the final all-years cleanup pass across all non-trash mail.
-- This resume command intentionally omits --refresh-existing so it does not rescan the full mailbox after an interrupted apply.
-- It writes one combined dashboard plus per-year dashboard HTML files.
-- Body unsubscribe links are scrubbed from message text and shown separately from header unsubscribe links.
-- If Gmail throttles again, reduce workers to 4 and increase sleep to 0.2.
-- Apply progress logs print every 100 trash calls or batch updates by default.
-- Gmail API calls use a 120 second HTTP timeout by default.
-- Gmail API Trash is used, not permanent delete.
+- This is the current safest next command before permanently deleting Gmail Trash.
+- It starts local Qwen through `llm-switch coder-big`.
+- It re-fetches planned-trash messages from Gmail.
+- It produces `reports/trash_rescue_audit_local_qwen.html`.
+- It does not permanently delete anything.
+- Review the HTML report before restoring candidates or emptying Trash.

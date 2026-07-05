@@ -145,6 +145,20 @@ python3 src/gmail_sorter.py --since-date 2026-07-01 --resume
 
 Before permanently emptying Gmail Trash, run a dry-run rescue audit against the messages that the all-years trash command planned to trash:
 
+Recommended overnight local-Qwen run:
+
+```bash
+/home/rzangeneh/codebase/local-ai-gmail-interpreter/commands/run-overnight-trash-rescue.sh
+```
+
+The same command is also available from this repo:
+
+```bash
+commands/run-overnight-trash-rescue.sh
+```
+
+Manual dry run without local model:
+
 ```bash
 cd /home/rzangeneh/codebase/sorter
 .venv/bin/python src/trash_rescue_audit.py \
@@ -224,6 +238,8 @@ To run the local Qwen/llama.cpp review automatically through the local OpenAI-co
 ```
 
 This uses `llm-switch coder-big` to start the `local-llm` systemd service and calls `http://127.0.0.1:8080/v1/chat/completions` with model `local`. It writes `reports/trash_rescue_audit_local_qwen_local_llm_results.jsonl` and merges those model decisions into the final HTML/CSV/JSON reports.
+
+The full runbook is in `docs/OVERNIGHT-LOCAL-QWEN-RUNBOOK.md`.
 
 If you decide to restore rescue candidates after reviewing the report:
 
