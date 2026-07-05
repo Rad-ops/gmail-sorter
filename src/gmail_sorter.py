@@ -13,6 +13,7 @@ import csv
 import html
 import json
 import re
+import socket
 import sys
 import threading
 import time
@@ -30,6 +31,8 @@ MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 DEFAULT_QUERY = "before:2025/12/30 -in:trash"
 ROOT_LABEL = "Sorter"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+APP_VERSION = "0.2.0"
+VERSION_CODE = "20260705"
 
 AD_SUBJECT_KEYWORDS = [
     "sale",
@@ -248,6 +251,18 @@ def get_credentials(credentials_path: Path, token_path: Path, scopes: list[str],
     return creds
 
 
+def build_gmail_service(build_func: Any, creds: Any, args: argparse.Namespace) -> Any:
+    if args.http_timeout > 0:
+        try:
+            import google_auth_httplib2
+            import httplib2
+        except ImportError as error:
+            raise SystemExit("Missing Google API packages. Run: python -m pip install -r requirements.txt") from error
+        http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=args.http_timeout))
+        return build_func("gmail", "v1", http=http)
+    return build_func("gmail", "v1", credentials=creds)
+
+
 def load_list(path: Path) -> set[str]:
     if not path.exists():
         return set()
@@ -315,7 +330,7 @@ def execute_with_retries(
             if throttle:
                 throttle.record_retryable_error()
             delay = retry_sleep * (2**attempt)
-            print(f"Retryable Gmail API error; sleeping {delay:.1f}s...", file=sys.stderr)
+            print(f"Retryable Gmail API error on attempt {attempt + 1}/{retries + 1}; sleeping {delay:.1f}s: {error}", file=sys.stderr, flush=True)
             time.sleep(delay)
     raise RuntimeError("unreachable retry state")
 
@@ -842,7 +857,7 @@ def scan_messages(
 
     def service_for_thread() -> Any:
         if not hasattr(thread_local, "service"):
-            thread_local.service = build_func("gmail", "v1", credentials=creds)
+            thread_local.service = build_gmail_service(build_func, creds, args)
         return thread_local.service
 
     def worker(message_id: str) -> tuple[str, Decision | None, str | None]:
@@ -906,6 +921,7 @@ def get_or_create_labels(service: Any, label_names: list[str], retries: int, ret
 
 
 def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Namespace) -> None:
+    started = time.monotonic()
     categories = sorted({category for item in decisions for category in item.categories})
     label_ids = get_or_create_labels(service, [f"{ROOT_LABEL}/{category}" for category in categories], args.retries, args.retry_sleep)
     grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[Decision]] = {}
@@ -920,12 +936,31 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
         remove_ids = ("INBOX",) if "archive" in item.planned_actions else ()
         grouped.setdefault((add_ids, remove_ids), []).append(item)
 
-    for item in trash_items:
+    grouped_count = sum(len(items) for items in grouped.values())
+    batch_count = sum((len(items) + args.batch_size - 1) // args.batch_size for items in grouped.values())
+    print(
+        f"Apply plan: trash={len(trash_items)} single-message calls; "
+        f"label/archive={grouped_count} messages in {batch_count} batchModify calls.",
+        flush=True,
+    )
+
+    for index, item in enumerate(trash_items, 1):
         execute_with_retries(service.users().messages().trash(userId="me", id=item.message_id), args.retries, args.retry_sleep)
         item.action_done = "yes"
+        if index == 1 or index == len(trash_items) or index % args.apply_progress_every == 0:
+            elapsed = max(0.001, time.monotonic() - started)
+            rate = index / elapsed
+            remaining = (len(trash_items) - index) / rate if rate else 0.0
+            print(
+                f"Trashed {index}/{len(trash_items)} messages "
+                f"({rate:.2f}/s, est remaining {remaining / 60:.1f} min)...",
+                flush=True,
+            )
 
+    batch_index = 0
     for (add_ids, remove_ids), items in grouped.items():
         for start in range(0, len(items), args.batch_size):
+            batch_index += 1
             chunk = items[start : start + args.batch_size]
             body: dict[str, list[str]] = {"ids": [item.message_id for item in chunk]}
             if add_ids:
@@ -935,6 +970,8 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
             execute_with_retries(service.users().messages().batchModify(userId="me", body=body), args.retries, args.retry_sleep)
             for item in chunk:
                 item.action_done = "yes"
+            if batch_index == 1 or batch_index == batch_count or batch_index % args.apply_progress_every == 0:
+                print(f"Applied label/archive batch {batch_index}/{batch_count}...", flush=True)
 
 
 def write_csv(path: Path, decisions: list[Decision]) -> None:
@@ -1454,6 +1491,7 @@ def write_yearly_dashboards(out_prefix: Path, decisions: list[Decision], args: a
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Categorize Gmail messages before December 30, 2025 with dashboard-centered review.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION} ({VERSION_CODE})")
     parser.add_argument("--credentials", default=str(PROJECT_DIR / "secrets" / "credentials.json"))
     parser.add_argument("--token-readonly", default=str(PROJECT_DIR / "secrets" / "token_sorter_readonly.json"))
     parser.add_argument("--token-modify", default=str(PROJECT_DIR / "secrets" / "token_sorter_modify.json"))
@@ -1471,6 +1509,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sleep", type=float, default=0.05)
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument("--retry-sleep", type=float, default=5.0)
+    parser.add_argument("--http-timeout", type=float, default=120.0, help="Socket timeout in seconds for Gmail API calls.")
+    parser.add_argument("--apply-progress-every", type=int, default=100, help="Print apply-stage progress every N trash calls or batch modifies.")
     parser.add_argument("--resume", action="store_true", help="Reuse and update the progress JSON for interrupted scans.")
     parser.add_argument("--refresh-existing", action="store_true", help="Refresh all cached decisions even when --resume is used.")
     parser.add_argument("--refresh-after-days", type=int, default=7, help="Refresh cached decisions older than this many days.")
@@ -1489,6 +1529,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.http_timeout > 0:
+        socket.setdefaulttimeout(args.http_timeout)
+    args.apply_progress_every = max(1, args.apply_progress_every)
     allowlist = Path(args.allowlist)
     blocklist = Path(args.blocklist)
     ensure_default_config_files(allowlist, blocklist)
@@ -1506,7 +1549,7 @@ def main() -> int:
     scopes = [MODIFY_SCOPE] if args.apply else [READONLY_SCOPE]
     token_path = Path(args.token_modify if args.apply else args.token_readonly).expanduser()
     creds = get_credentials(Path(args.credentials).expanduser(), token_path, scopes, args.open_browser, google_libs)
-    service = build("gmail", "v1", credentials=creds)
+    service = build_gmail_service(build, creds, args)
     list_throttle = AdaptiveThrottle(args.sleep)
 
     try:
@@ -1534,7 +1577,16 @@ def main() -> int:
         print(f"Restricted apply/report set to {len(decisions)} messages from manifest: {args.manifest}")
 
     if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
-        print(f"Applying stage={args.stage} to {len(decisions)} messages...")
+        action_count = sum(
+            1
+            for item in decisions
+            if (
+                (args.stage == "trash" and "trash" in item.planned_actions)
+                or (args.stage == "archive" and "archive" in item.planned_actions)
+                or (args.stage == "label" and any(action.startswith("label:") for action in item.planned_actions))
+            )
+        )
+        print(f"Applying stage={args.stage} to {action_count}/{len(decisions)} messages with planned {args.stage} actions...", flush=True)
         apply_decisions(service, decisions, args)
         for item in decisions:
             progress[item.message_id] = item

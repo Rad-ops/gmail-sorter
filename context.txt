@@ -2,7 +2,7 @@ Project: Gmail sorter / inbox cleanup
 Repo: /home/rzangeneh/codebase/sorter
 Remote: https://github.com/Rad-ops/gmail-sorter.git
 Branch: main
-Current head: 1106364 (Improve dashboard visuals)
+Current head: 937bdb3 (Improve Gmail trash scoring and reports)
 
 What is already done:
 - Local repo initialized and pushed to GitHub.
@@ -26,7 +26,7 @@ What is already done:
 - Broad single-query runs were too slow / throttled; year-chunking worked reliably.
 
 Current code state:
-- Final scoring/reporting changes are ready to commit.
+- Current version is 0.2.0 / version code 20260705.
 - The code includes:
   - stronger promotional scoring using one-click unsubscribe, List-Unsubscribe, List-Id, bulk/list precedence, campaign headers, promotional sender local-parts, and strong promo subject patterns
   - `perfect_ad_match` for messages that score 100 and have multiple independent bulk/promotional signals while still respecting allowlists, important/primary labels, attachments, protected categories, and mixed-thread protection
@@ -36,11 +36,15 @@ Current code state:
   - clickable unsubscribe links in dashboard tables
   - combined all-years dashboard plus per-year dashboard HTML files generated from one scan
   - progress/report filtering so reused progress files do not pollute the current query results
+  - apply-stage progress output for trash and label/archive writes
+  - explicit Gmail HTTP timeouts and clearer retry diagnostics
 - Generated reports, checkpoints, manifests, secrets, and `.venv/` are intentionally ignored and remain local.
 
 Important runtime notes:
 - Use `.venv/bin/python` for the sorter.
 - Prefer year chunks and conservative worker counts. `--workers 6` and `--sleep 0.1` have been more stable than broader/faster runs.
+- For interrupted all-years trash apply runs, rerun with `--resume` but without `--refresh-existing`.
+- The all-years trash apply can run for hours because trash writes are single-message Gmail API calls.
 - The sorter writes reports to `reports/`, checkpoints to `data/`, and manifests to `manifests/`.
 - Trash stages use Gmail's Trash API, not permanent delete.
 - Final all-years run should use `in:anywhere -in:trash` and a dedicated all-years progress file.

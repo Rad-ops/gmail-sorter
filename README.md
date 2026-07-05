@@ -2,6 +2,8 @@
 
 Dashboard-centered Gmail cleanup tool for older mail. It scans messages before December 30, 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
 
+Current version: `0.2.0` (`20260705`).
+
 ## Folder Layout
 
 ```text
@@ -81,7 +83,6 @@ cd /home/rzangeneh/codebase/sorter
   --trash-obvious-ads \
   --i-understand-trash \
   --resume \
-  --refresh-existing \
   --workers 6 \
   --sleep 0.1 \
   --attachment-details \
@@ -92,6 +93,8 @@ cd /home/rzangeneh/codebase/sorter
 ```
 
 The combined dashboard is written to `reports/gmail_sorter_all_years_trash_apply.html`. Per-year dashboards are written beside it with suffixes such as `_2024.html`.
+
+For interrupted all-years trash apply runs, rerun the same command with `--resume` and without `--refresh-existing`. The query excludes Trash, so messages already moved by a previous interrupted run are not selected again.
 
 Apply only a reviewed manifest:
 
@@ -108,6 +111,10 @@ python3 src/gmail_sorter.py --resume --workers 8
 ```
 
 `--sleep` is the base throttle. The script increases delay automatically when Gmail returns retryable quota/rate errors, then gradually recovers after successful requests.
+
+`--http-timeout 120` is the default Gmail HTTP request timeout. Increase it for very slow connections, or lower it if you want stuck requests to fail faster.
+
+`--apply-progress-every 100` controls how often the apply phase prints progress for single-message trash calls and batch label/archive calls.
 
 `--refresh-after-days 7` refreshes cached decisions older than seven days when `--resume` is used. Use `--refresh-existing` to rescan everything.
 

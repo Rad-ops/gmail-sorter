@@ -5,7 +5,6 @@ cd /home/rzangeneh/codebase/sorter
   --trash-obvious-ads \
   --i-understand-trash \
   --resume \
-  --refresh-existing \
   --workers 6 \
   --sleep 0.1 \
   --attachment-details \
@@ -16,7 +15,10 @@ cd /home/rzangeneh/codebase/sorter
 
 Notes:
 - This is the final all-years cleanup pass across all non-trash mail.
+- This resume command intentionally omits --refresh-existing so it does not rescan the full mailbox after an interrupted apply.
 - It writes one combined dashboard plus per-year dashboard HTML files.
 - Body unsubscribe links are scrubbed from message text and shown separately from header unsubscribe links.
 - If Gmail throttles again, reduce workers to 4 and increase sleep to 0.2.
+- Apply progress logs print every 100 trash calls or batch updates by default.
+- Gmail API calls use a 120 second HTTP timeout by default.
 - Gmail API Trash is used, not permanent delete.
