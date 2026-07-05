@@ -379,10 +379,12 @@ def execute_with_retries(
             return response
         except Exception as error:
             lowered = str(error).lower()
+            status = getattr(getattr(error, "resp", None), "status", None)
             retryable = (
-                "429" in lowered
-                or ("403" in lowered and "quota" in lowered)
-                or "rate" in lowered
+                status in {429, 500, 502, 503, 504}
+                or (status == 403 and ("quota" in lowered or "rate limit" in lowered))
+                or (status is None and ("429" in lowered or "rate limit" in lowered))
+                or (status is None and "403" in lowered and "quota" in lowered)
                 or "quota exceeded" in lowered
                 or "backenderror" in lowered
                 or "temporarily unavailable" in lowered

@@ -1,0 +1,210 @@
+Resume context for tomorrow - 2026-07-05 02:49 America/Toronto
+
+Working directory:
+  /home/rzangeneh/codebase/sorter
+
+User question:
+  The user asked whether this command was working as expected:
+    cd /home/rzangeneh/codebase/sorter
+    commands/run-overnight-trash-rescue-and-delete-verified.sh
+  They noticed the log files looked empty-ish.
+
+Finding:
+  The recent runs were not completing. There was no active
+  trash_rescue_audit.py / run-overnight-trash-rescue process. The latest logs
+  under:
+    /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs
+  started, printed a few missing Gmail IDs, and did not reach the wrapper's
+  final "Completed" lines.
+
+Relevant logs checked:
+  /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/trash-rescue-delete-verified-20260705-011626.log
+  /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/trash-rescue-delete-verified-20260705-011852.log
+  /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/trash-rescue-delete-verified-20260705-012112.log
+
+Root cause:
+  Gmail returns 404 "Requested entity was not found" for message IDs that are
+  already deleted or stale entries from the progress file. The rescue audit
+  code intended to skip those. However, gmail_sorter.execute_with_retries()
+  classified the error text as retryable because the Gmail request URL included
+  the string "metadataHeaders=X-Campaign", which contains "campaign"; the old
+  retry check used a broad substring match for "rate". This caused each stale
+  404 to go through exponential backoff before the rescue audit could skip it.
+  With retries=8 and retry_sleep=8, a single stale 404 could waste a very long
+  time, making the log look empty/stalled.
+
+Fix applied:
+  Modified src/gmail_sorter.py so execute_with_retries() uses the explicit
+  HTTP status when present:
+    - retries 429 and 5xx
+    - retries 403 only for quota/rate-limit text
+    - preserves fallback text matching when no status is available
+    - does not retry 404
+
+Regression test added:
+  tests/test_trash_rescue_audit.py now includes test_gmail_404_is_not_retried,
+  asserting a 404 request is executed once even when retries=8.
+
+Verification already run:
+  .venv/bin/python -m unittest tests/test_trash_rescue_audit.py
+  Result: passed, 8 tests.
+
+  Also ran a capped Gmail probe with network approval:
+    .venv/bin/python src/trash_rescue_audit.py \
+      --progress-file data/gmail_sorter_all_years_progress.json \
+      --out-prefix reports/trash_rescue_audit_probe \
+      --max-messages 10 \
+      --sleep 0 \
+      --retries 1 \
+      --retry-sleep 0 \
+      --http-timeout 30
+
+  Result:
+    - completed in about 3.5 seconds
+    - skipped 10 missing Gmail message IDs immediately
+    - wrote probe reports:
+      reports/trash_rescue_audit_probe.html
+      reports/trash_rescue_audit_probe.csv
+      reports/trash_rescue_audit_probe.json
+      reports/trash_rescue_audit_probe_summary.json
+      reports/trash_rescue_audit_probe_missing_gmail_ids.txt
+
+Current git state:
+  Modified:
+    src/gmail_sorter.py
+    tests/test_trash_rescue_audit.py
+  Added:
+    tbresumed
+
+Answer to "is everything working now?":
+  The identified stall is fixed and verified with a capped probe. The full
+  overnight rescue/delete command has not been rerun to completion yet. It
+  should be rerun tomorrow to produce the real local-Qwen audit, reports,
+  delete manifest, and any verified permanent deletes.
+
+Command to rerun tomorrow:
+  cd /home/rzangeneh/codebase/sorter
+  commands/run-overnight-trash-rescue-and-delete-verified.sh
+
+Expected behavior after the fix:
+  The log may still begin with "Skipping missing Gmail message ..." because the
+  progress file contains stale IDs, but it should move past those quickly. A
+  successful full run should end with "Completed at ..." and point to:
+    reports/trash_rescue_audit_local_qwen.html
+    reports/trash_rescue_audit_local_qwen_permanent_delete_manifest.json
+
+Good quick checks while/after running:
+  ps -eo pid,ppid,stat,etime,cmd | rg 'trash_rescue_audit|run-overnight-trash-rescue|systemd-inhibit|llama|qwen'
+  tail -f /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/trash-rescue-delete-verified-*.log
+  ls -lh reports/trash_rescue_audit_local_qwen*
+
+Note:
+  Probe reports with prefix reports/trash_rescue_audit_probe* are temporary
+  verification artifacts and can be removed later if desired.
+
+Update - 2026-07-05 03:04 America/Toronto
+
+The full overnight command is now running and should be left alone overnight:
+  PID 39075 systemd-inhibit
+  PID 39092 bash commands/run-overnight-trash-rescue-and-delete-verified.sh
+  PID 39103 .venv/bin/python src/trash_rescue_audit.py ...
+
+It is running under systemd-inhibit with:
+  --what=sleep:idle:handle-lid-switch
+
+That should prevent sleep/idle/lid-switch suspension while the command runs.
+Do not close the terminal/session that launched it, kill the processes, reboot,
+or stop local-llm.service.
+
+Latest checked progress:
+  Log:
+    /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/trash-rescue-delete-verified-20260705-012556.log
+  Last observed line:
+    Audited 13100/19107 candidates; report rows=9276; skipped=3824; missing=3824
+
+Current local model:
+  /home/rzangeneh/ai/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf
+
+Server details:
+  local-llm.service active since 2026-07-05 01:20:22 EDT
+  llama-server PID 36606
+  host/port 127.0.0.1:8080
+  ctx-size 16384
+  n_params about 30.5B
+  quantization Q4_K - Medium
+
+GPU at check time:
+  RTX 4070 Ti SUPER
+  llama-server using about 9798 MiB VRAM
+
+Speed:
+  The current overnight job had not reached the local-LLM review phase yet at
+  the time of checking. A tiny live probe against the loaded llama-server
+  returned:
+    prompt eval: 42.38 tokens/sec
+    generation: 56.47 tokens/sec
+    total: 35 tokens in 719.90 ms
+
+  During the actual LLM phase, speed can be watched with:
+    journalctl --user -u local-llm.service -f
+
+  llama.cpp prints lines like:
+    prompt eval time = ... tokens per second
+    eval time = ... tokens per second
+
+Status answer:
+  Yes, leave it running for the rest of the night. It is making progress. No
+  rerun is needed unless it exits early without "Completed at ...".
+
+Update - 2026-07-05 03:07 America/Toronto
+
+Added and started an overnight listener:
+  /home/rzangeneh/codebase/sorter/commands/listen-local-llm-speed.sh
+
+It is running as a transient user systemd unit:
+  local-llm-speed-listener.service
+
+Check it with:
+  systemctl --user status local-llm-speed-listener.service --no-pager
+
+Current listener output files:
+  /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/local-llm-speed-listener-20260705-030631.log
+  /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/local-llm-speed-listener-20260705-030631.csv
+
+The listener samples every 60 seconds. While the audit is still fetching Gmail
+messages, it records audit progress. Once local LLM review starts, it records:
+  reviewed_messages from trash_rescue_audit_local_qwen_local_llm_results.jsonl
+  prompt token count
+  prompt tokens/sec
+  generation token count
+  generation tokens/sec
+  total tokens
+  total request ms
+
+Latest main audit check:
+  Audited 13400/19107 candidates; report rows=9576; skipped=3824; missing=3824
+
+Nothing else should be needed before sleep. Leave the machine powered, avoid
+reboot/suspend, leave the launching terminal/session alone, and let
+local-llm.service plus local-llm-speed-listener.service keep running.
+
+Final pre-sleep consolidation - 2026-07-05 03:10 America/Toronto
+
+Single handoff file for tomorrow:
+  /home/rzangeneh/codebase/sorter/tbresumed
+
+Temporary probe artifacts removed:
+  reports/trash_rescue_audit_probe.*
+  /tmp/local-llm-speed-probe.json
+  first failed listener one-shot logs with timestamp 20260705-030614
+
+Operational files intentionally kept:
+  /home/rzangeneh/codebase/sorter/commands/listen-local-llm-speed.sh
+    This is the actual listener command used by the active systemd unit.
+  /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/local-llm-speed-listener-20260705-030631.log
+  /home/rzangeneh/codebase/local-ai-gmail-interpreter/logs/local-llm-speed-listener-20260705-030631.csv
+    These are the live overnight speed/progress logs.
+
+Git commit requested:
+  Commit the retry fix, regression test, listener command, and this handoff
+  file before ending the session.

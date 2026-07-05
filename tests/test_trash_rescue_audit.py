@@ -163,6 +163,25 @@ class TrashRescueAuditTests(unittest.TestCase):
         self.assertTrue(trash_rescue_audit.is_missing_gmail_message_error(Error("not found")))
         self.assertTrue(trash_rescue_audit.is_missing_gmail_message_error(Exception("Requested entity was not found.")))
 
+    def test_gmail_404_is_not_retried(self):
+        class Response:
+            status = 404
+
+        class Error(Exception):
+            resp = Response()
+
+        class Request:
+            calls = 0
+
+            def execute(self):
+                self.calls += 1
+                raise Error("Requested entity was not found.")
+
+        request = Request()
+        with self.assertRaises(Error):
+            gmail_sorter.execute_with_retries(request, retries=8, retry_sleep=0)
+        self.assertEqual(request.calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
