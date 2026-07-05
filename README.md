@@ -141,6 +141,87 @@ Or scan from an exact date:
 python3 src/gmail_sorter.py --since-date 2026-07-01 --resume
 ```
 
+## Trash Rescue Audit
+
+Before permanently emptying Gmail Trash, run a dry-run rescue audit against the messages that the all-years trash command planned to trash:
+
+```bash
+cd /home/rzangeneh/codebase/sorter
+.venv/bin/python src/trash_rescue_audit.py \
+  --progress-file data/gmail_sorter_all_years_progress.json \
+  --out-prefix reports/trash_rescue_audit \
+  --sleep 0.1 \
+  --http-timeout 120
+```
+
+This creates:
+
+```text
+reports/trash_rescue_audit.html
+reports/trash_rescue_audit.csv
+reports/trash_rescue_audit.json
+reports/trash_rescue_audit_summary.json
+```
+
+The audit re-fetches each planned-trash message from Gmail, confirms whether it is still in Trash, and flags possible mistakes using deeper rules for immigration, studies, legal/transactional language, real attachments, conversation signals, and original sorter protection reasons.
+
+Optional model-assisted review:
+
+```bash
+OPENAI_API_KEY=... .venv/bin/python src/trash_rescue_audit.py \
+  --openai \
+  --web-search \
+  --openai-max 200
+```
+
+The model path is optional and only reviews likely borderline/high-risk candidates. The local heuristic report still works without it.
+
+For a local Qwen model, export bounded review packets instead of giving the model Gmail access:
+
+```bash
+.venv/bin/python src/trash_rescue_audit.py \
+  --progress-file data/gmail_sorter_all_years_progress.json \
+  --out-prefix reports/trash_rescue_audit \
+  --llm-export \
+  --llm-body-chars 1200
+```
+
+Feed these files to Qwen:
+
+```text
+reports/trash_rescue_audit_llm_prompt.md
+reports/trash_rescue_audit_llm_input.jsonl
+```
+
+Qwen should produce JSONL like:
+
+```json
+{"message_id":"abc123","decision":"rescue_review","confidence":0.91,"reason":"IRCC/legal document signal","signals":["immigration","attachment"]}
+```
+
+Merge Qwen's output without re-fetching Gmail:
+
+```bash
+.venv/bin/python src/trash_rescue_audit.py \
+  --from-audit-json reports/trash_rescue_audit.json \
+  --model-results reports/qwen_trash_rescue_results.jsonl \
+  --out-prefix reports/trash_rescue_audit_qwen
+```
+
+If you decide to restore rescue candidates after reviewing the report:
+
+```bash
+.venv/bin/python src/trash_rescue_audit.py \
+  --apply \
+  --i-understand-restore
+```
+
+Restore applies one of these Gmail labels and untrashes the message unless `--label-only` is used:
+
+- `Trash Rescue/Review - 100 Confidence`
+- `Trash Rescue/Review - 75-99 Confidence`
+- `Trash Rescue/Review - Under 75 Confidence`
+
 ## Performance Controls
 
 `--workers` controls parallel read/classification workers. Writes remain sequential and batched.
