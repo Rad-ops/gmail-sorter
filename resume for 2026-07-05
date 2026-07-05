@@ -1,0 +1,38 @@
+Resume notes for 2026-07-05
+
+Current command to run in a separate terminal:
+
+cd /home/rzangeneh/codebase/sorter
+commands/run-overnight-trash-rescue-and-delete-verified.sh
+
+What happened:
+
+- The run printed many Gmail API 404 `Requested entity was not found` errors.
+- Those IDs are stale/missing from Gmail. They were already deleted, removed by another process/client, or no longer available even though they remain in the old progress file.
+- The audit script was already skipping them safely.
+- The output was too noisy, so the script was updated to print only the first few missing IDs, summarize the count, and write all missing IDs to:
+
+reports/trash_rescue_audit_local_qwen_missing_gmail_ids.txt
+
+Important behavior:
+
+- Missing Gmail IDs are not restored, not deleted, and not sent to local Qwen.
+- Non-404 Gmail/API errors still print in full.
+- The verified permanent-delete gate still requires:
+  - message is still in Gmail Trash
+  - script recommendation is keep_trash
+  - script_delete_confidence == 100
+  - local Qwen decision is keep_trash
+  - local Qwen confidence is 1.0
+  - no real attachments
+  - no rescue reasons
+
+Resumability:
+
+- Re-run the same command after interruption.
+- Partial reports are written with `_partial` suffix during Gmail audit.
+- Local Qwen results are appended to `reports/trash_rescue_audit_local_qwen_local_llm_results.jsonl` and reused on rerun.
+
+PC sleep:
+
+- The command uses `systemd-inhibit` to prevent sleep/idle/lid sleep while it runs.

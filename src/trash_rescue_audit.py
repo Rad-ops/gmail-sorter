@@ -198,6 +198,14 @@ def load_existing_audit(path: Path) -> list[RescueAudit]:
     return [audit_from_dict(item) for item in data]
 
 
+def is_missing_gmail_message_error(error: Exception) -> bool:
+    status = getattr(getattr(error, "resp", None), "status", None)
+    if status == 404:
+        return True
+    lowered = str(error).lower()
+    return "notfound" in lowered or "requested entity was not found" in lowered
+
+
 def searchable_text(message: dict[str, Any], headers: dict[str, str]) -> str:
     payload = message.get("payload", {})
     body_text = gmail_sorter.collect_body_text(payload, max_chars=80_000)
@@ -951,6 +959,7 @@ def main() -> int:
 
     audits: list[RescueAudit] = []
     skipped = 0
+    missing_ids: list[str] = []
     throttle = gmail_sorter.AdaptiveThrottle(args.sleep)
     for index, decision in enumerate(candidates, 1):
         try:
@@ -963,7 +972,14 @@ def main() -> int:
                 include_attachment_details=True,
             )
         except HttpError as error:
-            print(f"Skipping {decision.message_id}: {error}", file=sys.stderr)
+            if is_missing_gmail_message_error(error):
+                missing_ids.append(decision.message_id)
+                if len(missing_ids) <= 5:
+                    print(f"Skipping missing Gmail message {decision.message_id} (already deleted or stale progress entry).", file=sys.stderr)
+                elif len(missing_ids) == 6:
+                    print("Additional missing Gmail messages will be summarized instead of printed individually.", file=sys.stderr)
+            else:
+                print(f"Skipping {decision.message_id}: {error}", file=sys.stderr)
             skipped += 1
             continue
         audit = audit_message(decision, message, args.llm_body_chars)
@@ -977,7 +993,12 @@ def main() -> int:
             if args.llm_export:
                 write_llm_export(partial, audits)
         if index == 1 or index == len(candidates) or index % 100 == 0:
-            print(f"Audited {index}/{len(candidates)} candidates; report rows={len(audits)}; skipped={skipped}", flush=True)
+            print(f"Audited {index}/{len(candidates)} candidates; report rows={len(audits)}; skipped={skipped}; missing={len(missing_ids)}", flush=True)
+
+    if missing_ids:
+        missing_path = out_prefix.with_name(out_prefix.name + "_missing_gmail_ids.txt")
+        missing_path.write_text("\n".join(missing_ids) + "\n", encoding="utf-8")
+        print(f"Skipped {len(missing_ids)} missing Gmail message IDs. Wrote {missing_path}")
 
     if args.openai:
         openai_count = 0

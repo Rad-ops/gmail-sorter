@@ -153,6 +153,16 @@ class TrashRescueAuditTests(unittest.TestCase):
         audit.model_confidence = 1.0
         self.assertEqual(trash_rescue_audit.permanent_delete_candidates([audit]), [audit])
 
+    def test_missing_gmail_message_detection(self):
+        class Response:
+            status = 404
+
+        class Error(Exception):
+            resp = Response()
+
+        self.assertTrue(trash_rescue_audit.is_missing_gmail_message_error(Error("not found")))
+        self.assertTrue(trash_rescue_audit.is_missing_gmail_message_error(Exception("Requested entity was not found.")))
+
 
 if __name__ == "__main__":
     unittest.main()

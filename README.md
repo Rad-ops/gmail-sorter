@@ -276,7 +276,10 @@ The verified permanent-delete run writes:
 ```text
 reports/trash_rescue_audit_local_qwen_permanent_delete_manifest.json
 reports/trash_rescue_audit_local_qwen_permanent_delete_manifest.csv
+reports/trash_rescue_audit_local_qwen_missing_gmail_ids.txt
 ```
+
+Old progress files may contain message IDs that Gmail no longer has. The audit summarizes those 404 missing IDs and writes them to the missing-ID file instead of printing every API error.
 
 ## Performance Controls
 

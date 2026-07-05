@@ -40,9 +40,12 @@ reports/trash_rescue_audit_local_qwen_summary.json
 reports/trash_rescue_audit_local_qwen_local_llm_results.jsonl
 reports/trash_rescue_audit_local_qwen_llm_input.jsonl
 reports/trash_rescue_audit_local_qwen_llm_prompt.md
+reports/trash_rescue_audit_local_qwen_missing_gmail_ids.txt
 ```
 
 Review the HTML first.
+
+If Gmail returns `404 Requested entity was not found` for old message IDs, the script treats those as stale/missing progress entries. It skips them, prints only a short summary, and writes all missing IDs to the missing-ID text file.
 
 ## Why Conservative Settings
 
