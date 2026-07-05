@@ -9,6 +9,7 @@ Workspace:
 - Local AI stack and models remain under /home/rzangeneh/ai and should not be moved.
 - Local AI Gmail operations wrapper: /home/rzangeneh/codebase/local-ai-gmail-interpreter
 - Overnight Trash rescue command: /home/rzangeneh/codebase/local-ai-gmail-interpreter/commands/run-overnight-trash-rescue.sh
+- Overnight Trash rescue + verified permanent delete command: /home/rzangeneh/codebase/sorter/commands/run-overnight-trash-rescue-and-delete-verified.sh
 
 What is already done:
 - Local repo initialized and pushed to GitHub.
@@ -68,5 +69,7 @@ cd /home/rzangeneh/codebase/sorter
 Suggested next focus:
 - Before permanently emptying Gmail Trash, run the overnight local-Qwen rescue audit:
   `/home/rzangeneh/codebase/local-ai-gmail-interpreter/commands/run-overnight-trash-rescue.sh`
+- If you want unattended permanent deletion for only messages that both the script and local Qwen rate as 100% trash, run:
+  `/home/rzangeneh/codebase/sorter/commands/run-overnight-trash-rescue-and-delete-verified.sh`
 - Review `reports/trash_rescue_audit_local_qwen.html`.
 - Only restore candidates after manual review.

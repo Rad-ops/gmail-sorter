@@ -134,6 +134,25 @@ class TrashRescueAuditTests(unittest.TestCase):
         self.assertIn("Return exactly one JSON object", prompt)
         self.assertIn('"message_id": "m1"', prompt)
 
+    def test_permanent_delete_requires_both_100_percent_gates(self):
+        audit = trash_rescue_audit.audit_message(
+            decision(),
+            message(
+                {
+                    "From": "Deals <deals@shop.example>",
+                    "Subject": "Flash sale 50% off",
+                    "List-Unsubscribe": "<https://shop.example/unsubscribe>",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                },
+                snippet="Shop now. Manage preferences or unsubscribe.",
+            ),
+        )
+        audit.model_decision = "keep_trash"
+        audit.model_confidence = 0.99
+        self.assertEqual(trash_rescue_audit.permanent_delete_candidates([audit]), [])
+        audit.model_confidence = 1.0
+        self.assertEqual(trash_rescue_audit.permanent_delete_candidates([audit]), [audit])
+
 
 if __name__ == "__main__":
     unittest.main()

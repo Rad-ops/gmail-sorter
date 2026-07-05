@@ -116,6 +116,7 @@ class RescueAudit:
     gmail_labels: list[str] = field(default_factory=list)
     still_in_trash: bool = False
     deep_risk_score: int = 0
+    script_delete_confidence: int = 0
     rescue_reasons: list[str] = field(default_factory=list)
     keep_trash_reasons: list[str] = field(default_factory=list)
     recommended_action: str = "keep_trash"
@@ -128,6 +129,7 @@ class RescueAudit:
     snippet: str = ""
     body_excerpt: str = ""
     model_decision: str = ""
+    model_confidence: float = 0.0
     model_reason: str = ""
     model_error: str = ""
 
@@ -142,6 +144,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-messages", type=int, default=0, help="Limit number of progress candidates to inspect.")
     parser.add_argument("--min-confidence", type=int, default=0, help="Only inspect candidates with original ad confidence >= N.")
     parser.add_argument("--include-not-in-trash", action="store_true", help="Also report candidates no longer carrying Gmail TRASH.")
+    parser.add_argument("--checkpoint-every", type=int, default=100, help="Write partial reports every N audited Gmail messages.")
     parser.add_argument("--workers", type=int, default=1, help="Reserved for future parallel audit; current audit is sequential to reduce Gmail pressure.")
     parser.add_argument("--sleep", type=float, default=0.1)
     parser.add_argument("--retries", type=int, default=5)
@@ -167,6 +170,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="Untrash rescue candidates and apply review labels.")
     parser.add_argument("--label-only", action="store_true", help="Apply review labels without untrashing.")
     parser.add_argument("--i-understand-restore", action="store_true", help="Required with --apply.")
+    parser.add_argument("--delete-passed-trash", action="store_true", help="Permanently delete messages that both script and local model classify as 100%% safe trash.")
+    parser.add_argument("--i-understand-permanent-delete", action="store_true", help="Required with --delete-passed-trash. Gmail permanent delete cannot be undone.")
     return parser.parse_args()
 
 
@@ -216,7 +221,8 @@ def hits(text: str, terms: list[str]) -> list[str]:
     lowered = text.lower()
     found = []
     for term in terms:
-        if term.lower() in lowered:
+        pattern = r"(?<![a-z0-9])" + re.escape(term.lower()) + r"(?![a-z0-9])"
+        if re.search(pattern, lowered):
             found.append(term)
     return found
 
@@ -231,6 +237,26 @@ def confidence_bucket(confidence: int) -> str:
 
 def label_for_confidence(confidence: int) -> str:
     return REVIEW_LABELS[confidence_bucket(confidence)]
+
+
+def compute_script_delete_confidence(decision: gmail_sorter.Decision, score: int, rescue_reasons: list[str], keep_trash_reasons: list[str], real_attachment_count: int) -> int:
+    if score > 0 or rescue_reasons or real_attachment_count:
+        return 0
+    if decision.ad_confidence < 100:
+        return 0
+    if not decision.perfect_ad_match:
+        return 0
+    required_evidence = {
+        "original_perfect_ad_match",
+        "original_100_confidence",
+    }
+    if not required_evidence.issubset(set(keep_trash_reasons)):
+        return 0
+    if not any(reason.startswith("marketing_terms:") for reason in keep_trash_reasons):
+        return 0
+    if "unsubscribe_signal" not in keep_trash_reasons:
+        return 0
+    return 100
 
 
 def audit_message(decision: gmail_sorter.Decision, message: dict[str, Any], body_chars: int = 1200) -> RescueAudit:
@@ -304,6 +330,13 @@ def audit_message(decision: gmail_sorter.Decision, message: dict[str, Any], body
 
     score = max(0, min(100, score))
     recommended_action = "rescue_review" if score >= 45 else "keep_trash"
+    script_delete_confidence = compute_script_delete_confidence(
+        decision,
+        score,
+        rescue_reasons,
+        keep_trash_reasons,
+        real_attachment_count,
+    )
 
     return RescueAudit(
         message_id=decision.message_id,
@@ -320,6 +353,7 @@ def audit_message(decision: gmail_sorter.Decision, message: dict[str, Any], body
         gmail_labels=labels,
         still_in_trash="TRASH" in labels,
         deep_risk_score=score,
+        script_delete_confidence=script_delete_confidence,
         rescue_reasons=rescue_reasons,
         keep_trash_reasons=keep_trash_reasons,
         recommended_action=recommended_action,
@@ -457,6 +491,7 @@ def write_reports(out_prefix: Path, audits: list[RescueAudit]) -> None:
         "keep_trash": sum(1 for item in audits if item.recommended_action == "keep_trash"),
         "rescue_by_confidence_bucket": dict(by_confidence),
         "top_rescue_domains": by_domain.most_common(50),
+        "permanent_delete_ready": len(permanent_delete_candidates(audits)),
     }
     (out_prefix.with_name(out_prefix.name + "_summary.json")).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     write_html_report(out_prefix.with_suffix(".html"), audits, summary)
@@ -549,6 +584,9 @@ def local_llm_prompt(packet: dict[str, Any]) -> str:
         "Return exactly one JSON object and no prose. "
         "Schema: {\"message_id\": string, \"decision\": \"rescue_review\"|\"keep_trash\", "
         "\"confidence\": number from 0 to 1, \"reason\": short string, \"signals\": array of short strings}. "
+        "Use confidence 1.0 only when you are completely certain the message is safe to permanently delete. "
+        "If there is any durable account, immigration, legal, school, attachment, financial, security, receipt, "
+        "or human-conversation value, choose rescue_review. "
         "Prefer rescue_review for immigration, visa, IRCC, legal/lawyer, studies, school, transcript, tuition, "
         "government/legal, finance/security, receipts/orders, real attachments, or human conversation. "
         "Prefer keep_trash for obvious marketing/newsletter/social-sale messages with unsubscribe/list/bulk evidence "
@@ -612,15 +650,27 @@ def call_local_llm(packet: dict[str, Any], args: argparse.Namespace) -> tuple[di
 def run_local_llm_review(audits: list[RescueAudit], out_prefix: Path, args: argparse.Namespace) -> Path:
     ensure_local_llm(args)
     results_path = Path(args.local_llm_results) if args.local_llm_results else out_prefix.with_name(out_prefix.name + "_local_llm_results.jsonl")
+    completed_ids = set()
+    if results_path.exists():
+        for raw_line in results_path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("message_id"):
+                completed_ids.add(str(row["message_id"]))
+        if completed_ids:
+            imported = import_model_results(results_path, audits)
+            print(f"Resuming local LLM review with {len(completed_ids)} existing decisions imported ({imported} matched current audit).")
     review_items = [
         item
         for item in sorted(audits, key=lambda row: (row.recommended_action == "rescue_review", row.deep_risk_score, row.original_confidence), reverse=True)
-        if model_should_review(item)
+        if model_should_review(item) and item.message_id not in completed_ids
     ]
     if args.local_llm_max:
         review_items = review_items[: args.local_llm_max]
     results_path.parent.mkdir(parents=True, exist_ok=True)
-    with results_path.open("w", encoding="utf-8") as file:
+    with results_path.open("a", encoding="utf-8") as file:
         for index, item in enumerate(review_items, 1):
             packet = llm_packet(item)
             result, error = call_local_llm(packet, args)
@@ -659,7 +709,12 @@ def import_model_results(path: Path, audits: list[RescueAudit]) -> int:
         decision = str(row.get("decision", ""))
         reason = str(row.get("reason", ""))
         confidence = row.get("confidence", "")
+        try:
+            model_confidence = float(confidence)
+        except (TypeError, ValueError):
+            model_confidence = 0.0
         item.model_decision = decision
+        item.model_confidence = model_confidence
         item.model_reason = f"{reason} (model confidence={confidence})" if confidence != "" else reason
         if decision == "rescue_review":
             item.recommended_action = "rescue_review"
@@ -730,6 +785,7 @@ th {{ background: #eef2f6; position: sticky; top: 0; }}
 <section class="card"><strong>Still In Trash</strong><span>{esc(summary["still_in_trash"])}</span></section>
 <section class="card"><strong>Rescue Review</strong><span>{esc(summary["rescue_review"])}</span></section>
 <section class="card"><strong>Keep Trash</strong><span>{esc(summary["keep_trash"])}</span></section>
+<section class="card"><strong>Delete Ready</strong><span>{esc(summary["permanent_delete_ready"])}</span></section>
 </div>
 <h2>Top Rescue Domains</h2>
 <table><thead><tr><th>Domain</th><th>Messages</th></tr></thead><tbody>{domain_rows}</tbody></table>
@@ -743,6 +799,87 @@ th {{ background: #eef2f6; position: sticky; top: 0; }}
 
 def get_or_create_labels(service: Any, names: list[str], retries: int, retry_sleep: float) -> dict[str, str]:
     return gmail_sorter.get_or_create_labels(service, names, retries, retry_sleep)
+
+
+def build_gmail_modify_service(args: argparse.Namespace) -> Any:
+    google_libs = gmail_sorter.load_google_libraries()
+    _, _, _, build, _ = google_libs
+    creds = gmail_sorter.get_credentials(
+        Path(args.credentials).expanduser(),
+        Path(args.token_modify).expanduser(),
+        [gmail_sorter.MODIFY_SCOPE],
+        args.open_browser,
+        google_libs,
+    )
+    return gmail_sorter.build_gmail_service(build, creds, args)
+
+
+def permanent_delete_candidates(audits: list[RescueAudit]) -> list[RescueAudit]:
+    return [
+        item
+        for item in audits
+        if (
+            item.still_in_trash
+            and item.recommended_action == "keep_trash"
+            and item.script_delete_confidence == 100
+            and item.model_decision == "keep_trash"
+            and item.model_confidence >= 1.0
+            and not item.has_real_attachment
+            and not item.rescue_reasons
+        )
+    ]
+
+
+def write_delete_manifest(out_prefix: Path, candidates: list[RescueAudit]) -> None:
+    json_path = out_prefix.with_name(out_prefix.name + "_permanent_delete_manifest.json")
+    csv_path = out_prefix.with_name(out_prefix.name + "_permanent_delete_manifest.csv")
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "message_count": len(candidates),
+        "requirements": [
+            "still_in_trash",
+            "recommended_action == keep_trash",
+            "script_delete_confidence == 100",
+            "model_decision == keep_trash",
+            "model_confidence >= 1.0",
+            "no real attachments",
+            "no rescue reasons",
+        ],
+        "items": [asdict(item) for item in candidates],
+    }
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    with csv_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=["message_id", "date", "sender", "subject", "original_confidence", "script_delete_confidence", "model_confidence", "model_reason"])
+        writer.writeheader()
+        for item in candidates:
+            writer.writerow(
+                {
+                    "message_id": item.message_id,
+                    "date": item.date,
+                    "sender": item.sender,
+                    "subject": item.subject,
+                    "original_confidence": item.original_confidence,
+                    "script_delete_confidence": item.script_delete_confidence,
+                    "model_confidence": item.model_confidence,
+                    "model_reason": item.model_reason,
+                }
+            )
+
+
+def apply_permanent_deletes(service: Any, audits: list[RescueAudit], args: argparse.Namespace, out_prefix: Path) -> None:
+    candidates = permanent_delete_candidates(audits)
+    write_delete_manifest(out_prefix, candidates)
+    if not candidates:
+        print("No permanent-delete candidates met both 100% gates.")
+        return
+    for index, item in enumerate(candidates, 1):
+        gmail_sorter.execute_with_retries(
+            service.users().messages().delete(userId="me", id=item.message_id),
+            args.retries,
+            args.retry_sleep,
+        )
+        if index == 1 or index == len(candidates) or index % 100 == 0:
+            print(f"Permanently deleted {index}/{len(candidates)} verified trash messages...", flush=True)
 
 
 def apply_rescue_actions(service: Any, audits: list[RescueAudit], args: argparse.Namespace) -> None:
@@ -779,6 +916,9 @@ def main() -> int:
     if args.apply and not args.i_understand_restore:
         print("Refusing apply without --i-understand-restore.", file=sys.stderr)
         return 2
+    if args.delete_passed_trash and not args.i_understand_permanent_delete:
+        print("Refusing permanent delete without --i-understand-permanent-delete.", file=sys.stderr)
+        return 2
 
     out_prefix = Path(args.out_prefix)
 
@@ -792,6 +932,9 @@ def main() -> int:
         if args.llm_export:
             write_llm_export(out_prefix, audits)
         write_reports(out_prefix, audits)
+        if args.delete_passed_trash:
+            service = build_gmail_modify_service(args)
+            apply_permanent_deletes(service, audits, args, out_prefix)
         rescue_count = sum(1 for item in audits if item.recommended_action == "rescue_review")
         print(f"OFFLINE REPORT: audited={len(audits)} rescue_review={rescue_count} keep_trash={len(audits) - rescue_count}")
         print(f"Wrote {out_prefix.with_suffix('.html')}")
@@ -803,15 +946,8 @@ def main() -> int:
     print(f"Loaded {len(candidates)} planned-trash candidates from {args.progress_file}")
 
     google_libs = gmail_sorter.load_google_libraries()
-    _, _, _, build, HttpError = google_libs
-    creds = gmail_sorter.get_credentials(
-        Path(args.credentials).expanduser(),
-        Path(args.token_modify).expanduser(),
-        [gmail_sorter.MODIFY_SCOPE],
-        args.open_browser,
-        google_libs,
-    )
-    service = gmail_sorter.build_gmail_service(build, creds, args)
+    *_, HttpError = google_libs
+    service = build_gmail_modify_service(args)
 
     audits: list[RescueAudit] = []
     skipped = 0
@@ -835,6 +971,11 @@ def main() -> int:
             audits.append(audit)
         else:
             skipped += 1
+        if args.checkpoint_every and len(audits) and len(audits) % args.checkpoint_every == 0:
+            partial = Path(args.out_prefix).with_name(Path(args.out_prefix).name + "_partial")
+            write_reports(partial, audits)
+            if args.llm_export:
+                write_llm_export(partial, audits)
         if index == 1 or index == len(candidates) or index % 100 == 0:
             print(f"Audited {index}/{len(candidates)} candidates; report rows={len(audits)}; skipped={skipped}", flush=True)
 
@@ -880,6 +1021,8 @@ def main() -> int:
 
     if args.apply:
         apply_rescue_actions(service, audits, args)
+    if args.delete_passed_trash:
+        apply_permanent_deletes(service, audits, args, out_prefix)
     return 0
 
 

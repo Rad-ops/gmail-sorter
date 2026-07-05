@@ -6,6 +6,12 @@ Run the overnight local-Qwen safety review:
 commands/run-overnight-trash-rescue.sh
 ```
 
+Run the overnight local-Qwen safety review and permanently delete only messages that both reviewers classify as 100% safe trash:
+
+```bash
+commands/run-overnight-trash-rescue-and-delete-verified.sh
+```
+
 After reviewing `reports/trash_rescue_audit_local_qwen.html`, restore rescue candidates:
 
 ```bash

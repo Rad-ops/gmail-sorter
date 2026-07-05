@@ -151,6 +151,22 @@ Recommended overnight local-Qwen run:
 /home/rzangeneh/codebase/local-ai-gmail-interpreter/commands/run-overnight-trash-rescue.sh
 ```
 
+Recommended unattended run when you want verified 100% trash permanently deleted after both checks pass:
+
+```bash
+/home/rzangeneh/codebase/sorter/commands/run-overnight-trash-rescue-and-delete-verified.sh
+```
+
+This prevents system sleep with `systemd-inhibit`, runs the local-Qwen audit, writes reports/manifests, and permanently deletes only messages that meet all gates:
+
+- still in Gmail Trash
+- script recommendation is `keep_trash`
+- `script_delete_confidence == 100`
+- local model decision is `keep_trash`
+- local model confidence is `1.0`
+- no real attachments
+- no rescue reasons
+
 The same command is also available from this repo:
 
 ```bash
@@ -254,6 +270,13 @@ Restore applies one of these Gmail labels and untrashes the message unless `--la
 - `Trash Rescue/Review - 100 Confidence`
 - `Trash Rescue/Review - 75-99 Confidence`
 - `Trash Rescue/Review - Under 75 Confidence`
+
+The verified permanent-delete run writes:
+
+```text
+reports/trash_rescue_audit_local_qwen_permanent_delete_manifest.json
+reports/trash_rescue_audit_local_qwen_permanent_delete_manifest.csv
+```
 
 ## Performance Controls
 

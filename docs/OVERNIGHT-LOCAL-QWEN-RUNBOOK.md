@@ -4,9 +4,22 @@ Use this before permanently emptying Gmail Trash.
 
 ## Recommended Command
 
+Audit only:
+
 ```bash
 /home/rzangeneh/codebase/local-ai-gmail-interpreter/commands/run-overnight-trash-rescue.sh
 ```
+
+Audit plus verified permanent delete:
+
+```bash
+/home/rzangeneh/codebase/sorter/commands/run-overnight-trash-rescue-and-delete-verified.sh
+```
+
+The verified delete command uses `systemd-inhibit` to prevent sleep and deletes only messages where both gates are exactly 100%:
+
+- sorter/script delete confidence is `100`
+- local Qwen decision is `keep_trash` with confidence `1.0`
 
 This runs:
 
@@ -15,6 +28,7 @@ This runs:
 - Local Qwen review through `http://127.0.0.1:8080/v1/chat/completions`.
 - HTML/CSV/JSON report generation.
 - JSONL packet export for manual local-model retry if needed.
+- Optional permanent delete manifest and deletion of verified-safe Trash when using the `delete-verified` command.
 
 ## Output
 
