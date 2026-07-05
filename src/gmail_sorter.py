@@ -14,6 +14,7 @@ import html
 import json
 import re
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -31,7 +32,7 @@ MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 DEFAULT_QUERY = "before:2025/12/30 -in:trash"
 ROOT_LABEL = "Sorter"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 VERSION_CODE = "20260705"
 
 AD_SUBJECT_KEYWORDS = [
@@ -138,11 +139,67 @@ PROTECTED_CATEGORIES = {
     "Government Legal",
     "Health",
     "Insurance",
+    "Priority Attachments",
+    "Priority Immigration",
+    "Priority Studies",
     "Receipts Orders",
     "Utilities",
 }
 
+IMMIGRATION_KEYWORDS = [
+    "immigration",
+    "ircc",
+    "cic",
+    "visa",
+    "work permit",
+    "study permit",
+    "permanent residence",
+    "pr card",
+    "express entry",
+    "biometrics",
+    "lawyer",
+    "law firm",
+    "legal counsel",
+    "barrister",
+    "solicitor",
+    "marolia",
+    "pinaz",
+    "tiffani",
+    "ronen",
+    "raquel",
+    "jemma",
+    "jonalyn",
+    "oskoii",
+    "oskooii",
+    "oskoui",
+    "osgoode",
+]
+
+STUDIES_KEYWORDS = [
+    "university",
+    "college",
+    "course",
+    "class",
+    "assignment",
+    "tuition",
+    "transcript",
+    "diploma",
+    "degree",
+    "registrar",
+    "student",
+    "student record",
+    "academic",
+    "study permit",
+    "enrolment",
+    "enrollment",
+    "exam",
+    "grade",
+    "syllabus",
+]
+
 CATEGORY_RULES = [
+    ("Priority Immigration", IMMIGRATION_KEYWORDS),
+    ("Priority Studies", STUDIES_KEYWORDS),
     ("Finance", ["bank", "credit card", "debit", "statement", "payment", "payroll", "invoice", "tax", "cra", "irs", "etransfer", "e-transfer"]),
     ("Receipts Orders", ["receipt", "order", "purchase", "shipment", "shipped", "delivered", "delivery", "tracking", "refund", "return"]),
     ("Account Security", ["password", "reset", "verification", "verify", "security alert", "new login", "sign-in", "2fa", "mfa", "authentication", "code"]),
@@ -178,6 +235,7 @@ class Decision:
     sender: str
     sender_email: str
     sender_domain: str
+    registered_domain: str
     subject: str
     snippet: str
     existing_labels: list[str] = field(default_factory=list)
@@ -187,6 +245,10 @@ class Decision:
     negative_reasons: list[str] = field(default_factory=list)
     planned_actions: list[str] = field(default_factory=list)
     has_attachment: bool = False
+    has_real_attachment: bool = False
+    attachment_count: int = 0
+    inline_attachment_count: int = 0
+    message_size_estimate: int = 0
     list_unsubscribe: str = ""
     body_unsubscribe_links: list[str] = field(default_factory=list)
     attachment_names: list[str] = field(default_factory=list)
@@ -376,6 +438,20 @@ def sender_localpart(sender_email: str) -> str:
     return sender_email.split("@", 1)[0].lower() if "@" in sender_email else ""
 
 
+def registered_domain_for(domain: str) -> str:
+    if not domain:
+        return ""
+    try:
+        import tldextract
+    except ImportError:
+        parts = domain.lower().strip(".").split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else domain.lower().strip(".")
+    extracted = tldextract.extract(domain)
+    if extracted.domain and extracted.suffix:
+        return f"{extracted.domain}.{extracted.suffix}".lower()
+    return domain.lower().strip(".")
+
+
 def has_one_click_unsubscribe(headers: dict[str, str]) -> bool:
     return headers.get("list-unsubscribe-post", "").strip().lower() == "list-unsubscribe=one-click"
 
@@ -437,6 +513,44 @@ def payload_has_attachment(payload: dict[str, Any]) -> bool:
     if filename or body.get("attachmentId"):
         return True
     return any(payload_has_attachment(part) for part in payload.get("parts", []) or [])
+
+
+def payload_headers(payload: dict[str, Any]) -> dict[str, str]:
+    return {item.get("name", "").lower(): item.get("value", "") for item in payload.get("headers", [])}
+
+
+def is_inline_attachment_part(payload: dict[str, Any]) -> bool:
+    headers = payload_headers(payload)
+    disposition = headers.get("content-disposition", "").lower()
+    mime_type = (payload.get("mimeType") or "").lower()
+    filename = payload.get("filename") or ""
+    if "attachment" in disposition:
+        return False
+    if "inline" in disposition:
+        return True
+    return bool(filename) and mime_type.startswith("image/")
+
+
+def attachment_counts(payload: dict[str, Any]) -> tuple[int, int]:
+    real_count = 0
+    inline_count = 0
+    filename = payload.get("filename") or ""
+    body = payload.get("body", {})
+    if filename or body.get("attachmentId"):
+        if is_inline_attachment_part(payload):
+            inline_count += 1
+        else:
+            real_count += 1
+    for part in payload.get("parts", []) or []:
+        child_real, child_inline = attachment_counts(part)
+        real_count += child_real
+        inline_count += child_inline
+    return real_count, inline_count
+
+
+def payload_has_real_attachment(payload: dict[str, Any]) -> bool:
+    real_count, _ = attachment_counts(payload)
+    return real_count > 0
 
 
 def collect_attachment_details(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -682,6 +796,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     labels = message.get("labelIds", [])
     sender = headers.get("from", "")
     sender_email, sender_domain = parse_sender(sender)
+    registered_domain = registered_domain_for(sender_domain)
     subject = headers.get("subject", "")
     snippet = message.get("snippet", "")
     message_date = parse_date(headers.get("date", ""), message.get("internalDate"))
@@ -693,17 +808,24 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         reasons.append(f"older_mail_boost:{age_boost}")
     categories = categorize(searchable, labels, ad_confidence)
     has_attachment = payload_has_attachment(payload)
+    real_attachment_count, inline_attachment_count = attachment_counts(payload)
+    has_real_attachment = real_attachment_count > 0
+    if has_real_attachment:
+        categories.append("Priority Attachments")
+        categories = sorted(set(categories))
     body_unsubscribe_links = extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
     protected = (
         sender_domain in config.allow_domains
         or sender_email in config.allow_senders
-        or has_attachment
+        or has_real_attachment
         or bool(PROTECTED_CATEGORIES.intersection(categories))
         or any(label in labels for label in IMPORTANT_LABELS)
     )
-    if has_attachment:
+    if has_real_attachment:
         negative_reasons.append("has_attachment")
+    elif inline_attachment_count:
+        reasons.append("inline_attachment_only")
     if PROTECTED_CATEGORIES.intersection(categories):
         negative_reasons.append("protected_category")
     if body_unsubscribe_links:
@@ -752,6 +874,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         sender=sender,
         sender_email=sender_email,
         sender_domain=sender_domain,
+        registered_domain=registered_domain,
         subject=subject,
         snippet=snippet,
         existing_labels=labels,
@@ -761,6 +884,10 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         negative_reasons=negative_reasons,
         planned_actions=planned_actions,
         has_attachment=has_attachment,
+        has_real_attachment=has_real_attachment,
+        attachment_count=real_attachment_count,
+        inline_attachment_count=inline_attachment_count,
+        message_size_estimate=int(message.get("sizeEstimate") or 0),
         list_unsubscribe=headers.get("list-unsubscribe", ""),
         body_unsubscribe_links=body_unsubscribe_links,
         attachment_names=attachment_names,
@@ -802,6 +929,13 @@ def protect_mixed_threads(service: Any, decisions: list[Decision], retries: int,
 
 def decision_from_dict(data: dict[str, Any]) -> Decision:
     valid = Decision.__dataclass_fields__.keys()
+    if "registered_domain" not in data:
+        data["registered_domain"] = registered_domain_for(data.get("sender_domain", ""))
+    if "has_real_attachment" not in data:
+        data["has_real_attachment"] = bool(data.get("has_attachment", False))
+    data.setdefault("attachment_count", 1 if data.get("has_real_attachment") else 0)
+    data.setdefault("inline_attachment_count", 0)
+    data.setdefault("message_size_estimate", 0)
     return Decision(**{key: data[key] for key in valid if key in data})
 
 
@@ -817,9 +951,188 @@ def save_progress(path: Path, decisions: dict[str, Decision]) -> None:
     path.write_text(json.dumps([asdict(item) for item in decisions.values()], indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def open_state_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            date TEXT,
+            sender TEXT,
+            sender_email TEXT,
+            sender_domain TEXT,
+            registered_domain TEXT,
+            subject TEXT,
+            categories_json TEXT NOT NULL,
+            planned_actions_json TEXT NOT NULL,
+            ad_confidence INTEGER NOT NULL,
+            protected INTEGER NOT NULL,
+            perfect_ad_match INTEGER NOT NULL,
+            has_attachment INTEGER NOT NULL,
+            has_real_attachment INTEGER NOT NULL,
+            attachment_count INTEGER NOT NULL,
+            inline_attachment_count INTEGER NOT NULL,
+            message_size_estimate INTEGER NOT NULL,
+            review_priority TEXT,
+            action_done TEXT,
+            scanned_at TEXT,
+            decision_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            action TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS domain_review (
+            domain TEXT PRIMARY KEY,
+            registered_domain TEXT,
+            status TEXT NOT NULL DEFAULT 'unreviewed',
+            note TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def upsert_state_decisions(conn: sqlite3.Connection | None, decisions: list[Decision]) -> None:
+    if conn is None or not decisions:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for item in decisions:
+        rows.append(
+            (
+                item.message_id,
+                item.thread_id,
+                item.date,
+                item.sender,
+                item.sender_email,
+                item.sender_domain,
+                item.registered_domain,
+                item.subject,
+                json.dumps(item.categories, ensure_ascii=False),
+                json.dumps(item.planned_actions, ensure_ascii=False),
+                item.ad_confidence,
+                int(item.protected),
+                int(item.perfect_ad_match),
+                int(item.has_attachment),
+                int(item.has_real_attachment),
+                item.attachment_count,
+                item.inline_attachment_count,
+                item.message_size_estimate,
+                item.review_priority,
+                item.action_done,
+                item.scanned_at,
+                json.dumps(asdict(item), ensure_ascii=False),
+                now,
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO messages (
+            message_id, thread_id, date, sender, sender_email, sender_domain, registered_domain,
+            subject, categories_json, planned_actions_json, ad_confidence, protected,
+            perfect_ad_match, has_attachment, has_real_attachment, attachment_count,
+            inline_attachment_count, message_size_estimate, review_priority, action_done,
+            scanned_at, decision_json, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            thread_id=excluded.thread_id,
+            date=excluded.date,
+            sender=excluded.sender,
+            sender_email=excluded.sender_email,
+            sender_domain=excluded.sender_domain,
+            registered_domain=excluded.registered_domain,
+            subject=excluded.subject,
+            categories_json=excluded.categories_json,
+            planned_actions_json=excluded.planned_actions_json,
+            ad_confidence=excluded.ad_confidence,
+            protected=excluded.protected,
+            perfect_ad_match=excluded.perfect_ad_match,
+            has_attachment=excluded.has_attachment,
+            has_real_attachment=excluded.has_real_attachment,
+            attachment_count=excluded.attachment_count,
+            inline_attachment_count=excluded.inline_attachment_count,
+            message_size_estimate=excluded.message_size_estimate,
+            review_priority=excluded.review_priority,
+            action_done=excluded.action_done,
+            scanned_at=excluded.scanned_at,
+            decision_json=excluded.decision_json,
+            updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def record_action_ledger(
+    conn: sqlite3.Connection | None,
+    stage: str,
+    action: str,
+    message_id: str,
+    status: str = "success",
+    detail: str = "",
+) -> None:
+    if conn is None:
+        return
+    conn.execute(
+        "INSERT INTO action_ledger (created_at, stage, action, message_id, status, detail) VALUES (?, ?, ?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), stage, action, message_id, status, detail),
+    )
+    conn.commit()
+
+
 def decisions_for_current_query(progress: dict[str, Decision], message_ids: list[str]) -> list[Decision]:
     """Return decisions in Gmail query order, excluding stale rows from reused progress files."""
     return [progress[message_id] for message_id in message_ids if message_id in progress]
+
+
+def apply_trash_policy_caps(decisions: list[Decision], args: argparse.Namespace) -> None:
+    trash_items = [item for item in decisions if "trash" in item.planned_actions]
+    if args.max_trash_total and len(trash_items) > args.max_trash_total:
+        allowed = {item.message_id for item in trash_items[: args.max_trash_total]}
+        for item in trash_items[args.max_trash_total :]:
+            item.planned_actions = [action for action in item.planned_actions if action != "trash"]
+            item.negative_reasons.append(f"trash_total_cap:{args.max_trash_total}")
+            item.review_priority = "trash_capped_review"
+        trash_items = [item for item in trash_items if item.message_id in allowed]
+
+    if args.max_trash_per_domain:
+        seen: dict[str, int] = defaultdict(int)
+        for item in trash_items:
+            domain = item.registered_domain or item.sender_domain or "(unknown)"
+            seen[domain] += 1
+            if seen[domain] > args.max_trash_per_domain:
+                item.planned_actions = [action for action in item.planned_actions if action != "trash"]
+                item.negative_reasons.append(f"trash_domain_cap:{args.max_trash_per_domain}")
+                item.review_priority = "trash_capped_review"
+
+    if args.canary_limit and args.apply and args.stage == "trash":
+        remaining = [item for item in decisions if "trash" in item.planned_actions]
+        for item in remaining[args.canary_limit :]:
+            item.planned_actions = [action for action in item.planned_actions if action != "trash"]
+            item.negative_reasons.append(f"trash_canary_limit:{args.canary_limit}")
+            item.review_priority = "trash_capped_review"
 
 
 def should_refresh(decision: Decision, args: argparse.Namespace) -> bool:
@@ -920,7 +1233,7 @@ def get_or_create_labels(service: Any, label_names: list[str], retries: int, ret
     return {name: label_ids[name] for name in label_names}
 
 
-def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Namespace) -> None:
+def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Namespace, state_conn: sqlite3.Connection | None = None) -> None:
     started = time.monotonic()
     categories = sorted({category for item in decisions for category in item.categories})
     label_ids = get_or_create_labels(service, [f"{ROOT_LABEL}/{category}" for category in categories], args.retries, args.retry_sleep)
@@ -947,6 +1260,8 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
     for index, item in enumerate(trash_items, 1):
         execute_with_retries(service.users().messages().trash(userId="me", id=item.message_id), args.retries, args.retry_sleep)
         item.action_done = "yes"
+        record_action_ledger(state_conn, args.stage, "trash", item.message_id)
+        upsert_state_decisions(state_conn, [item])
         if index == 1 or index == len(trash_items) or index % args.apply_progress_every == 0:
             elapsed = max(0.001, time.monotonic() - started)
             rate = index / elapsed
@@ -970,6 +1285,10 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
             execute_with_retries(service.users().messages().batchModify(userId="me", body=body), args.retries, args.retry_sleep)
             for item in chunk:
                 item.action_done = "yes"
+                for action in item.planned_actions:
+                    if action == "archive" or action.startswith("label:"):
+                        record_action_ledger(state_conn, args.stage, action, item.message_id)
+            upsert_state_decisions(state_conn, chunk)
             if batch_index == 1 or batch_index == batch_count or batch_index % args.apply_progress_every == 0:
                 print(f"Applied label/archive batch {batch_index}/{batch_count}...", flush=True)
 
@@ -1018,20 +1337,138 @@ def write_sender_report(path: Path, decisions: list[Decision]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     grouped: dict[str, list[Decision]] = defaultdict(list)
     for item in decisions:
-        grouped[item.sender_domain or "(unknown)"].append(item)
+        grouped[item.registered_domain or item.sender_domain or "(unknown)"].append(item)
     with path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["sender_domain", "count", "avg_ad_confidence", "categories", "sample_subject"])
+        writer = csv.DictWriter(file, fieldnames=["registered_domain", "count", "avg_ad_confidence", "categories", "planned_trash", "protected", "size_mb", "sample_subject"])
         writer.writeheader()
         for domain, items in sorted(grouped.items(), key=lambda pair: len(pair[1]), reverse=True):
             avg = sum(item.ad_confidence for item in items) / len(items)
             cats = Counter(category for item in items for category in item.categories)
+            size_mb = sum(item.message_size_estimate for item in items) / (1024 * 1024)
             writer.writerow({
-                "sender_domain": domain,
+                "registered_domain": domain,
                 "count": len(items),
                 "avg_ad_confidence": f"{avg:.1f}",
                 "categories": "; ".join(name for name, _ in cats.most_common(5)),
+                "planned_trash": sum(1 for item in items if "trash" in item.planned_actions),
+                "protected": sum(1 for item in items if item.protected),
+                "size_mb": f"{size_mb:.1f}",
                 "sample_subject": items[0].subject,
             })
+
+
+def write_storage_report(path: Path, decisions: list[Decision]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, list[Decision]] = defaultdict(list)
+    for item in decisions:
+        grouped[item.registered_domain or item.sender_domain or "(unknown)"].append(item)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "registered_domain",
+                "messages",
+                "size_mb",
+                "real_attachments",
+                "planned_trash",
+                "protected",
+                "largest_subject",
+                "largest_message_size_mb",
+            ],
+        )
+        writer.writeheader()
+        rows = []
+        for domain, items in grouped.items():
+            largest = max(items, key=lambda item: item.message_size_estimate)
+            rows.append(
+                {
+                    "registered_domain": domain,
+                    "messages": len(items),
+                    "size_mb": sum(item.message_size_estimate for item in items) / (1024 * 1024),
+                    "real_attachments": sum(item.attachment_count for item in items),
+                    "planned_trash": sum(1 for item in items if "trash" in item.planned_actions),
+                    "protected": sum(1 for item in items if item.protected),
+                    "largest_subject": largest.subject,
+                    "largest_message_size_mb": largest.message_size_estimate / (1024 * 1024),
+                }
+            )
+        for row in sorted(rows, key=lambda item: item["size_mb"], reverse=True):
+            row["size_mb"] = f"{row['size_mb']:.1f}"
+            row["largest_message_size_mb"] = f"{row['largest_message_size_mb']:.1f}"
+            writer.writerow(row)
+
+
+def write_review_workflow(path: Path, decisions: list[Decision]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, list[Decision]] = defaultdict(list)
+    for item in decisions:
+        grouped[item.registered_domain or item.sender_domain or "(unknown)"].append(item)
+
+    rows = []
+    for domain, items in grouped.items():
+        categories = Counter(category for item in items for category in item.categories)
+        actions = Counter(action for item in items for action in item.planned_actions)
+        reasons = Counter(reason for item in items for reason in item.reasons)
+        latest = max((item.date for item in items if item.date), default="")
+        oldest = min((item.date for item in items if item.date), default="")
+        row = {
+            "registered_domain": domain,
+            "status": "unreviewed",
+            "messages": len(items),
+            "planned_trash": actions["trash"],
+            "planned_archive": actions["archive"],
+            "protected": sum(1 for item in items if item.protected),
+            "real_attachments": sum(item.attachment_count for item in items),
+            "size_mb": round(sum(item.message_size_estimate for item in items) / (1024 * 1024), 1),
+            "avg_ad_confidence": round(sum(item.ad_confidence for item in items) / len(items), 1),
+            "top_categories": "; ".join(name for name, _ in categories.most_common(5)),
+            "top_reasons": "; ".join(name for name, _ in reasons.most_common(5)),
+            "oldest": oldest,
+            "latest": latest,
+            "sample_subjects": " | ".join(item.subject for item in items[:3]),
+            "suggested_action": suggested_domain_action(items),
+        }
+        rows.append(row)
+
+    rows.sort(key=lambda item: (item["planned_trash"], item["messages"], item["size_mb"]), reverse=True)
+    csv_path = path / "domain_review.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as file:
+        fieldnames = list(rows[0].keys()) if rows else [
+            "registered_domain",
+            "status",
+            "messages",
+            "planned_trash",
+            "planned_archive",
+            "protected",
+            "real_attachments",
+            "size_mb",
+            "avg_ad_confidence",
+            "top_categories",
+            "top_reasons",
+            "oldest",
+            "latest",
+            "sample_subjects",
+            "suggested_action",
+        ]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    (path / "domain_review.json").write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def suggested_domain_action(items: list[Decision]) -> str:
+    protected_count = sum(1 for item in items if item.protected)
+    trash_count = sum(1 for item in items if "trash" in item.planned_actions)
+    priority_count = sum(1 for item in items if {"Priority Immigration", "Priority Studies", "Priority Attachments"}.intersection(item.categories))
+    if priority_count:
+        return "protect_priority"
+    if trash_count >= 20 and protected_count == 0:
+        return "approve_trash"
+    if any(item.list_unsubscribe or item.body_unsubscribe_links for item in items):
+        return "unsubscribe_review"
+    if protected_count:
+        return "allow_or_review"
+    return "review"
 
 
 def write_action_manifests(path: Path, decisions: list[Decision]) -> None:
@@ -1219,7 +1656,7 @@ def render_body_unsubscribe_links(items: list[Decision], limit: int = 100) -> st
 def render_bulk_preview(items: list[Decision], limit: int = 50) -> str:
     grouped: dict[str, list[Decision]] = defaultdict(list)
     for item in items:
-        grouped[item.sender_domain or "(unknown)"].append(item)
+        grouped[item.registered_domain or item.sender_domain or "(unknown)"].append(item)
     rows = []
     for domain, domain_items in sorted(grouped.items(), key=lambda pair: len(pair[1]), reverse=True)[:limit]:
         archive_count = sum(1 for item in domain_items if "archive" in item.planned_actions)
@@ -1252,7 +1689,7 @@ def render_trash_domain_summary(items: list[Decision], limit: int = 50) -> str:
     grouped: dict[str, list[Decision]] = defaultdict(list)
     for item in items:
         if "trash" in item.planned_actions:
-            grouped[item.sender_domain or "(unknown)"].append(item)
+            grouped[item.registered_domain or item.sender_domain or "(unknown)"].append(item)
     rows = []
     for domain, domain_items in sorted(grouped.items(), key=lambda pair: len(pair[1]), reverse=True)[:limit]:
         dates = [item.date for item in domain_items if item.date]
@@ -1327,7 +1764,12 @@ def render_cell(column: str, value: Any) -> str:
     if column == "list_unsubscribe":
         targets = extract_unsubscribe_targets(str(value))
         return render_unsubscribe_links(targets) if targets else esc(value)
-    if column in {"protected", "has_attachment", "perfect_ad_match"}:
+    if column == "message_size_estimate":
+        try:
+            return f"{float(value) / (1024 * 1024):.1f} MB"
+        except (TypeError, ValueError):
+            return esc(value)
+    if column in {"protected", "has_attachment", "has_real_attachment", "perfect_ad_match"}:
         return f"<span class=\"status {'yes' if value else 'no'}\">{esc(value)}</span>"
     return esc(value)
 
@@ -1356,11 +1798,13 @@ def render_rank_list(items: list[tuple[str, int]], total: int, tone: str = "neut
 def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namespace) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     category_counts = Counter(category for item in decisions for category in item.categories)
-    sender_counts = Counter(item.sender_domain or "(unknown)" for item in decisions)
+    sender_counts = Counter(item.registered_domain or item.sender_domain or "(unknown)" for item in decisions)
     review_counts = Counter(item.review_priority for item in decisions)
     trash_items = [item for item in decisions if item.review_priority in {"trash_review", "thread_review"}]
     protected_ads = [item for item in decisions if item.review_priority == "protected_ad_review"]
     attachment_items = [item for item in decisions if item.has_attachment]
+    real_attachment_items = [item for item in decisions if item.has_real_attachment]
+    priority_items = [item for item in decisions if {"Priority Immigration", "Priority Studies", "Priority Attachments"}.intersection(item.categories)]
     unsubscribe_items = [item for item in decisions if item.list_unsubscribe]
     body_unsubscribe_items = [item for item in decisions if item.body_unsubscribe_links]
     top_noisy = sender_counts.most_common(20)
@@ -1372,6 +1816,7 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
     archive_count = sum(1 for item in decisions if "archive" in item.planned_actions)
     trash_count = sum(1 for item in decisions if "trash" in item.planned_actions)
     applied_count = sum(1 for item in decisions if item.action_done == "yes")
+    total_size_mb = sum(item.message_size_estimate for item in decisions) / (1024 * 1024)
     stale_progress_count = max(0, len(load_progress(Path(args.progress_file))) - total) if args.resume else 0
     pre_2020_trash_items = [
         item for item in decisions if is_before_year(item.date, 2020) and "trash" in item.planned_actions
@@ -1385,7 +1830,9 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
         render_metric_card("High Confidence Ads", high_confidence, total, "danger"),
         render_metric_card("Perfect Ad Matches", perfect_ad_count, total, "danger"),
         render_metric_card("Protected", protected_count, total, "safe"),
-        render_metric_card("Attachments", len(attachment_items), total, "neutral"),
+        render_metric_card("Priority Items", len(priority_items), total, "safe"),
+        render_metric_card("Real Attachments", len(real_attachment_items), total, "neutral"),
+        render_metric_card("Storage MB", f"{total_size_mb:.0f}", None, "neutral"),
         render_metric_card("Header Unsub Domains", len({item.sender_domain for item in unsubscribe_items}), None, "accent"),
         render_metric_card("Body Unsub Links", sum(len(item.body_unsubscribe_links) for item in body_unsubscribe_items), None, "accent"),
         render_metric_card("Deduped Unsub Headers", unsubscribe_duplicate_headers, len(unsubscribe_items) or None, "accent"),
@@ -1447,6 +1894,9 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 <section class="panel"><h2>Positive Reasons</h2>{render_reason_summary(decisions, "reasons", 20)}</section>
 <section class="panel"><h2>Protection / Negative Reasons</h2>{render_reason_summary(decisions, "negative_reasons", 20)}</section>
 </div>
+<h2 class="section-title">Priority Folder Review</h2>
+<p class="note">Immigration, studies, and real attachment mail are protected and labeled for higher-priority review.</p>
+{render_table(priority_items, ["date", "sender_domain", "registered_domain", "subject", "categories", "attachment_names", "message_size_estimate"], 150)}
 <h2 class="section-title danger-text">Trash / Thread Review</h2>
 <p class="note">Review these before running the trash stage. Mixed threads and protected items are kept out of trash actions.</p>
 {render_table(trash_items, ["ad_confidence", "perfect_ad_match", "review_priority", "protected", "sender_domain", "subject", "reasons", "negative_reasons", "planned_actions"], 100)}
@@ -1497,6 +1947,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-modify", default=str(PROJECT_DIR / "secrets" / "token_sorter_modify.json"))
     parser.add_argument("--query", default=DEFAULT_QUERY)
     parser.add_argument("--out-prefix", default=str(PROJECT_DIR / "reports" / "gmail_sorter_report"))
+    parser.add_argument("--state-db", default=str(PROJECT_DIR / "data" / "gmail_sorter_state.sqlite"), help="SQLite state database for decisions, review state, and action ledger.")
+    parser.add_argument("--disable-state-db", action="store_true", help="Skip SQLite state updates and use JSON/report outputs only.")
+    parser.add_argument("--maintenance-days", type=int, default=0, help="Scan only recent non-trash mail from the last N days.")
+    parser.add_argument("--since-date", default="", help="Scan non-trash mail after YYYY-MM-DD.")
     parser.add_argument("--allowlist", default=str(PROJECT_DIR / "config" / "allowlist.txt"))
     parser.add_argument("--blocklist", default=str(PROJECT_DIR / "config" / "blocklist.txt"))
     parser.add_argument("--max-messages", type=int, default=None)
@@ -1519,6 +1973,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thread-check-limit", type=int, default=500)
     parser.add_argument("--manifest-dir", default=str(PROJECT_DIR / "manifests"))
     parser.add_argument("--manifest", default="", help="Optional reviewed manifest JSON to restrict an apply stage.")
+    parser.add_argument("--review-dir", default="", help="Directory for review workflow CSV/JSON outputs. Defaults beside manifest-dir.")
+    parser.add_argument("--max-trash-per-domain", type=int, default=0, help="Cap planned trash actions per registered domain; 0 disables the cap.")
+    parser.add_argument("--max-trash-total", type=int, default=0, help="Cap total planned trash actions; 0 disables the cap.")
+    parser.add_argument("--canary-limit", type=int, default=0, help="When applying trash, only keep the first N trash actions in the apply set.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
     parser.add_argument("--apply", action="store_true", help="Actually modify Gmail for the selected stage.")
     parser.add_argument("--trash-obvious-ads", action="store_true", help="Allow trash actions during --stage trash.")
@@ -1532,6 +1990,15 @@ def main() -> int:
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)
     args.apply_progress_every = max(1, args.apply_progress_every)
+    if args.maintenance_days:
+        args.query = f"newer_than:{args.maintenance_days}d -in:trash"
+    if args.since_date:
+        try:
+            since = datetime.fromisoformat(args.since_date).strftime("%Y/%m/%d")
+        except ValueError:
+            print("--since-date must be in YYYY-MM-DD format.", file=sys.stderr)
+            return 2
+        args.query = f"after:{since} -in:trash"
     allowlist = Path(args.allowlist)
     blocklist = Path(args.blocklist)
     ensure_default_config_files(allowlist, blocklist)
@@ -1543,6 +2010,8 @@ def main() -> int:
     if args.apply and args.stage == "trash" and (not args.trash_obvious_ads or not args.i_understand_trash):
         print("Refusing trash stage without --trash-obvious-ads --i-understand-trash.", file=sys.stderr)
         return 2
+
+    state_conn = None if args.disable_state_db else open_state_db(Path(args.state_db))
 
     google_libs = load_google_libraries()
     _, _, _, build, HttpError = google_libs
@@ -1556,6 +2025,8 @@ def main() -> int:
         message_ids = list_message_ids(service, args.query, args.max_messages, args.retries, args.retry_sleep, list_throttle)
     except HttpError as error:
         print(f"Failed to list messages: {error}", file=sys.stderr)
+        if state_conn is not None:
+            state_conn.close()
         return 1
 
     progress_path = Path(args.progress_file)
@@ -1565,6 +2036,7 @@ def main() -> int:
     save_progress(progress_path, progress)
 
     decisions = decisions_for_current_query(progress, message_ids)
+    upsert_state_decisions(state_conn, decisions)
     stale_progress_count = len(progress) - len(decisions)
     if stale_progress_count > 0:
         print(f"Ignoring {stale_progress_count} cached decisions outside the current query/report set.")
@@ -1575,6 +2047,10 @@ def main() -> int:
         manifest_ids = load_manifest_ids(Path(args.manifest))
         decisions = [item for item in decisions if item.message_id in manifest_ids]
         print(f"Restricted apply/report set to {len(decisions)} messages from manifest: {args.manifest}")
+
+    if args.stage == "trash":
+        apply_trash_policy_caps(decisions, args)
+        upsert_state_decisions(state_conn, decisions)
 
     if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
         action_count = sum(
@@ -1587,18 +2063,22 @@ def main() -> int:
             )
         )
         print(f"Applying stage={args.stage} to {action_count}/{len(decisions)} messages with planned {args.stage} actions...", flush=True)
-        apply_decisions(service, decisions, args)
+        apply_decisions(service, decisions, args, state_conn)
         for item in decisions:
             progress[item.message_id] = item
         save_progress(progress_path, progress)
+        upsert_state_decisions(state_conn, decisions)
 
     decisions.sort(key=lambda item: (item.ad_confidence, item.date, item.sender_domain), reverse=True)
     out_prefix = Path(args.out_prefix)
     write_csv(out_prefix.with_suffix(".csv"), decisions)
     write_json(out_prefix.with_suffix(".json"), decisions)
     write_sender_report(out_prefix.with_name(out_prefix.name + "_senders.csv"), decisions)
+    write_storage_report(out_prefix.with_name(out_prefix.name + "_storage.csv"), decisions)
     write_unsubscribe_report(out_prefix.with_name(out_prefix.name + "_unsubscribe.csv"), decisions)
     write_action_manifests(Path(args.manifest_dir), decisions)
+    review_dir = Path(args.review_dir) if args.review_dir else Path(args.manifest_dir) / "review"
+    write_review_workflow(review_dir, decisions)
     write_dashboard(out_prefix.with_suffix(".html"), decisions, args)
     yearly_dashboards = write_yearly_dashboards(out_prefix, decisions, args)
 
@@ -1611,9 +2091,13 @@ def main() -> int:
     print(f"Wrote {out_prefix.with_suffix('.csv')}")
     print(f"Wrote {out_prefix.with_suffix('.json')}")
     print(f"Wrote {out_prefix.with_name(out_prefix.name + '_senders.csv')}")
+    print(f"Wrote {out_prefix.with_name(out_prefix.name + '_storage.csv')}")
     print(f"Wrote {out_prefix.with_name(out_prefix.name + '_unsubscribe.csv')}")
     print(f"Wrote {len(yearly_dashboards)} yearly dashboards")
     print(f"Wrote manifests in {Path(args.manifest_dir)}")
+    print(f"Wrote review workflow in {review_dir}")
+    if state_conn is not None:
+        state_conn.close()
     return 0
 
 

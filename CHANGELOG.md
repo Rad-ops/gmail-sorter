@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 - 2026-07-05
+
+- Added SQLite state storage for message decisions plus an append-only action ledger for successful label/archive/trash changes.
+- Added registered-domain sender intelligence so reports group noisy subdomains under one organization-level domain.
+- Added domain review workflow outputs in CSV/JSON with suggested actions, storage impact, planned actions, protected counts, and sample subjects.
+- Added storage reports that rank senders by estimated Gmail storage use and attachment impact.
+- Added maintenance scan shortcuts with `--maintenance-days` and `--since-date`.
+- Added priority categories and protected labels for immigration, studies, and real attachment mail, including known immigration contacts and IRCC/visa/work-permit terms.
+- Split real attachments from inline image attachments so important files stay protected without overprotecting promotional image-only mail.
+- Added trash safety controls with `--max-trash-per-domain`, `--max-trash-total`, and `--canary-limit`.
+- Added local unit tests for registered-domain grouping, old progress compatibility, priority immigration detection, and attachment handling.
+
 ## 0.2.0 - 2026-07-05
 
 - Hardened promotional/ad scoring with stronger subject-pattern detection, one-click unsubscribe headers, `List-Id`, bulk/list precedence, campaign headers, promotional sender local-parts, and auto-submitted system-mail penalties.
