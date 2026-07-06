@@ -41,6 +41,7 @@ from sorter import policy
 from sorter.keywords import compile_keywords, contains_any, keyword_hits, regex_hits
 from sorter.config_loader import apply_overrides, load_policy_overrides
 from sorter.embeddings import compute_embedding_scores, cosine_similarity
+from sorter.schema import CURRENT_SCHEMA_VERSION, migrate
 
 
 # Re-export policy names for backwards compatibility.
@@ -67,7 +68,7 @@ PRIMARY_CATEGORY_PRECEDENCE = policy.PRIMARY_CATEGORY_PRECEDENCE
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 APP_VERSION = "0.5.0"
 VERSION_CODE = "20260706"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 log = logging.getLogger("sorter")
 
 
@@ -1208,99 +1209,7 @@ def open_state_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            message_id TEXT PRIMARY KEY,
-            thread_id TEXT NOT NULL,
-            date TEXT,
-            sender TEXT,
-            sender_email TEXT,
-            sender_domain TEXT,
-            registered_domain TEXT,
-            subject TEXT,
-            categories_json TEXT NOT NULL,
-            planned_actions_json TEXT NOT NULL,
-            ad_confidence INTEGER NOT NULL,
-            protected INTEGER NOT NULL,
-            perfect_ad_match INTEGER NOT NULL,
-            has_attachment INTEGER NOT NULL,
-            has_real_attachment INTEGER NOT NULL,
-            attachment_count INTEGER NOT NULL,
-            inline_attachment_count INTEGER NOT NULL,
-            message_size_estimate INTEGER NOT NULL,
-            review_priority TEXT,
-            action_done TEXT,
-            scanned_at TEXT,
-            decision_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS action_ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            stage TEXT NOT NULL,
-            action TEXT NOT NULL,
-            message_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            detail TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS domain_review (
-            domain TEXT PRIMARY KEY,
-            registered_domain TEXT,
-            status TEXT NOT NULL DEFAULT 'unreviewed',
-            note TEXT,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sender_profile (
-            key TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            category TEXT NOT NULL,
-            hits INTEGER NOT NULL DEFAULT 0,
-            protected_hits INTEGER NOT NULL DEFAULT 0,
-            last_seen TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sender_profile_kind ON sender_profile(kind, category)"
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS message_features (
-            message_id TEXT PRIMARY KEY,
-            body_len INTEGER NOT NULL DEFAULT 0,
-            body_category_hits_json TEXT NOT NULL DEFAULT '[]',
-            body_unsubscribe_count INTEGER NOT NULL DEFAULT 0,
-            scan_mode TEXT NOT NULL DEFAULT 'metadata',
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS category_centroid (
-            category TEXT PRIMARY KEY,
-            embedding_json TEXT NOT NULL,
-            dimension INTEGER NOT NULL,
-            message_count INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
+    migrate(conn)
     return conn
 
 
