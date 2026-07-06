@@ -8,6 +8,6 @@ these names for backwards compatibility with the companion scripts and tests.
 
 from __future__ import annotations
 
-from . import keywords, policy, schema
+from . import keywords, policy, schema, lang
 
-__all__ = ["keywords", "policy", "schema"]
+__all__ = ["keywords", "policy", "schema", "lang"]

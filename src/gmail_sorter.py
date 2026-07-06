@@ -130,6 +130,7 @@ class Decision:
     body_len: int = 0
     body_category_hits: list[str] = field(default_factory=list)
     body_text_excerpt: str = ""
+    detected_language: str = ""
     list_unsubscribe: str = ""
     body_unsubscribe_links: list[str] = field(default_factory=list)
     attachment_names: list[str] = field(default_factory=list)
@@ -959,6 +960,16 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
                 category_confidence[cat] = emb_conf
                 if emb_conf >= getattr(args, "label_confidence", 50):
                     reasons.append(f"embedding_boost:{cat}:{sim:.2f}")
+    # v0.7: detect the message language once. The detector picks which
+    # language-specific keyword overlay (config/policy.<lang>.yaml) should be
+    # applied at the categorization step. It is never used to gate mail or to
+    # change the protection decision. On a cache-only scan the fresh body is
+    # empty so we fall back to the cached excerpt.
+    from sorter.lang import detect as detect_language
+    lang_source = f"{subject} {body_excerpt_for_features}"
+    if not lang_source.strip() and cached_body:
+        lang_source = f"{subject} {cached_body.get('body_text_excerpt', '')}"
+    detected_language = detect_language(lang_source)
     # Merge body-derived category hits from a previous full scan when this run
     # used the cache (metadata-only fetch). Cached hits let categorization stay
     # body-aware without re-fetching the body.
@@ -1149,6 +1160,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         body_len=body_len,
         body_category_hits=body_hit_categories,
         body_text_excerpt=body_excerpt_for_features,
+        detected_language=detected_language,
         list_unsubscribe=headers.get("list-unsubscribe", ""),
         body_unsubscribe_links=body_unsubscribe_links,
         attachment_names=attachment_names,
