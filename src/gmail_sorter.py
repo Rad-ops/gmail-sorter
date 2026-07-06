@@ -936,7 +936,41 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     if getattr(args, "use_sender_profiles", True):
         profile_index = getattr(args, "sender_profiles", {}) or {}
         profile_cats = sender_profile_categories_from_index(profile_index, sender_email, registered_domain)
-    category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats, subject=subject, body_text=clean_body_text(body_text) if body_included else "", sender_text=f"{sender} {sender_domain}")
+    # v0.7: detect the message language once. The detector picks which
+    # language-specific keyword overlay (config/policy.<lang>.yaml) should be
+    # applied at the categorization step. It is never used to gate mail or to
+    # change the protection decision. On a cache-only scan the fresh body is
+    # empty so we fall back to the cached excerpt.
+    from sorter.lang import detect as detect_language
+    lang_source = f"{subject} {body_excerpt_for_features}"
+    if not lang_source.strip() and cached_body:
+        lang_source = f"{subject} {cached_body.get('body_text_excerpt', '')}"
+    detected_language = detect_language(lang_source)
+    # v0.7: apply the per-language keyword overlay (FR/FA) when one is
+    # configured and the detector picked a non-English language. The overlay
+    # extends or replaces the matching category's keyword list, and is
+    # restored at the end of decide() so the next message — possibly in a
+    # different language — starts from a clean policy state.
+    from sorter.config_loader import activate_language_overlay, restore_policy
+    overlay_token: dict | None = None
+    if detected_language and detected_language != "en":
+        overlay_dir = getattr(args, "_policy_config_dir", None)
+        if overlay_dir is not None:
+            from pathlib import Path
+            from sorter.config_loader import load_language_overlay
+            overlay = load_language_overlay(Path(overlay_dir), detected_language)
+            if overlay:
+                overlay_token = activate_language_overlay(overlay)
+    try:
+        category_confidence = categorize_with_confidence(
+            category_searchable, labels, ad_confidence, profile_cats,
+            subject=subject,
+            body_text=clean_body_text(body_text) if body_included else "",
+            sender_text=f"{sender} {sender_domain}",
+        )
+    finally:
+        if overlay_token is not None:
+            restore_policy(overlay_token)
     # Embedding-based semantic scoring (hybrid). When an embedding backend is
     # available and centroids have been learned, compute the cosine similarity
     # between this message's text and each category centroid. The embedding
@@ -960,16 +994,6 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
                 category_confidence[cat] = emb_conf
                 if emb_conf >= getattr(args, "label_confidence", 50):
                     reasons.append(f"embedding_boost:{cat}:{sim:.2f}")
-    # v0.7: detect the message language once. The detector picks which
-    # language-specific keyword overlay (config/policy.<lang>.yaml) should be
-    # applied at the categorization step. It is never used to gate mail or to
-    # change the protection decision. On a cache-only scan the fresh body is
-    # empty so we fall back to the cached excerpt.
-    from sorter.lang import detect as detect_language
-    lang_source = f"{subject} {body_excerpt_for_features}"
-    if not lang_source.strip() and cached_body:
-        lang_source = f"{subject} {cached_body.get('body_text_excerpt', '')}"
-    detected_language = detect_language(lang_source)
     # Merge body-derived category hits from a previous full scan when this run
     # used the cache (metadata-only fetch). Cached hits let categorization stay
     # body-aware without re-fetching the body.
@@ -3090,6 +3114,9 @@ def main() -> int:
     except OSError:
         log.warning("could not open run log at %s", run_log)
     apply_overrides(load_policy_overrides(PROJECT_DIR / "config" / "policy.yaml"))
+    # v0.7: pass the config directory to decide() so per-language overlays
+    # (config/policy.fr.yaml, config/policy.fa.yaml) can be loaded on demand.
+    args._policy_config_dir = str(PROJECT_DIR / "config")
     log.info("gmail-sorter %s (%s) schema_version=%s", APP_VERSION, VERSION_CODE, SCHEMA_VERSION)
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)

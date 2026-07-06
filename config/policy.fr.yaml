@@ -1,0 +1,110 @@
+# French keyword overlay for the Gmail sorter (v0.7)
+#
+# This file is optional. When the language detector on a message returns
+# "fr", these keywords are appended to (or replace, with ``replace: true``)
+# the matching English category list in sorter/policy.py. The English list
+# is always kept as a fallback for code-mixed mail.
+#
+# Edit this file to tune French-language classification without touching
+# code. The same shape applies to policy.fa.yaml for Farsi.
+#
+# Requires PyYAML only when this file is present and non-empty.
+#
+# Coverage focuses on the categories that matter most for this mailbox:
+#   - Priority Immigration: IRCC French vocabulary (permis, résidence,
+#     biométrie, avocat, etc.)
+#   - Finance: banque, relevé, virement
+#   - Health: rendez-vous médical, médecin, hôpital
+#   - Government Legal: gouvernement, tribunal, juridique
+#   - Utilities: hydro, internet, téléphone
+#
+# Format: one entry per category. Each entry has:
+#   keywords: list of strings (case-insensitive, word-boundary matched)
+#   replace:  bool (default false). When true, the category's keyword list is
+#             replaced instead of extended. Replace is opt-in because the
+#             sorter never wants to lose English coverage on code-mixed mail.
+categories:
+  Priority Immigration:
+    keywords:
+      - "permis de travail"
+      - "permis d'études"
+      - "résidence permanente"
+      - "carte de résidence permanente"
+      - "demande de résidence"
+      - "entrée express"
+      - "biométrie"
+      - "avis de biométrie"
+      - "citoyenneté"
+      - "demande de citoyenneté"
+      - "renouvellement de permis"
+      - "référence de demande"
+      - "agent d'immigration"
+      - "bureau des visas"
+      - "ministère de l'immigration"
+      - "demande d'asile"
+      - "statut de résident"
+      - "permis de séjour"
+  Priority Studies:
+    keywords:
+      - "frais de scolarité"
+      - "relevé de notes"
+      - "inscription"
+      - "diplôme"
+      - "bourse"
+      - "bourse d'études"
+      - "session"
+      - "programme d'études"
+      - "registraire"
+  Finance:
+    keywords:
+      - "relevé bancaire"
+      - "virement"
+      - "virement électronique"
+      - "paiement"
+      - "prélèvement"
+      - "frais bancaires"
+      - "compte bancaire"
+      - "solde"
+      - "carte de crédit"
+      - "carte de débit"
+  Health:
+    keywords:
+      - "rendez-vous médical"
+      - "rendez-vous chez le médecin"
+      - "consultation"
+      - "ordonnance"
+      - "pharmacie"
+      - "résultats d'analyse"
+      - "résultats de laboratoire"
+      - "hôpital"
+      - "clinique"
+      - "spécialiste"
+  Government Legal:
+    keywords:
+      - "gouvernement"
+      - "tribunal"
+      - "juridique"
+      - "avocat"
+      - "conseil juridique"
+      - "citation à comparaître"
+      - "passeport"
+      - "permis de conduire"
+      - "avis juridique"
+  Utilities:
+    keywords:
+      - "facture d'électricité"
+      - "facture d'hydro"
+      - "service téléphonique"
+      - "forfait mobile"
+      - "fournisseur d'accès"
+      - "internet"
+  Account Security:
+    keywords:
+      - "mot de passe"
+      - "réinitialisation"
+      - "vérification"
+      - "code de vérification"
+      - "alerte de sécurité"
+      - "connexion"
+      - "authentification"
+      - "authentification à deux facteurs"

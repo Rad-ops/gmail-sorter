@@ -1,0 +1,87 @@
+# Farsi keyword overlay for the Gmail sorter (v0.7)
+#
+# This file is optional. When the language detector on a message returns
+# "fa", these keywords are appended to (or replace, with ``replace: true``)
+# the matching English category list in sorter/policy.py. The English list
+# is always kept as a fallback for code-mixed mail.
+#
+# Edit this file to tune Farsi-language classification without touching
+# code. The same shape applies to policy.fr.yaml for French.
+#
+# Farsi is matched as space-separated tokens. Substring matches within a
+# single token are accepted for the common function words (از, به, در, که,
+# etc.) so the language detector can pick up a short subject, and so a
+# Farsi word embedded in a longer token still triggers a hit.
+#
+# Coverage focuses on:
+#   - Priority Immigration: ویزا (visa), اقامت (residence), مهاجرت (immigration)
+#   - Personal contacts: the lawyer/contact surnames already used in the
+#     English file (Pinaz Marolia, Tiffani, Ronen, Jemma, Jonalyn, Oskoii)
+#     are language-agnostic and stay in IMMIGRATION_KEYWORDS; the Farsi
+#     terms here add the surrounding context that personal mail in Farsi
+#     typically carries.
+#   - Finance, Health, Utilities, Account Security: the Farsi equivalents.
+categories:
+  Priority Immigration:
+    keywords:
+      - "ویزا"
+      - "اقامت"
+      - "اقامت دائم"
+      - "مهاجرت"
+      - "وکیل مهاجرت"
+      - "پرونده مهاجرت"
+      - "وقت سفارت"
+      - "مصاحبه مهاجرت"
+      - "رد شدن ویزا"
+      - "تمدید ویزا"
+      - "ویزای کار"
+      - "ویزای تحصیلی"
+      - "کارت اقامت"
+  Finance:
+    keywords:
+      - "صورتحساب"
+      - "پرداخت"
+      - "موجودی"
+      - "برداشت"
+      - "واریز"
+      - "انتقال وجه"
+      - "حساب بانکی"
+      - "کارت اعتباری"
+      - "وام"
+      - "اقساط"
+  Health:
+    keywords:
+      - "نوبت پزشک"
+      - "نوبت دکتر"
+      - "نسخه"
+      - "داروخانه"
+      - "بیمارستان"
+      - "کلینیک"
+      - "متخصص"
+      - "آزمایش"
+      - "نتیجه آزمایش"
+  Utilities:
+    keywords:
+      - "قبض"
+      - "قبض برق"
+      - "قبض گاز"
+      - "قبض آب"
+      - "قبض تلفن"
+      - "شارژ اینترنت"
+      - "بسته اینترنت"
+  Account Security:
+    keywords:
+      - "رمز عبور"
+      - "تغییر رمز"
+      - "کد تأیید"
+      - "تأیید هویت"
+      - "ورود به حساب"
+      - "هشدار امنیتی"
+  Government Legal:
+    keywords:
+      - "دولت"
+      - "دادگاه"
+      - "قانونی"
+      - "حقوقی"
+      - "حکم"
+      - "دادخواست"
