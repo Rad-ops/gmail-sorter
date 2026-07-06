@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.1 - 2026-07-06
+
+### 🎯 Per-Category Confidence and Label Caps
+
+- `categorize_with_confidence()` returns a 0–100 confidence per category. Categories below `--label-confidence` (default 50) are dropped unless protected/priority. `--max-labels-per-message` (default 3) caps applied labels; protected buckets are always kept. Adds `category_confidence` to `Decision`.
+
+### 🧹 Body Cleaning
+
+- `clean_body_text()` strips quoted reply chains, forwarded blocks, and footer/signature lines before category matching. A reply that quotes a promotional email is no longer misclassified as promo, and a long unsubscribe footer does not dominate the body. Unsubscribe link extraction still uses the raw body so footer URLs survive.
+
+### 🔄 Relabel Workflow Improvements
+
+- `--relabel-since-date` and `--relabel-label` restrict a relabel stage to a slice (by date or current Sorter label) without a full rescan.
+- `--undo-relabel <run_id>` reverses a relabel run by swapping recorded adds/removes back. Each relabel apply records previous labels + run_id in the action ledger. Dry-run without `--apply`.
+- `--relabel-run-id` resumes an interrupted relabel apply by skipping messages already recorded in the ledger for that run.
+
+### ⚡ Body-Feature Cache Reuse
+
+- `load_body_features_index()` precomputes cached body features; the worker fetches metadata-only for messages with cached features (when not `--refresh-existing`), and `decide()` reuses the cached body category hits so categorization stays body-aware without a re-fetch.
+
+### 📚 Documentation Overhaul
+
+- Rewrote the README into a standard, well-structured document: quick start, relabel workflow, labeling model, configuration, project layout, safety model, caps table, and performance controls.
+- Cleaned up and consolidated the docs/ notes.
+
+### 🧪 Tests
+
+- 36 tests passing. Added regression coverage for confidence/cap behavior, body cleaning, undo relabel, resume-via-ledger, and cached-body-feature reuse.
+
 ## 0.5.0 - 2026-07-06
 
 ### 🏷️ Relabel Stage (read body, remove stale labels, re-apply)

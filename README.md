@@ -1,465 +1,244 @@
-# 📬 Gmail Sorter
+# Gmail Sorter
 
-<p align="center">
-  <img src="assets/gmail-sorter-hero.png" alt="Gmail sorter triage dashboard with AI review checkpoint" width="100%">
-</p>
+A conservative, dashboard-driven Gmail cleanup and relabeling tool for large or
+long-unmanaged mailboxes. It scans, classifies, and reports before any change
+is made, then applies label, archive, trash, and relabel stages only when
+explicitly requested.
 
-<p align="center">
-  <strong>Conservative Gmail cleanup with dashboards, manifests, rescue audits, and local AI review.</strong>
-</p>
+**Version:** `0.5.1` · **Schema version:** 1
 
-Dashboard-centered Gmail cleanup tool for older mail. It scans messages before December 30, 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
+Companion local-AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack)
 
-Current version: `0.5.0` (`20260706`).
+---
 
-Companion AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack). This repo is the mailbox cleanup tool; the local AI stack repo documents the Qwen3.6, DeepSeek 32B, and Gemma planner setup used around it.
+## Why this exists
 
-## ✨ What It Does
+The target mailbox was unmanaged for more than seven years. The tool is built
+around a single principle: **every destructive path has visible reports,
+manifests, and explicit flags before Gmail is changed.** Classification is fast
+and opinionated; action is slow and gated.
+
+## What it does
 
 | Stage | Purpose | Safety posture |
 | --- | --- | --- |
-| 🏷️ Label | Mark and organize mail without moving it. | Lowest risk |
-| 🏷️ Relabel | Read bodies and re-apply the corrected `Sorter/*` labels, removing stale ones. | Reviewable |
-| 📦 Archive | Move low-value bulk mail out of the inbox. | Reviewable |
-| 🗑️ Trash | Move only high-confidence promotional mail to Trash. | Explicit flags required |
-| 🧯 Rescue audit | Re-check Trash before permanent deletion. | Conservative |
-| 🧠 Local AI review | Qwen3.6 reviews bounded packets through local llama.cpp. | No Gmail credentials given to the model |
+| **Classify** | Scan and categorize mail without changing anything. | Read-only |
+| **Label** | Apply `Sorter/<category>` labels. | Lowest risk |
+| **Relabel** | Read bodies, remove stale `Sorter/*` labels, re-apply the corrected set. Supports undo and resume. | Reviewable |
+| **Archive** | Move low-value bulk mail out of the inbox. | Reviewable |
+| **Trash** | Move high-confidence promotional mail to Trash. | Explicit flags required |
+| **Rescue audit** | Re-check Trash before permanent deletion, optionally with a local model. | Conservative |
 
-## 📁 Folder Layout
+The local-AI review path is intentionally separate from this tool. The sorter
+exports bounded review packets; the model never receives Gmail credentials.
 
-```text
-sorter/
-  src/
-    gmail_sorter.py     runnable core (CLI, scan, decide, apply, reports, dashboard)
-    sorter/             package: policy data, keyword matcher, config loader
-      policy.py         keyword lists, category rules, precedence, defaults
-      keywords.py       word-boundary keyword matching
-      config_loader.py  optional config/policy.yaml overrides
-    trash_rescue_audit.py
-    apply_domain_trash_policy.py
-  config/              allowlist, blocklist, and optional policy.yaml overrides
-  secrets/             Gmail OAuth credentials and tokens; never committed
-  reports/             generated dashboards and CSV/JSON reports; local only
-  manifests/           reviewed action manifests; local only
-  data/                resumable progress cache, SQLite state, and run logs; local only
-  docs/                notes and future documentation
-```
-
-Those local-only folders are ignored because they can contain message IDs, sender domains, snippets, OAuth tokens, mailbox state, and run-specific decisions. GitHub should explain how the sorter works, not publish a private mailbox snapshot.
-
-## ⚙️ Setup
+## Quick start
 
 ```bash
-cd /home/rzangeneh/codebase/sorter
+cd sorter
 python3 -m pip install -r requirements.txt
-```
-
-Put Gmail API credentials in:
-
-```text
-secrets/credentials.json
-```
-
-OAuth tokens are generated under `secrets/` and are intentionally ignored by Git.
-
-## 🔎 First Scan
-
-```bash
+# Place Gmail OAuth credentials at secrets/credentials.json
 python3 src/gmail_sorter.py --resume
 ```
 
-This creates:
-
-```text
-reports/gmail_sorter_report.html
-reports/gmail_sorter_report.csv
-reports/gmail_sorter_report.json
-reports/gmail_sorter_report_senders.csv
-reports/gmail_sorter_report_storage.csv
-reports/gmail_sorter_report_unsubscribe.csv
-manifests/label_manifest.json
-manifests/archive_manifest.json
-manifests/trash_manifest.json
-manifests/review/domain_review.csv
-```
-
-Review the HTML dashboard first. The dashboard includes review queues, noisy senders, top sender bulk preview, trash summary by domain, attachment review, perfect ad matches, header unsubscribe domains, and body unsubscribe links.
-
-The sorter also writes a SQLite state database to `data/gmail_sorter_state.sqlite` unless `--disable-state-db` is used. The database keeps the latest decision for each message plus an append-only action ledger for successful label/archive/trash changes.
-
-## 🧪 Staged Apply
-
-Labels only:
+Open `reports/gmail_sorter_report.html` to review the classification. Then apply
+stages explicitly:
 
 ```bash
+# Apply labels only
 python3 src/gmail_sorter.py --stage label --apply --resume
+
+# Archive bulk mail (requires bulk-mail signals, not just a high ad score)
+python3 src/gmail_sorter.py --stage archive --apply --resume
+
+# Trash high-confidence ads (requires explicit acknowledgment)
+python3 src/gmail_sorter.py --stage trash --apply \
+  --trash-obvious-ads --i-understand-trash --resume
 ```
 
-Re-label mail the sorter already labeled once, using the email body for better accuracy (re-run after the first pass taught the sender profiles):
+## Relabeling from full content
+
+The relabel stage reads each email's body, header, and footer via the Gmail API
+(`--scan full`), recomputes labels from the full content, and replaces stale
+`Sorter/*` labels with the corrected set. It only ever touches the `Sorter/`
+namespace — your user-created and Gmail system labels are never removed.
 
 ```bash
-python3 src/gmail_sorter.py \
-  --stage relabel \
-  --scan full \
-  --resume \
-  --refresh-existing \
-  --attachment-details
-```
+# Dry run: scan bodies and preview the relabel diff
+python3 src/gmail_sorter.py --stage relabel --scan full --resume --refresh-existing
 
-Review the dry-run dashboard and `manifests/relabel_manifest.json` (before→after per message), then apply:
-
-```bash
-python3 src/gmail_sorter.py \
-  --stage relabel \
-  --scan full \
-  --apply \
-  --resume \
+# Apply the relabel, then prune labels left empty
+python3 src/gmail_sorter.py --stage relabel --scan full --apply --resume \
   --prune-empty-labels
 ```
 
-Relabel only ever touches the `Sorter/*` namespace — your user-created labels and Gmail system labels are never removed. A message that now only lands in a catch-all bucket has its stale `Sorter` labels cleared. `--scan full` fetches `format=full` and feeds a bounded slice of the decoded body to the classifier so labels reflect body/header/footer content, not just the subject and snippet; ad confidence is still scored on headers+subject+snippet so a long promotional body does not inflate trash scores.
+Review `manifests/relabel_manifest.json` (before → after per message) and the
+dashboard's **Relabel Review** section before applying.
 
-Archive low-value bulk mail:
+### Incremental relabel
 
-```bash
-python3 src/gmail_sorter.py --stage archive --apply --resume
-```
-
-Archive only requires an independent bulk-mail signal (List-Unsubscribe, List-Id, one-click unsubscribe, bulk/list precedence, campaign header, Gmail Promotions, or a body unsubscribe link) plus `--archive-threshold` confidence. A one-off message that only scored high on subject keywords stays in the inbox. Cap and canary an archive apply the same way as trash:
+Relabel a slice of the mailbox without a full rescan:
 
 ```bash
-python3 src/gmail_sorter.py \
-  --stage archive \
-  --apply \
-  --resume \
-  --archive-canary-limit 100 \
-  --max-archive-per-domain 500 \
-  --max-archive-total 5000 \
-  --archive-skip-unread \
-  --archive-min-age-days 30
+# Only messages on or before a date
+python3 src/gmail_sorter.py --stage relabel --scan full --apply --resume \
+  --relabel-since-date 2024-01-01
+
+# Only messages currently tagged Sorter/Review
+python3 src/gmail_sorter.py --stage relabel --scan full --apply --resume \
+  --relabel-label Review
 ```
 
-Trash very high-confidence ads only after reviewing the dashboard:
+### Undo and resume
+
+Every relabel apply records a `run_id` and the previous label set per message in
+the action ledger.
 
 ```bash
-python3 src/gmail_sorter.py --stage trash --apply --trash-obvious-ads --i-understand-trash --resume
+# Undo an entire relabel run (dry run first, then apply)
+python3 src/gmail_sorter.py --undo-relabel 20260706T193300
+python3 src/gmail_sorter.py --undo-relabel 20260706T193300 --apply
+
+# Resume an interrupted relabel apply (skips already-applied messages)
+python3 src/gmail_sorter.py --stage relabel --scan full --apply --resume \
+  --relabel-run-id 20260706T193300
 ```
 
-All-years trash apply with combined and yearly dashboards:
+## Labeling model
 
-```bash
-cd /home/rzangeneh/codebase/sorter
-.venv/bin/python src/gmail_sorter.py \
-  --stage trash \
-  --apply \
-  --trash-obvious-ads \
-  --i-understand-trash \
-  --resume \
-  --workers 6 \
-  --sleep 0.1 \
-  --attachment-details \
-  --query "in:anywhere -in:trash" \
-  --out-prefix reports/gmail_sorter_all_years_trash_apply \
-  --progress-file data/gmail_sorter_all_years_progress.json \
-  --manifest-dir manifests/all_years
+- **Word-boundary matching.** Keyword rules use `\b` boundaries, so `exam` does
+  not match `example.com` and `class` does not match `classification`.
+  Punctuation keywords (e.g. `% off`) are matched as escaped substrings.
+- **Per-category confidence.** Each category gets a 0–100 confidence. Categories
+  below `--label-confidence` (default 50) are dropped unless protected. A
+  `--max-labels-per-message` cap (default 3) prevents label sprawl; protected
+  and priority buckets are always kept.
+- **Sender → category profiles.** High-confidence and protected decisions are
+  accumulated per sender/domain in SQLite. On a re-run, a profile can surface a
+  category the subject keywords missed, so the mailbox self-improves pass over
+  pass. Disable with `--no-sender-profiles`.
+- **Body-aware scanning.** `--scan full` feeds a bounded, cleaned slice of the
+  decoded body (quotes and footers stripped) to the classifier. Ad confidence
+  is still scored on headers + subject + snippet so a long promotional body
+  does not inflate trash scores.
+- **Catch-all labels.** `Review` and `Updates` appear on the dashboard but are
+  never applied as `Sorter/Review` / `Sorter/Updates` Gmail labels.
+- **Primary category.** Each message gets one `primary_category` chosen by a
+  protected/priority-first precedence.
+
+## Configuration
+
+Policy data lives in [`src/sorter/policy.py`](src/sorter/policy.py) and can be
+overridden without editing code via [`config/policy.yaml`](config/policy.yaml):
+
+```yaml
+immigration_keywords:
+  - immigration
+  - ircc
+  - "work permit"
+
+thresholds:
+  ad_threshold: 65
+  archive_threshold: 65
+  trash_threshold: 90
+  pre_2020_trash_threshold: 75
 ```
 
-The combined dashboard is written to `reports/gmail_sorter_all_years_trash_apply.html`. Per-year dashboards are written beside it with suffixes such as `_2024.html`.
+PyYAML is optional; built-in defaults are used when the file or library is
+absent. Allow/block lists live in `config/allowlist.txt` and
+`config/blocklist.txt`.
 
-For interrupted all-years trash apply runs, rerun the same command with `--resume` and without `--refresh-existing`. The query excludes Trash, so messages already moved by a previous interrupted run are not selected again.
+## Project layout
 
-Apply only a reviewed manifest:
-
-```bash
-python3 src/gmail_sorter.py --stage archive --apply --resume --manifest manifests/archive_manifest.json
+```
+sorter/
+  src/
+    gmail_sorter.py            Runnable core: CLI, scan, decide, apply, reports, dashboard
+    sorter/                    Package: policy data and pure logic
+      policy.py                Keyword lists, category rules, precedence, defaults
+      keywords.py              Word-boundary keyword matcher
+      config_loader.py         Optional config/policy.yaml overrides
+    trash_rescue_audit.py      Deep re-check of planned Trash before permanent delete
+    apply_domain_trash_policy.py  User-approved permanent-delete policy
+  config/                      allowlist, blocklist, optional policy.yaml
+  secrets/                     Gmail OAuth credentials and tokens (gitignored)
+  reports/                     Generated dashboards and CSV/JSON reports (local only)
+  manifests/                   Reviewed action manifests (local only)
+  data/                        Progress cache, SQLite state, run logs (local only)
+  tests/                       unittest suite
+  docs/                        Decision log, runbooks, handoff notes
 ```
 
-Use a canary trash apply when you want the first small batch to prove the policy before continuing:
+Folders marked *local only* are gitignored because they can contain message IDs,
+sender domains, snippets, OAuth tokens, and run-specific decisions. GitHub
+explains how the sorter works; it does not publish a private mailbox snapshot.
 
-```bash
-python3 src/gmail_sorter.py \
-  --stage trash \
-  --apply \
-  --trash-obvious-ads \
-  --i-understand-trash \
-  --resume \
-  --canary-limit 100 \
-  --max-trash-per-domain 500
-```
+## Safety model
 
-## 🧭 Review Workflow
+- The default run is classification only. Gmail changes require `--apply`.
+- Trash requires `--stage trash --trash-obvious-ads --i-understand-trash`.
+- **Protected messages** are never archived or trashed. A message is protected
+  when it is allowlisted, important/starred/primary, has real attachments, or
+  matches a protected category (immigration, studies, finance, account
+  security, health, government/legal, utilities, insurance, receipts/orders,
+  work/school).
+- **Archive** requires an independent bulk-mail signal (List-Unsubscribe,
+  List-Id, one-click unsubscribe, bulk/list precedence, campaign header, Gmail
+  Promotions, or a body unsubscribe link) plus `--archive-threshold` — a
+  high-scoring one-off message is not pulled from the inbox.
+- **Relabel** only touches `Sorter/*` labels. User and system labels are never
+  removed. Each apply is recorded in an append-only action ledger and can be
+  undone by `run_id`.
 
-`manifests/review/domain_review.csv` groups messages by registered domain, not noisy subdomains. It includes message counts, planned trash/archive counts, protected counts, real attachment counts, storage size, sample subjects, and a suggested action such as `approve_trash`, `unsubscribe_review`, or `protect_priority`.
+### Caps and canaries
 
-Priority mail is labeled and protected when it matches immigration, studies, or real attachment signals. Immigration signals include IRCC/visa/work permit/permanent residence terms and known lawyer/contact names such as Pinaz Marolia, Tiffani, Ronen, Raquel, Jemma, Jonalyn, and Oskoii.
+| Flag | Stage | Effect |
+| --- | --- | --- |
+| `--max-trash-total N` | trash | Cap total trash actions |
+| `--max-trash-per-domain N` | trash | Cap trash per registered domain |
+| `--canary-limit N` | trash | Keep only the first N trash actions on apply |
+| `--max-archive-total N` | archive | Cap total archive actions |
+| `--max-archive-per-domain N` | archive | Cap archive per registered domain |
+| `--archive-canary-limit N` | archive | Keep only the first N archive actions on apply |
+| `--archive-min-age-days N` | archive | Keep mail newer than N days in the inbox |
+| `--archive-skip-unread` | archive | Never archive unread mail |
 
-`reports/*_storage.csv` ranks registered domains by estimated Gmail storage usage. Use it to find the few senders that reclaim the most storage without digging through individual messages.
+## Maintenance mode
 
-## 🛠️ Maintenance Mode
-
-After the historical cleanup, use maintenance scans for new mail only:
+After the historical cleanup, scan new mail only:
 
 ```bash
 python3 src/gmail_sorter.py --maintenance-days 30 --resume --attachment-details
-```
-
-Or scan from an exact date:
-
-```bash
+# or from an exact date:
 python3 src/gmail_sorter.py --since-date 2026-07-01 --resume
 ```
 
-## 🧯 Trash Rescue Audit
-
-Before permanently emptying Gmail Trash, run a dry-run rescue audit against the messages that the all-years trash command planned to trash:
-
-```mermaid
-flowchart LR
-  A[Sorter trash plan] --> B[Re-fetch messages from Gmail Trash]
-  B --> C[Heuristic rescue audit]
-  C --> D[Local Qwen3.6 review]
-  D --> E{Both say 100% safe trash?}
-  E -->|yes| F[Verified permanent-delete manifest]
-  E -->|no| G[Rescue review / restore labels]
-```
-
-Recommended overnight local-Qwen run:
-
-```bash
-/home/rzangeneh/codebase/local-ai-gmail-interpreter/commands/run-overnight-trash-rescue.sh
-```
-
-Recommended unattended run when you want verified 100% trash permanently deleted after both checks pass:
-
-```bash
-/home/rzangeneh/codebase/sorter/commands/run-overnight-trash-rescue-and-delete-verified.sh
-```
-
-This prevents system sleep with `systemd-inhibit`, runs the local-Qwen audit, writes reports/manifests, and permanently deletes only messages that meet all gates:
-
-- still in Gmail Trash
-- script recommendation is `keep_trash`
-- `script_delete_confidence == 100`
-- local model decision is `keep_trash`
-- local model confidence is `1.0`
-- no real attachments
-- no rescue reasons
-
-The same command is also available from this repo:
-
-```bash
-commands/run-overnight-trash-rescue.sh
-```
-
-Manual dry run without local model:
-
-```bash
-cd /home/rzangeneh/codebase/sorter
-.venv/bin/python src/trash_rescue_audit.py \
-  --progress-file data/gmail_sorter_all_years_progress.json \
-  --out-prefix reports/trash_rescue_audit \
-  --sleep 0.1 \
-  --http-timeout 120
-```
-
-This creates:
-
-```text
-reports/trash_rescue_audit.html
-reports/trash_rescue_audit.csv
-reports/trash_rescue_audit.json
-reports/trash_rescue_audit_summary.json
-```
-
-The audit re-fetches each planned-trash message from Gmail, confirms whether it is still in Trash, and flags possible mistakes using deeper rules for immigration, studies, legal/transactional language, real attachments, conversation signals, and original sorter protection reasons.
-
-Optional model-assisted review:
-
-```bash
-OPENAI_API_KEY=... .venv/bin/python src/trash_rescue_audit.py \
-  --openai \
-  --web-search \
-  --openai-max 200
-```
-
-The model path is optional and only reviews likely borderline/high-risk candidates. The local heuristic report still works without it.
-
-For a local Qwen model, export bounded review packets instead of giving the model Gmail access:
-
-```bash
-.venv/bin/python src/trash_rescue_audit.py \
-  --progress-file data/gmail_sorter_all_years_progress.json \
-  --out-prefix reports/trash_rescue_audit \
-  --llm-export \
-  --llm-body-chars 1200
-```
-
-Feed these files to Qwen:
-
-```text
-reports/trash_rescue_audit_llm_prompt.md
-reports/trash_rescue_audit_llm_input.jsonl
-```
-
-Qwen should produce JSONL like:
-
-```json
-{"message_id":"abc123","decision":"rescue_review","confidence":0.91,"reason":"IRCC/legal document signal","signals":["immigration","attachment"]}
-```
-
-Merge Qwen's output without re-fetching Gmail:
-
-```bash
-.venv/bin/python src/trash_rescue_audit.py \
-  --from-audit-json reports/trash_rescue_audit.json \
-  --model-results reports/qwen_trash_rescue_results.jsonl \
-  --out-prefix reports/trash_rescue_audit_qwen
-```
-
-To run the local Qwen/llama.cpp review automatically through the local OpenAI-compatible server:
-
-```bash
-.venv/bin/python src/trash_rescue_audit.py \
-  --progress-file data/gmail_sorter_all_years_progress.json \
-  --out-prefix reports/trash_rescue_audit_local_qwen \
-  --local-llm \
-  --start-local-llm \
-  --local-llm-profile qwen36 \
-  --local-llm-max 0 \
-  --llm-body-chars 1200 \
-  --sleep 0.1 \
-  --http-timeout 120
-```
-
-This uses `llm-switch qwen36` to start the `local-llm` systemd service and calls `http://127.0.0.1:8080/v1/chat/completions` with model `local`. It writes `reports/trash_rescue_audit_local_qwen_local_llm_results.jsonl` and merges those model decisions into the final HTML/CSV/JSON reports.
-
-To review every audited Trash row with the local model instead of only the script's borderline subset, add `--local-llm-all`. Progress output includes local generation speed, prompt speed, and draft-token acceptance when llama.cpp returns those timings.
-
-The sustained Qwen3.6 run from this workflow is recorded in the AI stack repo as a real workload benchmark: 6,531 bounded review rows, 10,309,912 prompt tokens, 846,873 generated tokens, 549.96 average prompt tok/sec, 90.92 average generation tok/sec, and 85.03% weighted draft-token acceptance.
-
-For user-approved obvious-trash domains, generate a permanent-delete manifest and a smaller Qwen review file for the remaining messages:
-
-```bash
-.venv/bin/python src/apply_domain_trash_policy.py \
-  --audit-json reports/trash_rescue_audit_qwen36.json \
-  --out-prefix reports/domain_policy_obvious_trash
-```
-
-To permanently delete the manifest, the script uses a separate full-mail-scope Gmail token at `secrets/token_sorter_delete.json` because Gmail `messages.delete` requires `https://mail.google.com/`:
-
-```bash
-.venv/bin/python src/apply_domain_trash_policy.py \
-  --audit-json reports/trash_rescue_audit_qwen36.json \
-  --out-prefix reports/domain_policy_obvious_trash \
-  --apply \
-  --i-understand-permanent-delete \
-  --open-browser
-```
-
-To confirm Gmail no longer returns deleted manifest messages:
-
-```bash
-.venv/bin/python src/apply_domain_trash_policy.py \
-  --audit-json reports/trash_rescue_audit_qwen36.json \
-  --out-prefix reports/domain_policy_obvious_trash \
-  --verify-delete-status \
-  --verify-limit 300
-```
-
-The full runbook is in `docs/OVERNIGHT-LOCAL-QWEN-RUNBOOK.md`.
-
-If you decide to restore rescue candidates after reviewing the report:
-
-```bash
-.venv/bin/python src/trash_rescue_audit.py \
-  --apply \
-  --i-understand-restore
-```
-
-Restore applies one of these Gmail labels and untrashes the message unless `--label-only` is used:
-
-- `Trash Rescue/Review - 100 Confidence`
-- `Trash Rescue/Review - 75-99 Confidence`
-- `Trash Rescue/Review - Under 75 Confidence`
-
-The verified permanent-delete run writes:
-
-```text
-reports/trash_rescue_audit_local_qwen_permanent_delete_manifest.json
-reports/trash_rescue_audit_local_qwen_permanent_delete_manifest.csv
-reports/trash_rescue_audit_local_qwen_missing_gmail_ids.txt
-```
-
-Old progress files may contain message IDs that Gmail no longer has. The audit summarizes those 404 missing IDs and writes them to the missing-ID file instead of printing every API error.
-
-## 🧼 Cleanup And Decision Records
-
-- [Project decision log](docs/DECISION-LOG.md)
-- [Cleanup log for 2026-07-05](docs/CLEANUP-LOG-2026-07-05.md)
-- [Local AI stack integration](docs/LOCAL-AI-STACK-INTEGRATION.md)
-- [Continuation handoff](docs/NEXT-RUN-HANDOFF.md)
-- [Overnight local Qwen3.6 runbook](docs/OVERNIGHT-LOCAL-QWEN-RUNBOOK.md)
-- [Workspace notes](docs/CODEBASE-WORKSPACE.md)
-
-## 📊 Performance Controls
-
-`--workers` controls parallel read/classification workers. Writes remain sequential and batched.
-
-```bash
-python3 src/gmail_sorter.py --resume --workers 8
-```
-
-`--sleep` is the base throttle. The script increases delay automatically when Gmail returns retryable quota/rate errors, then gradually recovers after successful requests.
-
-`--http-timeout 120` is the default Gmail HTTP request timeout. Increase it for very slow connections, or lower it if you want stuck requests to fail faster.
-
-`--apply-progress-every 100` controls how often the apply phase prints progress for single-message trash calls and batch label/archive calls.
-
-`--refresh-after-days 7` refreshes cached decisions older than seven days when `--resume` is used. Use `--refresh-existing` to rescan everything.
-
-`--attachment-details` fetches metadata-rich payloads to report attachment filenames and MIME types. It does not download attachment bytes.
-
-It also allows the report to inspect text/html and text/plain message parts for unsubscribe URLs. The script does not persist email body text; it stores only normalized unsubscribe/preference links in reports.
-
-## 🧠 Labeling Model
-
-- **Word-boundary matching**: keyword rules use `\b` boundaries, so `exam` no longer matches `example.com` and `class` no longer matches `classification`. Punctuation keywords (e.g. `% off`) are matched as escaped substrings.
-- **Sender→category profiles**: high-confidence and protected decisions are accumulated per sender/domain in SQLite. On a re-run, a profile can add a category the subject keywords missed, so the mailbox self-improves pass over pass. Disable with `--no-sender-profiles`.
-- **Primary category**: each message gets one `primary_category` chosen by a protected/priority-first precedence, surfaced on the dashboard.
-- **Catch-all labels**: `Review`/`Updates` are shown on the dashboard but never applied as `Sorter/Review`/`Sorter/Updates` Gmail labels.
-- **Config overrides**: edit `config/policy.yaml` to override keyword groups and thresholds without touching code (PyYAML optional; built-in defaults are used otherwise).
-
-## Safety
-
-The default run is classification only. Gmail changes require `--apply`. Trash requires:
-
-```text
---stage trash --trash-obvious-ads --i-understand-trash
-```
-
-Protected messages are kept out of archive/trash when they are allowlisted, important/starred/primary, have real attachments, or match protected categories such as immigration, studies, finance, account security, health, government/legal, utilities, insurance, or receipts/orders. Inline marketing images are tracked separately so image-only promotional mail is not overprotected.
-
-Archive is deliberately conservative: a message is only archived when it clears `--archive-threshold` **and** carries an independent bulk-mail signal, so high-scoring one-off mail is not moved out of the inbox. Each archived message records an `archive_reason` explaining the evidence. Catch-all `Review`/`Updates` buckets are shown on the dashboard but never applied as Gmail labels.
-
-Archive safety controls:
-
-- `--archive-threshold N` sets the minimum ad confidence for archive (default 65).
-- `--archive-min-age-days N` keeps mail newer than N days in the inbox.
-- `--archive-skip-unread` never archives unread mail.
-- `--max-archive-per-domain N` caps archive actions per registered domain.
-- `--max-archive-total N` caps the total archive plan.
-- `--archive-canary-limit N` limits an apply run to the first N archive actions.
-
-`perfect_ad_match` means the message reached 100 ad confidence, has multiple independent bulk-mail signals such as Gmail promotions, List-Unsubscribe, List-Id, one-click unsubscribe, bulk precedence, or promotional sender local-parts, and has promotional body/subject content. Perfect matches still respect the same protected-message checks and mixed-thread protection.
-
-Trash safety controls:
-
-- `--max-trash-per-domain N` caps trash actions per registered domain.
-- `--max-trash-total N` caps the total trash plan.
-- `--canary-limit N` limits an apply run to the first N trash actions.
+## Performance controls
+
+- `--workers N` — parallel read/classification workers (writes stay sequential).
+- `--sleep F` — base throttle; auto-increases on quota/rate errors and recovers
+  after successes.
+- `--http-timeout 120` — Gmail request socket timeout.
+- `--scan full` caches compact derived body features (body length, body category
+  hits, unsubscribe count) in SQLite so re-runs skip the expensive `format=full`
+  fetch. Raw body text is never persisted.
+- `--refresh-after-days 7` refreshes cached decisions older than N days when
+  `--resume` is used; `--refresh-existing` rescans everything.
 
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+36 tests cover the classification policy, word-boundary matching, sender
+profiles, body-aware scanning, archive gating/caps, the relabel label diff,
+undo, resume, and empty-label pruning.
+
+## Documentation
+
+- [Decision log](docs/DECISION-LOG.md) — safety and design choices
+- [Overnight local-Qwen runbook](docs/OVERNIGHT-LOCAL-QWEN-RUNBOOK.md)
+- [Local AI stack integration](docs/LOCAL-AI-STACK-INTEGRATION.md)
+- [Next-run handoff](docs/NEXT-RUN-HANDOFF.md)
+- [Changelog](CHANGELOG.md)
