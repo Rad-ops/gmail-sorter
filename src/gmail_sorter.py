@@ -360,7 +360,20 @@ def decode_payload_text(data: str) -> str:
         return ""
 
 
-def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000) -> str:
+def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000, use_html_body: bool = True) -> str:
+    """Walk a Gmail message payload and return the decoded body text.
+
+    v0.8: when ``use_html_body`` is True (default), HTML parts are
+    converted to structured text (style/script stripped, tables as
+    tab-separated rows) so receipt line items and the like survive
+    into the cleaned body. When False, the function falls back to the
+    pre-v0.8 simple collector (each part decoded verbatim, joined
+    with newlines).
+    """
+
+    if use_html_body:
+        from sorter.html_body import html_to_structured_text
+
     chunks: list[str] = []
 
     def walk(part: dict[str, Any]) -> None:
@@ -371,7 +384,10 @@ def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000) -> str:
         body = part.get("body", {})
         data = body.get("data", "")
         if data and not filename and mime_type in {"text/plain", "text/html"}:
-            chunks.append(decode_payload_text(data))
+            decoded = decode_payload_text(data)
+            if mime_type == "text/html" and use_html_body:
+                decoded = html_to_structured_text(decoded)
+            chunks.append(decoded)
         for child in part.get("parts", []) or []:
             walk(child)
 
@@ -3340,6 +3356,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-sender-reputation", dest="use_sender_reputation", action="store_true", default=True, help="v0.8: first-class sender reputation signal. Computes total_messages, ad_fraction, and a derived 0-100 score per sender; high-reputation senders get -15 ad confidence, low-reputation senders get +10. The dashboard surfaces suggested blocklist candidates.")
     parser.add_argument("--no-sender-reputation", dest="use_sender_reputation", action="store_false", help="v0.8: disable sender reputation signal.")
     parser.add_argument("--since-history-id", type=str, default="", help="v0.8: incremental scan via the Gmail History API. Pass a numeric historyId, 'auto' to use the stored last_history_id, 'reset' to force a full re-scan, or empty to disable incremental mode.")
+    parser.add_argument("--use-html-body", dest="use_html_body", action="store_true", default=True, help="v0.8: better HTML body extraction. Strips <style>/<script> blocks, preserves table structure as tab-separated rows, decodes quoted-printable bodies, and handles multipart/alternative correctly.")
+    parser.add_argument("--no-html-body", dest="use_html_body", action="store_false", help="v0.8: disable the new HTML body extraction (fall back to the pre-v0.8 simple collector).")
     parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
     parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
     parser.add_argument("--embedding-model", default="local", help="Model name for the HTTP embedding endpoint.")
