@@ -8,6 +8,6 @@ these names for backwards compatibility with the companion scripts and tests.
 
 from __future__ import annotations
 
-from . import keywords, policy, schema, lang, ai_learning, learned_weights, thread_features
+from . import keywords, policy, schema, lang, ai_learning, learned_weights, thread_features, sender_reputation
 
-__all__ = ["keywords", "policy", "schema", "lang", "ai_learning", "learned_weights", "thread_features"]
+__all__ = ["keywords", "policy", "schema", "lang", "ai_learning", "learned_weights", "thread_features", "sender_reputation"]

@@ -3337,6 +3337,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
     parser.add_argument("--use-thread-modeling", dest="use_thread_modeling", action="store_true", default=True, help="v0.8: thread-level conversation modeling. Builds a thread feature vector (message_count, distinct_senders, top_category_share, etc.) and uses it to boost a category's confidence by up to 15 points. More principled than the plurality vote.")
     parser.add_argument("--no-thread-modeling", dest="use_thread_modeling", action="store_false", help="v0.8: disable thread-level conversation modeling.")
+    parser.add_argument("--use-sender-reputation", dest="use_sender_reputation", action="store_true", default=True, help="v0.8: first-class sender reputation signal. Computes total_messages, ad_fraction, and a derived 0-100 score per sender; high-reputation senders get -15 ad confidence, low-reputation senders get +10. The dashboard surfaces suggested blocklist candidates.")
+    parser.add_argument("--no-sender-reputation", dest="use_sender_reputation", action="store_false", help="v0.8: disable sender reputation signal.")
     parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
     parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
     parser.add_argument("--embedding-model", default="local", help="Model name for the HTTP embedding endpoint.")
@@ -3444,6 +3446,22 @@ def main() -> int:
         if features:
             upsert_thread_features(state_conn, features)
         args.thread_features = load_thread_features_index(state_conn)
+    # v0.8: build sender_reputation (lifetime message count, ad
+    # fraction, derived score) so score_ad can apply the -15/+10
+    # adjustment.
+    args.sender_reputation = {}
+    if getattr(args, "use_sender_reputation", True):
+        from sorter.sender_reputation import (
+            build_sender_reputation, upsert_sender_reputation, load_sender_reputation_index, suggest_blocklist,
+        )
+        reputations = build_sender_reputation(state_conn)
+        if reputations:
+            upsert_sender_reputation(state_conn, reputations)
+        args.sender_reputation = load_sender_reputation_index(state_conn)
+        candidates = suggest_blocklist(args.sender_reputation)
+        if candidates:
+            log.info("blocklist candidates (>=%d msgs, >=%.0f%% ads, no protected): %s",
+                     200, 0.80 * 100, ", ".join(candidates[:10]))
     # Embedding backend and centroids: optional semantic classification layer.
     args._embedding_backend = None
     args.category_centroids = {}
