@@ -1111,6 +1111,22 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
             categories = sorted(set(categories) | {dominant})
             category_confidence_kept[dominant] = 55
             reasons.append(f"thread_inherited:{dominant}")
+    # v0.8: thread-level conversation modeling. The thread features
+    # are read from args.thread_features in main(). The boost is
+    # small (cap 15) and only applies to the thread's top
+    # category, so a noisy thread can't blow up an unrelated
+    # category.
+    thread_features = getattr(args, "thread_features", {}) or {}
+    thread_id = message.get("threadId", "")
+    if thread_id and getattr(args, "use_thread_modeling", True):
+        feature = thread_features.get(thread_id)
+        if feature is not None:
+            from sorter.thread_features import compute_thread_boost
+            boost = compute_thread_boost(feature, feature.top_category)
+            if boost > 0 and feature.top_category not in NON_LABEL_CATEGORIES:
+                old_conf = category_confidence_kept.get(feature.top_category, 0)
+                category_confidence_kept[feature.top_category] = max(old_conf, min(100, old_conf + boost))
+                reasons.append(f"thread_model_boost:{feature.top_category}:+{boost}")
     body_unsubscribe_links = find_unsubscribe_links_in_text(body_text) if body_included else extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
     # This is the main safety gate. A protected message can still be reported
@@ -3319,6 +3335,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-learned-weights", action="store_true", default=False, help="v0.8: replace the hand-tuned keyword weights with weights learned from the labeled data in the SQLite messages table. Trained on every scan; persisted to data/learned_weights.json. Falls back to hand-tuned weights when not enough labeled data exists.")
     parser.add_argument("--learned-weights-file", type=str, default="data/learned_weights.json", help="v0.8: path to the learned-weights JSON file.")
     parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
+    parser.add_argument("--use-thread-modeling", dest="use_thread_modeling", action="store_true", default=True, help="v0.8: thread-level conversation modeling. Builds a thread feature vector (message_count, distinct_senders, top_category_share, etc.) and uses it to boost a category's confidence by up to 15 points. More principled than the plurality vote.")
+    parser.add_argument("--no-thread-modeling", dest="use_thread_modeling", action="store_false", help="v0.8: disable thread-level conversation modeling.")
     parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
     parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
     parser.add_argument("--embedding-model", default="local", help="Model name for the HTTP embedding endpoint.")
@@ -3415,6 +3433,17 @@ def main() -> int:
     ) if getattr(args, "use_sender_profiles", True) else {}
     args.cached_body_features = load_body_features_index(state_conn) if getattr(args, "scan", "metadata") == "full" and not args.refresh_existing else {}
     args.thread_dominant_categories = load_thread_dominant_categories(state_conn) if getattr(args, "use_thread_aware", False) else {}
+    # v0.8: build thread-level features (message_count, distinct_senders,
+    # top_category_share, etc.) for the thread-aware boost. The new
+    # table is populated lazily on every scan; the load function
+    # returns an empty dict on a fresh install.
+    args.thread_features = {}
+    if getattr(args, "use_thread_modeling", True):
+        from sorter.thread_features import build_thread_features, upsert_thread_features, load_thread_features_index
+        features = build_thread_features(state_conn)
+        if features:
+            upsert_thread_features(state_conn, features)
+        args.thread_features = load_thread_features_index(state_conn)
     # Embedding backend and centroids: optional semantic classification layer.
     args._embedding_backend = None
     args.category_centroids = {}
