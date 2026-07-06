@@ -293,6 +293,8 @@ class Decision:
     attachment_count: int = 0
     inline_attachment_count: int = 0
     message_size_estimate: int = 0
+    body_len: int = 0
+    body_category_hits: list[str] = field(default_factory=list)
     list_unsubscribe: str = ""
     body_unsubscribe_links: list[str] = field(default_factory=list)
     attachment_names: list[str] = field(default_factory=list)
@@ -605,9 +607,14 @@ def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000) -> str:
     return "\n".join(chunks)[:max_chars]
 
 
-def extract_body_unsubscribe_links(payload: dict[str, Any], limit: int = 20) -> list[str]:
-    # Keep reports privacy-light: inspect transient body text, persist only scrubbed unsubscribe targets.
-    body_text = html.unescape(collect_body_text(payload))
+def find_unsubscribe_links_in_text(body_text: str, limit: int = 20) -> list[str]:
+    """Scrub unsubscribe/preference URLs out of already-decoded body text.
+
+    Kept separate from payload walking so a caller that already collected body
+    text (for categorization) can reuse it instead of decoding the payload a
+    second time.
+    """
+
     if not body_text:
         return []
     candidates = re.findall(r"""https?://[^\s"'<>\\)]+|mailto:[^\s"'<>\\)]+""", body_text, flags=re.IGNORECASE)
@@ -625,6 +632,12 @@ def extract_body_unsubscribe_links(payload: dict[str, Any], limit: int = 20) -> 
         if len(links) >= limit:
             break
     return links
+
+
+def extract_body_unsubscribe_links(payload: dict[str, Any], limit: int = 20) -> list[str]:
+    # Keep reports privacy-light: inspect transient body text, persist only scrubbed unsubscribe targets.
+    body_text = html.unescape(collect_body_text(payload))
+    return find_unsubscribe_links_in_text(body_text, limit)
 
 
 def payload_has_attachment(payload: dict[str, Any]) -> bool:
@@ -994,12 +1007,26 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     snippet = message.get("snippet", "")
     message_date = parse_date(headers.get("date", ""), message.get("internalDate"))
     searchable = " ".join([sender, sender_domain, subject, snippet])
+    # Body-aware scanning: when the payload is fetched with format=full
+    # (--scan full), include a bounded slice of the decoded body in the text the
+    # category rules see. This lets categorization use the email body, header,
+    # footer, and unsubscribe evidence instead of only the subject and snippet.
+    # Ad confidence is intentionally still scored on headers+subject+snippet so
+    # a long promotional body does not inflate the trash score.
+    body_text = html.unescape(collect_body_text(payload))
+    body_len = len(body_text)
+    category_searchable = searchable
+    body_included = bool(body_len) and getattr(args, "scan", "metadata") == "full"
     ad_confidence, reasons, negative_reasons = score_ad(headers, labels, sender, sender_domain, subject, snippet, config)
+    if body_included:
+        category_searchable = f"{searchable}\n{body_text[:8000]}"
+        reasons.append(f"body_included:{body_len}")
+    body_hit_categories = sorted(body_category_hits(body_text).keys()) if body_included else []
     age_boost = age_score_boost(message_date)
     if age_boost and ad_confidence >= args.ad_threshold:
         ad_confidence = min(100, ad_confidence + age_boost)
         reasons.append(f"older_mail_boost:{age_boost}")
-    categories = categorize(searchable, labels, ad_confidence)
+    categories = categorize(category_searchable, labels, ad_confidence)
     # Sender history: if this address/domain was consistently labeled a category
     # before, surface it even when the subject keywords missed. This makes a
     # re-run on an already-labeled mailbox self-improve: the first pass teaches
@@ -1022,7 +1049,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     if has_real_attachment:
         categories.append("Priority Attachments")
         categories = sorted(set(categories))
-    body_unsubscribe_links = extract_body_unsubscribe_links(payload)
+    body_unsubscribe_links = find_unsubscribe_links_in_text(body_text) if body_included else extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
     # This is the main safety gate. A protected message can still be reported
     # and labeled, but archive/trash actions are removed before apply.
@@ -1143,6 +1170,8 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         attachment_count=real_attachment_count,
         inline_attachment_count=inline_attachment_count,
         message_size_estimate=int(message.get("sizeEstimate") or 0),
+        body_len=body_len,
+        body_category_hits=body_hit_categories,
         list_unsubscribe=headers.get("list-unsubscribe", ""),
         body_unsubscribe_links=body_unsubscribe_links,
         attachment_names=attachment_names,
@@ -1195,6 +1224,8 @@ def decision_from_dict(data: dict[str, Any]) -> Decision:
     data.setdefault("attachment_count", 1 if data.get("has_real_attachment") else 0)
     data.setdefault("inline_attachment_count", 0)
     data.setdefault("message_size_estimate", 0)
+    data.setdefault("body_len", 0)
+    data.setdefault("body_category_hits", [])
     if "primary_category" not in data:
         data["primary_category"] = pick_primary_category(data.get("categories", []) or [])
     data.setdefault("archive_reason", "")
@@ -1289,6 +1320,18 @@ def open_state_db(path: Path) -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sender_profile_kind ON sender_profile(kind, category)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_features (
+            message_id TEXT PRIMARY KEY,
+            body_len INTEGER NOT NULL DEFAULT 0,
+            body_category_hits_json TEXT NOT NULL DEFAULT '[]',
+            body_unsubscribe_count INTEGER NOT NULL DEFAULT 0,
+            scan_mode TEXT NOT NULL DEFAULT 'metadata',
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -1328,6 +1371,65 @@ def sender_profile_categories_from_index(index: dict[str, dict[str, int]], sende
         for category, weight in index.get(sender_profile_key(kind, value), {}).items():
             weighted[category] += weight
     return dict(weighted)
+
+
+def body_category_hits(body_text: str) -> dict[str, list[str]]:
+    """Return {category: [matched keywords]} found in the body text only.
+
+    Used to cache which category rules the body satisfied so a re-run can reuse
+    the body-derived features without re-fetching the message from Gmail.
+    """
+
+    hits: dict[str, list[str]] = {}
+    if not body_text:
+        return hits
+    for name, keywords, _exclusions in CATEGORY_RULES:
+        matched = keyword_hits(body_text, keywords)
+        if matched:
+            hits[name] = matched
+    return hits
+
+
+def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Decision], scan_mode: str) -> None:
+    """Cache compact, privacy-light body features per message.
+
+    Only the body length, the category keyword names that hit in the body, and
+    the unsubscribe count are stored. Raw body text is never persisted.
+    """
+
+    if conn is None or not decisions:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for item in decisions:
+        if not item.body_len:
+            continue
+        rows.append(
+            (
+                item.message_id,
+                item.body_len,
+                json.dumps(item.body_category_hits, ensure_ascii=False),
+                len(item.body_unsubscribe_links),
+                scan_mode,
+                now,
+            )
+        )
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO message_features (message_id, body_len, body_category_hits_json, body_unsubscribe_count, scan_mode, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            body_len=excluded.body_len,
+            body_category_hits_json=excluded.body_category_hits_json,
+            body_unsubscribe_count=excluded.body_unsubscribe_count,
+            scan_mode=excluded.scan_mode,
+            updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
 
 
 def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Decision], confidence_floor: int = 65) -> None:
@@ -1614,7 +1716,7 @@ def scan_messages(
                 args.retries,
                 args.retry_sleep,
                 throttle,
-                args.attachment_details,
+                args.attachment_details or getattr(args, "scan", "metadata") == "full",
             )
             return message_id, decide(message, args, config), None
         except Exception as error:
@@ -2463,6 +2565,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-archive-total", type=int, default=0, help="Cap total planned archive actions; 0 disables the cap.")
     parser.add_argument("--archive-canary-limit", type=int, default=0, help="When applying archive, only keep the first N archive actions in the apply set.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
+    parser.add_argument("--scan", choices=["metadata", "full"], default="metadata", help="metadata = headers+snippet (fast); full = also read decoded body text for body-aware categorization. full costs more Gmail quota and is meant for a relabel/re-scan pass.")
     parser.add_argument("--use-sender-profiles", dest="use_sender_profiles", action="store_true", default=True, help="Use learned sender/domain category history to fix keyword misses (default on).")
     parser.add_argument("--no-sender-profiles", dest="use_sender_profiles", action="store_false", help="Disable sender-profile-assisted categorization.")
     parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
@@ -2530,6 +2633,8 @@ def main() -> int:
     upsert_state_decisions(state_conn, decisions)
     if getattr(args, "use_sender_profiles", True):
         update_sender_profiles(state_conn, decisions, confidence_floor=args.sender_profile_floor)
+    if getattr(args, "scan", "metadata") == "full":
+        upsert_message_features(state_conn, decisions, scan_mode="full")
     stale_progress_count = len(progress) - len(decisions)
     if stale_progress_count > 0:
         print(f"Ignoring {stale_progress_count} cached decisions outside the current query/report set.")

@@ -21,6 +21,10 @@ def args(**overrides):
         "pre_2020_trash_threshold": 75,
         "stage": "classify",
         "trash_obvious_ads": False,
+        "scan": "metadata",
+        "use_sender_profiles": True,
+        "sender_profiles": {},
+        "sender_profile_min_weight": 6,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -49,6 +53,17 @@ def payload(headers, parts=None, filename="", mime_type="text/plain", body=None)
         "filename": filename,
         "mimeType": mime_type,
         "body": body or {},
+    }
+
+
+def body_payload(headers, body_text, mime_type="text/plain"):
+    """Build a format=full-style payload whose body decodes to body_text."""
+
+    import base64
+    return {
+        "headers": [{"name": name, "value": value} for name, value in headers.items()],
+        "mimeType": mime_type,
+        "body": {"data": base64.urlsafe_b64encode(body_text.encode("utf-8")).decode("ascii")},
     }
 
 
@@ -312,6 +327,39 @@ class WordBoundaryAndSenderProfileTests(unittest.TestCase):
         )
         item = gmail_sorter.decide(msg, args_profile, gmail_sorter.Config())
         self.assertNotIn("Finance", item.categories)
+
+    def test_scan_full_uses_body_for_categorization(self):
+        # The subject has no immigration keyword, but the body mentions IRCC
+        # and a work permit. With --scan full the body is decoded and the
+        # message is categorized as Priority Immigration, which it would miss
+        # in metadata-only mode.
+        headers = {
+            "From": "Counsel <counsel@legal.testmail.co>",
+            "Subject": "File update",
+            "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+        }
+        msg = message(
+            body_payload(headers, "Please find your IRCC work permit and biometrics appointment enclosed."),
+        )
+        meta_item = gmail_sorter.decide(msg, args(scan="metadata"), gmail_sorter.Config())
+        full_item = gmail_sorter.decide(msg, args(scan="full"), gmail_sorter.Config())
+        self.assertNotIn("Priority Immigration", meta_item.categories)
+        self.assertIn("Priority Immigration", full_item.categories)
+        self.assertGreater(full_item.body_len, 0)
+        self.assertTrue(any(r.startswith("body_included:") for r in full_item.reasons))
+
+    def test_scan_metadata_does_not_read_body(self):
+        # In real metadata mode the payload has no body data, so body-aware
+        # categorization is a no-op and body_len stays 0.
+        headers = {
+            "From": "Counsel <counsel@legal.testmail.co>",
+            "Subject": "File update",
+            "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+        }
+        msg = message(payload(headers))
+        item = gmail_sorter.decide(msg, args(scan="metadata"), gmail_sorter.Config())
+        self.assertEqual(item.body_len, 0)
+        self.assertNotIn("Priority Immigration", item.categories)
 
 
 if __name__ == "__main__":
