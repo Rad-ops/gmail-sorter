@@ -10,6 +10,8 @@ import gmail_sorter
 
 
 def args(**overrides):
+    """Build a minimal argparse-like object for policy tests."""
+
     defaults = {
         "ad_threshold": 65,
         "trash_threshold": 90,
@@ -22,6 +24,8 @@ def args(**overrides):
 
 
 def message(payload, labels=None, snippet="", size=0):
+    """Create the Gmail message shape consumed by gmail_sorter.decide."""
+
     return {
         "id": "msg-1",
         "threadId": "thread-1",
@@ -34,6 +38,8 @@ def message(payload, labels=None, snippet="", size=0):
 
 
 def payload(headers, parts=None, filename="", mime_type="text/plain", body=None):
+    """Build a lightweight Gmail payload with optional parts/body data."""
+
     return {
         "headers": [{"name": name, "value": value} for name, value in headers.items()],
         "parts": parts or [],
@@ -44,10 +50,14 @@ def payload(headers, parts=None, filename="", mime_type="text/plain", body=None)
 
 
 class GmailSorterPolicyTests(unittest.TestCase):
+    """Regression tests for the cleanup policy, not the live Gmail API."""
+
     def test_registered_domain_groups_subdomains(self):
+        # Sender reports should group noisy marketing subdomains together.
         self.assertEqual(gmail_sorter.registered_domain_for("email.linkedin.com"), "linkedin.com")
 
     def test_old_progress_decision_gets_new_defaults(self):
+        # Progress files survive across releases even when Decision grows fields.
         decision = gmail_sorter.decision_from_dict(
             {
                 "message_id": "m",
@@ -64,6 +74,7 @@ class GmailSorterPolicyTests(unittest.TestCase):
         self.assertEqual(decision.message_size_estimate, 0)
 
     def test_immigration_mail_is_priority_and_protected(self):
+        # Immigration/lawyer terms must override promotional-looking metadata.
         item = gmail_sorter.decide(
             message(
                 payload(
@@ -82,6 +93,7 @@ class GmailSorterPolicyTests(unittest.TestCase):
         self.assertTrue(item.protected)
 
     def test_real_attachment_is_priority_but_inline_image_only_is_not_real(self):
+        # PDFs/documents are safety signals; inline marketing images are not.
         real = payload(
             {"From": "School <registrar@example.edu>", "Subject": "Transcript", "Date": "Mon, 01 Jan 2024 00:00:00 +0000"},
             parts=[

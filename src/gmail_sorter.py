@@ -3,6 +3,11 @@
 
 Default mode is a dry-run classification pass. The HTML dashboard is the main
 review surface; use it before running any --apply stage.
+
+The safety model is intentionally boring: scan first, write reports/manifests,
+then require explicit flags before Gmail is changed. The code is split around
+that same idea so a new reader can trace each phase without guessing where the
+destructive operations happen.
 """
 
 from __future__ import annotations
@@ -33,9 +38,12 @@ MAIL_SCOPE = "https://mail.google.com/"
 DEFAULT_QUERY = "before:2025/12/30 -in:trash"
 ROOT_LABEL = "Sorter"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 VERSION_CODE = "20260705"
 
+# These keyword groups are policy inputs, not throwaway search terms. A message
+# only becomes trash-eligible when promotional evidence wins against the
+# protection rules below.
 AD_SUBJECT_KEYWORDS = [
     "sale",
     "deal",
@@ -134,6 +142,8 @@ TRANSACTIONAL_KEYWORDS = [
 ]
 
 IMPORTANT_LABELS = {"CATEGORY_PRIMARY", "STARRED", "IMPORTANT"}
+# Protected categories are the hard stop list. If a message lands here, it can
+# still be labeled for review, but it should not be archived or trashed.
 PROTECTED_CATEGORIES = {
     "Account Security",
     "Finance",
@@ -222,6 +232,8 @@ CATEGORY_RULES = [
 
 @dataclass
 class Config:
+    """User-maintained allow/block lists, split into domains and exact senders."""
+
     allow_domains: set[str] = field(default_factory=set)
     block_domains: set[str] = field(default_factory=set)
     allow_senders: set[str] = field(default_factory=set)
@@ -230,6 +242,13 @@ class Config:
 
 @dataclass
 class Decision:
+    """One normalized decision row used by reports, manifests, and state.
+
+    The dataclass is deliberately wider than a pure action object because the
+    dashboard needs to explain why a message was protected, archived, or queued
+    for Trash review.
+    """
+
     message_id: str
     thread_id: str
     date: str
@@ -262,6 +281,13 @@ class Decision:
 
 
 class AdaptiveThrottle:
+    """Small shared throttle for Gmail API pressure.
+
+    Gmail rate limits tend to arrive in bursts. Workers share this object so a
+    retryable error slows the whole scan down instead of letting every thread
+    keep hammering the API independently.
+    """
+
     def __init__(self, base_sleep: float, max_sleep: float = 10.0) -> None:
         self.base_sleep = max(0.0, base_sleep)
         self.current_sleep = self.base_sleep
@@ -285,6 +311,8 @@ class AdaptiveThrottle:
 
 
 def load_google_libraries() -> tuple[Any, Any, Any, Any, Any]:
+    """Import Google dependencies lazily so `--help` and tests stay lightweight."""
+
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
@@ -297,6 +325,8 @@ def load_google_libraries() -> tuple[Any, Any, Any, Any, Any]:
 
 
 def get_credentials(credentials_path: Path, token_path: Path, scopes: list[str], open_browser: bool, google_libs: tuple[Any, Any, Any, Any, Any]) -> Any:
+    """Load or create the OAuth token for exactly the scope requested by caller."""
+
     Request, Credentials, InstalledAppFlow, _, _ = google_libs
     creds = None
     if token_path.exists():
@@ -315,6 +345,8 @@ def get_credentials(credentials_path: Path, token_path: Path, scopes: list[str],
 
 
 def build_gmail_service(build_func: Any, creds: Any, args: argparse.Namespace) -> Any:
+    """Build a Gmail client and attach the configured HTTP timeout when possible."""
+
     if args.http_timeout > 0:
         try:
             import google_auth_httplib2
@@ -338,6 +370,8 @@ def load_list(path: Path) -> set[str]:
 
 
 def load_config(allowlist: Path, blocklist: Path) -> Config:
+    """Read the human-editable allow/block files into fast lookup sets."""
+
     allow = load_list(allowlist)
     block = load_list(blocklist)
     return Config(
@@ -370,6 +404,8 @@ def execute_with_retries(
     retry_sleep: float,
     throttle: AdaptiveThrottle | None = None,
 ) -> dict[str, Any]:
+    """Run one Gmail request with retry/backoff only for errors worth retrying."""
+
     for attempt in range(retries + 1):
         try:
             if throttle:
@@ -655,11 +691,20 @@ def get_message_metadata(
 
 
 def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_domain: str, subject: str, snippet: str, config: Config) -> tuple[int, list[str], list[str]]:
+    """Score promotional likelihood and keep the positive/negative evidence.
+
+    The score is capped at 100, but the evidence lists matter more than the
+    number. Reports and rescue audits use those lists to explain the decision.
+    """
+
     searchable = " ".join([sender, sender_domain, subject, snippet])
     score = 0
     reasons: list[str] = []
     negative_reasons: list[str] = []
 
+    # User blocklist entries are strong signals, but still do not bypass the
+    # later protection checks for attachments, important labels, or priority
+    # categories.
     if sender_domain in config.block_domains:
         score += 60
         reasons.append("blocklisted_domain")
@@ -667,6 +712,8 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
     if sender_email in config.block_senders:
         score += 60
         reasons.append("blocklisted_sender")
+    # Allowlist entries are intentionally heavy because a false positive here is
+    # worse than leaving some junk visible.
     if sender_domain in config.allow_domains or sender_email in config.allow_senders:
         score -= 100
         negative_reasons.append("allowlisted_sender_or_domain")
@@ -674,6 +721,8 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
     if "CATEGORY_PROMOTIONS" in labels:
         score += 50
         reasons.append("gmail_category_promotions")
+    # Bulk-mail headers are valuable because they come from the mail transport,
+    # not just marketing copy in a subject line.
     if headers.get("list-unsubscribe"):
         score += 30
         reasons.append("list_unsubscribe_header")
@@ -709,6 +758,8 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
         score += 18
         reasons.append(f"promotional_sender_localpart:{localpart}")
 
+    # Transactional words pull the score down. A receipt or account alert from a
+    # promotional sender is still a durable record.
     negative_hits = contains_any(searchable, TRANSACTIONAL_KEYWORDS)
     if negative_hits:
         score -= min(70, 18 * len(negative_hits))
@@ -774,6 +825,8 @@ def is_perfect_ad_match(
 
 
 def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[str]:
+    """Assign dashboard labels from evidence; this does not apply Gmail labels."""
+
     categories: list[str] = []
     if ad_confidence >= 65:
         categories.append("Ads Promotions")
@@ -794,6 +847,8 @@ def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[s
 
 
 def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) -> Decision:
+    """Turn one Gmail message payload into a conservative action plan."""
+
     payload = message.get("payload", {})
     headers = header_map(payload)
     labels = message.get("labelIds", [])
@@ -818,6 +873,8 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         categories = sorted(set(categories))
     body_unsubscribe_links = extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
+    # This is the main safety gate. A protected message can still be reported
+    # and labeled, but archive/trash actions are removed before apply.
     protected = (
         sender_domain in config.allow_domains
         or sender_email in config.allow_senders
@@ -833,6 +890,8 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         negative_reasons.append("protected_category")
     if body_unsubscribe_links:
         reasons.append("body_unsubscribe_link")
+    # Perfect ad matches are the only class designed for high-confidence Trash,
+    # and even they must survive the same protection checks.
     perfect_ad_match = not protected and is_perfect_ad_match(
         headers,
         labels,
@@ -857,6 +916,8 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         reasons.append(f"pre_2020_trash_threshold:{trash_threshold}")
     if args.stage in {"archive", "trash"} and can_archive:
         planned_actions.append("archive")
+    # Trash requires both the stage and the explicit trash flag. A normal scan
+    # or archive run should never sneak a Trash action into the manifest.
     if args.stage == "trash" and args.trash_obvious_ads and can_trash:
         planned_actions.append("trash")
 
@@ -912,6 +973,8 @@ def get_thread_message_ids(service: Any, thread_id: str, retries: int, retry_sle
 
 
 def protect_mixed_threads(service: Any, decisions: list[Decision], retries: int, retry_sleep: float, limit: int) -> None:
+    """Remove Trash actions from threads that include messages outside the plan."""
+
     checked = 0
     by_thread: dict[str, list[Decision]] = defaultdict(list)
     for item in decisions:
@@ -931,6 +994,8 @@ def protect_mixed_threads(service: Any, decisions: list[Decision], retries: int,
 
 
 def decision_from_dict(data: dict[str, Any]) -> Decision:
+    """Load older progress rows while tolerating newly added dataclass fields."""
+
     valid = Decision.__dataclass_fields__.keys()
     if "registered_domain" not in data:
         data["registered_domain"] = registered_domain_for(data.get("sender_domain", ""))
@@ -955,6 +1020,8 @@ def save_progress(path: Path, decisions: dict[str, Decision]) -> None:
 
 
 def open_state_db(path: Path) -> sqlite3.Connection:
+    """Create the local SQLite state database used for resumability/auditing."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1017,6 +1084,8 @@ def open_state_db(path: Path) -> sqlite3.Connection:
 
 
 def upsert_state_decisions(conn: sqlite3.Connection | None, decisions: list[Decision]) -> None:
+    """Persist the latest decision for each message after scans or applies."""
+
     if conn is None or not decisions:
         return
     now = datetime.now(timezone.utc).isoformat()
@@ -1096,6 +1165,8 @@ def record_action_ledger(
     status: str = "success",
     detail: str = "",
 ) -> None:
+    """Append a durable record of a Gmail write that actually succeeded."""
+
     if conn is None:
         return
     conn.execute(
@@ -1158,6 +1229,8 @@ def scan_messages(
     args: argparse.Namespace,
     config: Config,
 ) -> dict[str, Decision]:
+    """Fetch message metadata, classify it, and save progress as the scan runs."""
+
     throttle = AdaptiveThrottle(args.sleep)
     pending = [
         message_id
@@ -1172,6 +1245,8 @@ def scan_messages(
     thread_local = threading.local()
 
     def service_for_thread() -> Any:
+        # googleapiclient services are not documented as thread-safe, so each
+        # worker lazily gets its own Gmail client while sharing the same creds.
         if not hasattr(thread_local, "service"):
             thread_local.service = build_gmail_service(build_func, creds, args)
         return thread_local.service
@@ -1237,12 +1312,22 @@ def get_or_create_labels(service: Any, label_names: list[str], retries: int, ret
 
 
 def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Namespace, state_conn: sqlite3.Connection | None = None) -> None:
+    """Apply a reviewed decision set to Gmail.
+
+    Trash is done as single-message calls so progress is visible and resumable.
+    Label/archive operations are grouped into Gmail batchModify calls because
+    they are reversible and much cheaper to apply in bulk.
+    """
+
     started = time.monotonic()
     categories = sorted({category for item in decisions for category in item.categories})
     label_ids = get_or_create_labels(service, [f"{ROOT_LABEL}/{category}" for category in categories], args.retries, args.retry_sleep)
     grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[Decision]] = {}
     trash_items: list[Decision] = []
     for item in decisions:
+        # Re-check protection at the last possible moment. If a future scan bug
+        # accidentally planned archive/trash on a protected row, apply still
+        # strips the destructive action before talking to Gmail.
         if item.protected and ("trash" in item.planned_actions or "archive" in item.planned_actions):
             item.planned_actions = [action for action in item.planned_actions if action not in {"trash", "archive"}]
         if "trash" in item.planned_actions:
@@ -1297,6 +1382,8 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
 
 
 def write_csv(path: Path, decisions: list[Decision]) -> None:
+    """Write the flat report used for spreadsheet review."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(Decision.__dataclass_fields__.keys())
     with path.open("w", newline="", encoding="utf-8") as file:
@@ -1311,11 +1398,15 @@ def write_csv(path: Path, decisions: list[Decision]) -> None:
 
 
 def write_json(path: Path, decisions: list[Decision]) -> None:
+    """Write the full machine-readable decision report."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps([asdict(item) for item in decisions], indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def write_unsubscribe_report(path: Path, decisions: list[Decision]) -> None:
+    """Write unsubscribe targets without storing full email bodies."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=["source", "sender_domain", "sender", "count", "unsubscribe_target"])
@@ -1337,6 +1428,8 @@ def write_unsubscribe_report(path: Path, decisions: list[Decision]) -> None:
 
 
 def write_sender_report(path: Path, decisions: list[Decision]) -> None:
+    """Summarize noisy senders by registered domain for quick cleanup review."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     grouped: dict[str, list[Decision]] = defaultdict(list)
     for item in decisions:
@@ -1361,6 +1454,8 @@ def write_sender_report(path: Path, decisions: list[Decision]) -> None:
 
 
 def write_storage_report(path: Path, decisions: list[Decision]) -> None:
+    """Rank domains by estimated storage impact so big wins are easy to spot."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     grouped: dict[str, list[Decision]] = defaultdict(list)
     for item in decisions:
@@ -1402,6 +1497,8 @@ def write_storage_report(path: Path, decisions: list[Decision]) -> None:
 
 
 def write_review_workflow(path: Path, decisions: list[Decision]) -> None:
+    """Write the per-domain review queue used before approving large actions."""
+
     path.mkdir(parents=True, exist_ok=True)
     grouped: dict[str, list[Decision]] = defaultdict(list)
     for item in decisions:
@@ -1460,6 +1557,8 @@ def write_review_workflow(path: Path, decisions: list[Decision]) -> None:
 
 
 def suggested_domain_action(items: list[Decision]) -> str:
+    """Give a human reviewer a starting point, not an automatic approval."""
+
     protected_count = sum(1 for item in items if item.protected)
     trash_count = sum(1 for item in items if "trash" in item.planned_actions)
     priority_count = sum(1 for item in items if {"Priority Immigration", "Priority Studies", "Priority Attachments"}.intersection(item.categories))
@@ -1475,6 +1574,8 @@ def suggested_domain_action(items: list[Decision]) -> str:
 
 
 def write_action_manifests(path: Path, decisions: list[Decision]) -> None:
+    """Write exactly what each apply stage would touch."""
+
     path.mkdir(parents=True, exist_ok=True)
     manifests = {
         "label": [item for item in decisions if any(action.startswith("label:") for action in item.planned_actions)],
@@ -1493,6 +1594,8 @@ def write_action_manifests(path: Path, decisions: list[Decision]) -> None:
 
 
 def load_manifest_ids(path: Path) -> set[str]:
+    """Read a reviewed manifest and return the message IDs allowed for apply."""
+
     data = json.loads(path.read_text(encoding="utf-8"))
     return set(data.get("message_ids", []))
 
@@ -1506,6 +1609,8 @@ def pct(part: int | float, total: int | float) -> float:
 
 
 def extract_unsubscribe_targets(header_value: str) -> list[str]:
+    """Pull List-Unsubscribe targets out of Gmail header syntax."""
+
     targets = re.findall(r"<([^>]+)>", header_value)
     if not targets and header_value:
         targets = [part.strip() for part in header_value.split(",")]
@@ -1540,6 +1645,8 @@ def unsubscribe_domain_score(entry: dict[str, Any]) -> float:
 
 
 def grouped_unsubscribe_domains(items: list[Decision]) -> dict[str, dict[str, Any]]:
+    """Group unsubscribe opportunities by sender domain for dashboard ranking."""
+
     grouped: dict[str, dict[str, Any]] = {}
     for item in items:
         domain = item.sender_domain or "(unknown)"
@@ -1736,6 +1843,8 @@ def render_reason_summary(items: list[Decision], attr: str, limit: int = 20) -> 
 
 
 def render_table(items: list[Decision], columns: list[str], limit: int = 50) -> str:
+    """Render a bounded dashboard table so huge mailboxes stay browser-friendly."""
+
     rows = []
     for item in items[:limit]:
         data = asdict(item)
@@ -1799,6 +1908,8 @@ def render_rank_list(items: list[tuple[str, int]], total: int, tone: str = "neut
 
 
 def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namespace) -> None:
+    """Create the main human review surface for a scan/apply run."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     category_counts = Counter(category for item in decisions for category in item.categories)
     sender_counts = Counter(item.registered_domain or item.sender_domain or "(unknown)" for item in decisions)
@@ -1820,6 +1931,8 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
     trash_count = sum(1 for item in decisions if "trash" in item.planned_actions)
     applied_count = sum(1 for item in decisions if item.action_done == "yes")
     total_size_mb = sum(item.message_size_estimate for item in decisions) / (1024 * 1024)
+    # Resumed scans can contain old cached rows. Show the count instead of
+    # hiding it, because stale progress can otherwise make reports feel haunted.
     stale_progress_count = max(0, len(load_progress(Path(args.progress_file))) - total) if args.resume else 0
     pre_2020_trash_items = [
         item for item in decisions if is_before_year(item.date, 2020) and "trash" in item.planned_actions
@@ -1927,6 +2040,8 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 
 
 def write_yearly_dashboards(out_prefix: Path, decisions: list[Decision], args: argparse.Namespace) -> list[Path]:
+    """Split the combined dashboard into year-sized review pages."""
+
     grouped: dict[str, list[Decision]] = defaultdict(list)
     for item in decisions:
         year = item.date[:4] if item.date else "unknown"
@@ -1943,6 +2058,8 @@ def write_yearly_dashboards(out_prefix: Path, decisions: list[Decision], args: a
 
 
 def parse_args() -> argparse.Namespace:
+    """Define the command-line contract for scan, report, and apply workflows."""
+
     parser = argparse.ArgumentParser(description="Categorize Gmail messages before December 30, 2025 with dashboard-centered review.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION} ({VERSION_CODE})")
     parser.add_argument("--credentials", default=str(PROJECT_DIR / "secrets" / "credentials.json"))

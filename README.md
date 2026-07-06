@@ -10,7 +10,9 @@
 
 Dashboard-centered Gmail cleanup tool for older mail. It scans messages before December 30, 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
 
-Current version: `0.3.2` (`20260705`).
+Current version: `0.3.3` (`20260705`).
+
+Companion AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack). This repo is the mailbox cleanup tool; the local AI stack repo documents the Qwen3.6, DeepSeek 32B, and Gemma planner setup used around it.
 
 ## ✨ What It Does
 
@@ -28,12 +30,14 @@ Current version: `0.3.2` (`20260705`).
 sorter/
   src/                 Python source
   config/              allowlist and blocklist
-  secrets/             Gmail OAuth credentials and tokens, ignored by Git
-  reports/             generated dashboard and CSV/JSON reports, ignored by Git
-  manifests/           reviewed action manifests, ignored by Git
-  data/                resumable progress cache, ignored by Git
+  secrets/             Gmail OAuth credentials and tokens; never committed
+  reports/             generated dashboards and CSV/JSON reports; local only
+  manifests/           reviewed action manifests; local only
+  data/                resumable progress cache and SQLite state; local only
   docs/                notes and future documentation
 ```
+
+Those local-only folders are ignored because they can contain message IDs, sender domains, snippets, OAuth tokens, mailbox state, and run-specific decisions. GitHub should explain how the sorter works, not publish a private mailbox snapshot.
 
 ## ⚙️ Setup
 
@@ -285,6 +289,8 @@ This uses `llm-switch qwen36` to start the `local-llm` systemd service and calls
 
 To review every audited Trash row with the local model instead of only the script's borderline subset, add `--local-llm-all`. Progress output includes local generation speed, prompt speed, and draft-token acceptance when llama.cpp returns those timings.
 
+The sustained Qwen3.6 run from this workflow is recorded in the AI stack repo as a real workload benchmark: 6,531 bounded review rows, 10,309,912 prompt tokens, 846,873 generated tokens, 549.96 average prompt tok/sec, 90.92 average generation tok/sec, and 85.03% weighted draft-token acceptance.
+
 For user-approved obvious-trash domains, generate a permanent-delete manifest and a smaller Qwen review file for the remaining messages:
 
 ```bash
@@ -344,6 +350,8 @@ Old progress files may contain message IDs that Gmail no longer has. The audit s
 
 - [Project decision log](docs/DECISION-LOG.md)
 - [Cleanup log for 2026-07-05](docs/CLEANUP-LOG-2026-07-05.md)
+- [Local AI stack integration](docs/LOCAL-AI-STACK-INTEGRATION.md)
+- [Continuation handoff](docs/NEXT-RUN-HANDOFF.md)
 - [Overnight local Qwen3.6 runbook](docs/OVERNIGHT-LOCAL-QWEN-RUNBOOK.md)
 - [Workspace notes](docs/CODEBASE-WORKSPACE.md)
 

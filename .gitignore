@@ -3,11 +3,14 @@ __pycache__/
 .venv/
 venv/
 
-# Gmail OAuth secrets and generated tokens.
+# Gmail OAuth secrets and generated tokens. These can unlock the mailbox, so
+# only the placeholder file belongs in Git.
 secrets/*.json
 !secrets/.gitkeep
 
-# Generated mailbox data. These can contain private email metadata.
+# Generated mailbox data. Reports/manifests/data can include message IDs,
+# sender domains, snippets, local decisions, and run-specific state. Keep the
+# folders for structure, but keep their contents on the local machine.
 reports/*
 manifests/*
 data/*

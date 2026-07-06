@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.3 - 2026-07-05
+
+### 📊 Benchmarks And Project Linkage
+
+- Cross-linked Gmail Sorter with `Rad-ops/local-ai-coding-stack` so the mailbox workflow and local model stack are documented together.
+- Added the live Qwen3.6 Trash rescue workload numbers to the README and integration notes: 6,531 reviewed rows, 10,309,912 prompt tokens, 846,873 generated tokens, 549.96 average prompt tok/sec, 90.92 average generation tok/sec, and 85.03% weighted draft-token acceptance.
+- Pointed the full benchmark record to the AI stack repo, where benchmark CSVs belong.
+
+### 🧑‍🔧 Human Documentation Pass
+
+- Reworded generated-folder and ignore guidance so it explains why private mailbox artifacts stay local instead of simply listing excluded paths.
+- Added `docs/LOCAL-AI-STACK-INTEGRATION.md` to describe how this repo uses the Qwen3.6 local review path without giving Gmail credentials to the model.
+- Added `docs/NEXT-RUN-HANDOFF.md` so the next cleanup/commenting pass can continue without rediscovering the project state.
+
+### 💬 Code Readability
+
+- Added comments and docstrings around the main source files so a new developer can follow the policy pipeline, Gmail API boundaries, local-model review path, and permanent-delete gates without reading every branch from scratch.
+
 ## 0.3.2 - 2026-07-05
 
 ### ✨ GitHub Makeover
@@ -75,4 +93,8 @@
 
 ## 0.1.0 - 2026-07-04
 
-- Added staged Gmail classification, reporting, label/archive/trash application, resumable progress files, manifests, dashboard reporting, unsubscribe extraction, attachment review, and high-confidence promotional trash scoring.
+- Added Gmail OAuth setup, mailbox scanning, and staged decisions for label/archive/trash workflows.
+- Added the first reporting outputs: HTML dashboard, CSV/JSON decision reports, sender summaries, manifests, and resumable progress files.
+- Added allowlist/blocklist configuration so the cleanup policy could be tuned without editing Python.
+- Added unsubscribe extraction, attachment review, and high-confidence promotional trash scoring.
+- Added explicit `--apply` gating so scans were read-only unless the user asked for Gmail changes.

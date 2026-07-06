@@ -3,6 +3,11 @@
 
 Default mode is a dry-run report. Use --apply --i-understand-restore to untrash
 rescue candidates and apply review labels.
+
+Think of this script as the second opinion before emptying Trash. It re-fetches
+messages from Gmail, checks for priority/attachment/durable-record signals, and
+can ask a local model to review bounded packets before any permanent-delete
+manifest is produced.
 """
 
 from __future__ import annotations
@@ -102,6 +107,8 @@ MARKETING_TERMS = sorted(set(gmail_sorter.AD_SUBJECT_KEYWORDS + gmail_sorter.AD_
 
 @dataclass
 class RescueAudit:
+    """One re-check result for a message that the first sorter wanted trashed."""
+
     message_id: str
     thread_id: str
     date: str
@@ -135,6 +142,8 @@ class RescueAudit:
 
 
 def parse_args() -> argparse.Namespace:
+    """Define the audit workflow flags and explicit destructive-action gates."""
+
     parser = argparse.ArgumentParser(description="Deep-audit Gmail messages previously planned for Trash.")
     parser.add_argument("--credentials", default=str(PROJECT_DIR / "secrets" / "credentials.json"))
     parser.add_argument("--token-modify", default=str(PROJECT_DIR / "secrets" / "token_sorter_modify.json"))
@@ -177,6 +186,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_trash_candidates(path: Path, min_confidence: int, max_messages: int) -> list[gmail_sorter.Decision]:
+    """Load only the messages the original sorter actually planned to trash."""
+
     progress = gmail_sorter.load_progress(path)
     candidates = [
         item
@@ -190,6 +201,8 @@ def load_trash_candidates(path: Path, min_confidence: int, max_messages: int) ->
 
 
 def audit_from_dict(data: dict[str, Any]) -> RescueAudit:
+    """Load older JSON reports while ignoring fields this version no longer uses."""
+
     valid = RescueAudit.__dataclass_fields__.keys()
     return RescueAudit(**{key: data[key] for key in valid if key in data})
 
@@ -200,6 +213,8 @@ def load_existing_audit(path: Path) -> list[RescueAudit]:
 
 
 def is_missing_gmail_message_error(error: Exception) -> bool:
+    """Treat 404/stale progress as skip-worthy, not as a whole-run failure."""
+
     status = getattr(getattr(error, "resp", None), "status", None)
     if status == 404:
         return True
@@ -249,6 +264,8 @@ def label_for_confidence(confidence: int) -> str:
 
 
 def compute_script_delete_confidence(decision: gmail_sorter.Decision, score: int, rescue_reasons: list[str], keep_trash_reasons: list[str], real_attachment_count: int) -> int:
+    """Return 100 only when the script has every required safe-trash signal."""
+
     if score > 0 or rescue_reasons or real_attachment_count:
         return 0
     if decision.ad_confidence < 100:
@@ -269,6 +286,8 @@ def compute_script_delete_confidence(decision: gmail_sorter.Decision, score: int
 
 
 def audit_message(decision: gmail_sorter.Decision, message: dict[str, Any], body_chars: int = 1200) -> RescueAudit:
+    """Re-score one Trash message using deeper rescue-focused evidence."""
+
     payload = message.get("payload", {})
     headers = gmail_sorter.header_map(payload)
     sender = headers.get("from", decision.sender)
@@ -303,6 +322,8 @@ def audit_message(decision: gmail_sorter.Decision, message: dict[str, Any], body
     keep_trash_reasons = []
     score = 0
 
+    # Rescue evidence adds risk. These are the things we would regret deleting:
+    # immigration, school, legal, account, finance, and human conversation.
     if priority_hits:
         score += min(60, 18 * len(priority_hits))
         rescue_reasons.append("priority_terms:" + ", ".join(priority_hits[:8]))
@@ -324,6 +345,8 @@ def audit_message(decision: gmail_sorter.Decision, message: dict[str, Any], body
         score += 15
         rescue_reasons.append("original_protection_or_negative_reason")
 
+    # Marketing evidence subtracts risk, but it cannot erase attachments or
+    # priority terms by itself.
     if marketing_hits:
         score -= min(45, 8 * len(marketing_hits))
         keep_trash_reasons.append("marketing_terms:" + ", ".join(marketing_hits[:8]))
@@ -378,6 +401,8 @@ def audit_message(decision: gmail_sorter.Decision, message: dict[str, Any], body
 
 
 def model_should_review(item: RescueAudit) -> bool:
+    """Pick the rows worth spending model time on in the default mode."""
+
     if item.recommended_action == "rescue_review":
         return True
     if item.deep_risk_score >= 30 and item.original_confidence < 100:
@@ -388,6 +413,8 @@ def model_should_review(item: RescueAudit) -> bool:
 
 
 def call_openai_reasoner(item: RescueAudit, model: str, web_search: bool) -> tuple[str, str, str]:
+    """Optional hosted-model review for borderline rows."""
+
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return "", "", "OPENAI_API_KEY is not set"
@@ -476,6 +503,8 @@ def extract_response_text(data: dict[str, Any]) -> str:
 
 
 def write_reports(out_prefix: Path, audits: list[RescueAudit]) -> None:
+    """Write JSON/CSV/HTML reports plus a small summary file."""
+
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     rows = [asdict(item) for item in audits]
     (out_prefix.with_suffix(".json")).write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -507,6 +536,12 @@ def write_reports(out_prefix: Path, audits: list[RescueAudit]) -> None:
 
 
 def llm_packet(item: RescueAudit) -> dict[str, Any]:
+    """Build the bounded packet a local model can review safely.
+
+    The packet has no Gmail credentials and no direct mailbox access. It carries
+    just enough context for a second opinion.
+    """
+
     return {
         "message_id": item.message_id,
         "task": "Decide if this Gmail Trash message should be restored for human review before permanent deletion.",
@@ -550,6 +585,8 @@ def llm_packet(item: RescueAudit) -> dict[str, Any]:
 
 
 def write_llm_export(out_prefix: Path, audits: list[RescueAudit]) -> None:
+    """Export JSONL and instructions for an offline local-model review."""
+
     review_items = sorted(
         audits,
         key=lambda item: (item.recommended_action == "rescue_review", item.deep_risk_score, item.original_confidence),
@@ -588,6 +625,8 @@ Keep the reason short and concrete. Do not output prose outside JSONL.
 
 
 def local_llm_prompt(packet: dict[str, Any]) -> str:
+    """Wrap one packet in strict JSON-output instructions for llama.cpp."""
+
     return (
         "You are double-checking Gmail Trash before permanent deletion. "
         "Return exactly one JSON object and no prose. "
@@ -605,6 +644,8 @@ def local_llm_prompt(packet: dict[str, Any]) -> str:
 
 
 def ensure_local_llm(args: argparse.Namespace) -> None:
+    """Start or verify the local llama.cpp server before sending packets."""
+
     if args.start_local_llm:
         subprocess.run(["llm-switch", args.local_llm_profile], check=True)
         return
@@ -621,6 +662,8 @@ def ensure_local_llm(args: argparse.Namespace) -> None:
 
 
 def call_local_llm(packet: dict[str, Any], args: argparse.Namespace) -> tuple[dict[str, Any] | None, str]:
+    """Call the local OpenAI-compatible endpoint and normalize its JSON result."""
+
     body = {
         "model": args.local_llm_model,
         "messages": [
@@ -666,10 +709,14 @@ def call_local_llm(packet: dict[str, Any], args: argparse.Namespace) -> tuple[di
 
 
 def run_local_llm_review(audits: list[RescueAudit], out_prefix: Path, args: argparse.Namespace) -> Path:
+    """Review selected audit rows locally and append resumable JSONL results."""
+
     ensure_local_llm(args)
     results_path = Path(args.local_llm_results) if args.local_llm_results else out_prefix.with_name(out_prefix.name + "_local_llm_results.jsonl")
     completed_ids = set()
     if results_path.exists():
+        # The local review can run for hours. Reusing completed IDs makes an
+        # interrupted overnight job cheap to resume.
         for raw_line in results_path.read_text(encoding="utf-8").splitlines():
             try:
                 row = json.loads(raw_line)
@@ -731,6 +778,8 @@ def run_local_llm_review(audits: list[RescueAudit], out_prefix: Path, args: argp
 
 
 def import_model_results(path: Path, audits: list[RescueAudit]) -> int:
+    """Merge local/hosted model JSONL decisions back into audit rows."""
+
     by_id = {item.message_id: item for item in audits}
     imported = 0
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -756,6 +805,8 @@ def import_model_results(path: Path, audits: list[RescueAudit]) -> int:
         item.model_decision = decision
         item.model_confidence = model_confidence
         item.model_reason = f"{reason} (model confidence={confidence})" if confidence != "" else reason
+        # A model can promote a row into rescue review, but it only demotes back
+        # to keep_trash when the script risk score is still comfortably low.
         if decision == "rescue_review":
             item.recommended_action = "rescue_review"
             if "local_model_rescue_review" not in item.rescue_reasons:
@@ -776,6 +827,8 @@ def render_list(values: list[str]) -> str:
 
 
 def write_html_report(path: Path, audits: list[RescueAudit], summary: dict[str, Any]) -> None:
+    """Render the compact rescue-review dashboard."""
+
     rescue = [item for item in audits if item.recommended_action == "rescue_review"]
     top_domains = summary.get("top_rescue_domains", [])
     domain_rows = "".join(
@@ -842,6 +895,8 @@ def get_or_create_labels(service: Any, names: list[str], retries: int, retry_sle
 
 
 def build_gmail_modify_service(args: argparse.Namespace) -> Any:
+    """Build the modify-scope Gmail service used for untrash/label actions."""
+
     google_libs = gmail_sorter.load_google_libraries()
     _, _, _, build, _ = google_libs
     creds = gmail_sorter.get_credentials(
@@ -855,6 +910,12 @@ def build_gmail_modify_service(args: argparse.Namespace) -> Any:
 
 
 def permanent_delete_candidates(audits: list[RescueAudit]) -> list[RescueAudit]:
+    """Final permanent-delete gate.
+
+    A row must pass both script and model checks at maximum confidence and must
+    have no rescue evidence. Anything less stays reviewable.
+    """
+
     return [
         item
         for item in audits
@@ -871,6 +932,8 @@ def permanent_delete_candidates(audits: list[RescueAudit]) -> list[RescueAudit]:
 
 
 def write_delete_manifest(out_prefix: Path, candidates: list[RescueAudit]) -> None:
+    """Write the permanent-delete manifest before any delete calls are made."""
+
     json_path = out_prefix.with_name(out_prefix.name + "_permanent_delete_manifest.json")
     csv_path = out_prefix.with_name(out_prefix.name + "_permanent_delete_manifest.csv")
     payload = {
@@ -907,6 +970,8 @@ def write_delete_manifest(out_prefix: Path, candidates: list[RescueAudit]) -> No
 
 
 def apply_permanent_deletes(service: Any, audits: list[RescueAudit], args: argparse.Namespace, out_prefix: Path) -> None:
+    """Permanently delete only the rows that passed every manifest requirement."""
+
     candidates = permanent_delete_candidates(audits)
     write_delete_manifest(out_prefix, candidates)
     if not candidates:
@@ -923,6 +988,8 @@ def apply_permanent_deletes(service: Any, audits: list[RescueAudit], args: argpa
 
 
 def apply_rescue_actions(service: Any, audits: list[RescueAudit], args: argparse.Namespace) -> None:
+    """Untrash and label rescue-review rows after explicit user confirmation."""
+
     rescue = [item for item in audits if item.recommended_action == "rescue_review" and item.still_in_trash]
     if not rescue:
         print("No rescue candidates to apply.")
@@ -950,6 +1017,8 @@ def apply_rescue_actions(service: Any, audits: list[RescueAudit], args: argparse
 
 
 def main() -> int:
+    """Run the audit, optional model review, reports, and explicit apply paths."""
+
     args = parse_args()
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)

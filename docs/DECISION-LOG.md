@@ -29,6 +29,15 @@ flowchart LR
 
 The sorter uses Qwen3.6 for local mailbox review because this is an implementation/review task with bounded inputs. The broader local AI stack keeps Gemma 4 as a planner/architect model and DeepSeek 32B as a reasoning fallback.
 
+The companion AI stack repo is `https://github.com/Rad-ops/local-ai-coding-stack`. It keeps the model profiles, install notes, and benchmark CSVs. This repo keeps the Gmail policy and workflow code.
+
+Live Gmail Sorter workload recorded there:
+
+- Qwen3.6 reviewed 6,531 bounded Trash rescue rows.
+- The run processed 10,309,912 prompt tokens and 846,873 generated tokens.
+- The averaged llama.cpp timing was 549.96 prompt tok/sec and 90.92 generation tok/sec.
+- Weighted draft-token acceptance was 85.03%.
+
 ## Local Cleanup Decisions
 
 Generated local folders were cleaned after the mail cleanup finished:
