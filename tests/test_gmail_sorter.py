@@ -751,8 +751,9 @@ class AIReviewPacketTests(unittest.TestCase):
                 "ai_reviewed": True,
             }
             path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
-            agreed, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            agreed, overridden, removed = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
             self.assertEqual(overridden, 1)
+            self.assertEqual(removed, 0)
             self.assertIn("Finance", decisions[0].categories)
             self.assertTrue(any(r.startswith("ai_override:Finance") for r in decisions[0].reasons))
 
@@ -769,8 +770,9 @@ class AIReviewPacketTests(unittest.TestCase):
                 "ai_reviewed": True,
             }
             path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
-            agreed, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            agreed, overridden, removed = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
             self.assertEqual(overridden, 0)
+            self.assertEqual(removed, 0)
             self.assertNotIn("Finance", decisions[0].categories)
 
     def test_merge_never_removes_protected_category(self):
@@ -786,7 +788,7 @@ class AIReviewPacketTests(unittest.TestCase):
                 "ai_reviewed": True,
             }
             path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
-            _, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            _, overridden, _ = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
             # AI can add Shopping but Priority Immigration must stay.
             self.assertIn("Priority Immigration", decisions[0].categories)
             self.assertTrue(decisions[0].protected)

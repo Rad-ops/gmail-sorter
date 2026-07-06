@@ -2507,17 +2507,35 @@ def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: i
     return len(packets)
 
 
-def merge_ai_labels(decisions: list[Decision], path: Path, min_ai_confidence: float = 0.7) -> tuple[int, int]:
+def merge_ai_labels(
+    decisions: list[Decision],
+    path: Path,
+    min_ai_confidence: float = 0.7,
+    min_ai_removal_confidence: float = 0.85,
+) -> tuple[int, int, int]:
     """Merge AI-reviewed labels back into decisions.
 
-    Reads the reviewed JSONL and adjusts a decision when the AI suggests a
-    different label with confidence >= min_ai_confidence (0-1). Protected
-    status is never removed — the AI can add a protected category but cannot
-    take one away. Returns (agreed, overridden) counts.
+    v0.6 semantics (preserved):
+      * Additive override: the AI's label is added to ``item.categories`` if
+        it is not already there, the per-category confidence is set, and a
+        reason ``ai_override:<label>:<conf>`` is appended.
+      * Protected status is never removed — the AI can add a protected
+        category but cannot take one away.
+
+    v0.7 addition — removal pass:
+      * When ``ai_label in item.categories`` and the AI's confidence is
+        ``>= min_ai_removal_confidence`` (default 0.85, stricter than
+        ``min_ai_confidence``), the AI can drop a *non-protected* category
+        from the message. The drop is recorded as ``ai_remove:<old>:<conf>``
+        in ``reasons``. Removing a protected category is rejected even at
+        very high confidence: protection is the safety floor.
+
+    Returns ``(agreed, overridden, removed)`` where ``removed`` is the count
+    of messages the AI actively corrected by removing a wrong label.
     """
 
     if not path.exists():
-        return 0, 0
+        return 0, 0, 0
     ai_map: dict[str, dict[str, Any]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -2531,12 +2549,35 @@ def merge_ai_labels(decisions: list[Decision], path: Path, min_ai_confidence: fl
             ai_map[packet["message_id"]] = packet
     agreed = 0
     overridden = 0
+    removed = 0
     for item in decisions:
         packet = ai_map.get(item.message_id)
         if not packet:
             continue
         ai_label = packet["ai_label"]
         ai_conf = float(packet.get("ai_confidence", 0))
+        # Removal pass: AI says this label is wrong, and confidence is high.
+        if ai_label in item.categories and ai_conf >= min_ai_removal_confidence:
+            # The AI is voting against ai_label. If ai_label is protected, do
+            # not remove; protection is the safety floor.
+            if ai_label in PROTECTED_CATEGORIES:
+                agreed += 1
+                continue
+            # The AI is confirming a label the code already assigned; that
+            # is the "agreed" case, not the removal case.
+            if ai_label == item.primary_category:
+                agreed += 1
+                continue
+            # Remove the wrong label and refresh the primary if needed.
+            item.categories = [c for c in item.categories if c != ai_label]
+            item.category_confidence.pop(ai_label, None)
+            item.reasons.append(f"ai_remove:{ai_label}:{ai_conf:.2f}")
+            new_primary = pick_primary_category(item.categories) if item.categories else "Review"
+            if new_primary != item.primary_category:
+                item.primary_category = new_primary
+            item.planned_actions = [f"label:{c}" for c in labelable_categories(item.categories)]
+            removed += 1
+            continue
         if ai_label in item.categories:
             agreed += 1
             continue
@@ -2555,7 +2596,7 @@ def merge_ai_labels(decisions: list[Decision], path: Path, min_ai_confidence: fl
                 item.primary_category = new_primary
             item.planned_actions = [f"label:{c}" for c in labelable_categories(item.categories)]
             overridden += 1
-    return agreed, overridden
+    return agreed, overridden, removed
 
 
 def esc(value: Any) -> str:
@@ -3080,6 +3121,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ai-review-file", default=str(PROJECT_DIR / "data" / "label_review_packets.jsonl"), help="Path to the AI review JSONL file (export and merge both use this path).")
     parser.add_argument("--merge-ai-labels", action="store_true", help="Before apply, merge AI-reviewed labels from the review file back into decisions. The AI can add a label the code missed; protected status is never removed.")
     parser.add_argument("--ai-merge-min-confidence", type=float, default=0.7, help="Minimum AI confidence (0-1) required to override the code's label with the AI's suggestion.")
+    parser.add_argument("--ai-merge-min-removal-confidence", type=float, default=0.85, help="v0.7: minimum AI confidence (0-1) required to REMOVE a non-protected category the code already assigned. Stricter than the addition threshold because removal is harder to undo.")
+    parser.add_argument("--no-ai-learning", action="store_true", help="v0.7: disable the active-learning pass that pushes AI-verified decisions into sender_profile and category centroids.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
     parser.add_argument("--scan", choices=["metadata", "full"], default="metadata", help="metadata = headers+snippet (fast); full = also read decoded body text for body-aware categorization. full costs more Gmail quota and is meant for a relabel/re-scan pass.")
     parser.add_argument("--use-sender-profiles", dest="use_sender_profiles", action="store_true", default=True, help="Use learned sender/domain category history to fix keyword misses (default on).")
@@ -3256,9 +3299,40 @@ def main() -> int:
     # between the export step and this run; see HANDOVER.md for the workflow.
     if getattr(args, "merge_ai_labels", False):
         ai_path = Path(getattr(args, "ai_review_file", ""))
-        agreed, overridden = merge_ai_labels(decisions, ai_path, min_ai_confidence=args.ai_merge_min_confidence)
-        print(f"AI label merge: {agreed} agreed, {overridden} overridden by AI suggestions.", flush=True)
+        min_removal = getattr(args, "ai_merge_min_removal_confidence", 0.85)
+        agreed, overridden, removed = merge_ai_labels(
+            decisions,
+            ai_path,
+            min_ai_confidence=args.ai_merge_min_confidence,
+            min_ai_removal_confidence=min_removal,
+        )
+        print(
+            f"AI label merge: {agreed} agreed, {overridden} added, {removed} removed.",
+            flush=True,
+        )
         upsert_state_decisions(state_conn, decisions)
+        # v0.7: active learning. Push the AI's verified decisions back into
+        # the sender profile and (when an embedding backend is on) the
+        # category centroids so the next scan benefits immediately.
+        if not getattr(args, "no_ai_learning", False):
+            from sorter.ai_learning import apply_ai_learning
+            try:
+                with ai_path.open("r", encoding="utf-8") as f:
+                    ai_packets = [json.loads(line) for line in f if line.strip()]
+            except (FileNotFoundError, json.JSONDecodeError):
+                ai_packets = []
+            report = apply_ai_learning(
+                state_conn,
+                decisions,
+                ai_packets,
+                embedding_backend=getattr(args, "_embedding_backend", None),
+            )
+            print(
+                f"AI active learning: considered {report['considered']} packets, "
+                f"{report['profile_bumps']} sender-profile bumps, "
+                f"{report['centroid_contributions']} centroid contributions.",
+                flush=True,
+            )
 
     if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
         action_count = sum(
