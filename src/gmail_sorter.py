@@ -749,7 +749,7 @@ def is_perfect_ad_match(
     )
 
 
-def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence: int, sender_profile_cats: dict[str, int] | None = None, subject: str = "", body_text: str = "") -> dict[str, int]:
+def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence: int, sender_profile_cats: dict[str, int] | None = None, subject: str = "", body_text: str = "", sender_text: str = "") -> dict[str, int]:
     """Return {category: confidence 0-100} from evidence.
 
     Confidence is the policy input that lets the relabel/label stages apply only
@@ -767,6 +767,11 @@ def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence
       - a sender-profile hit adds the learned weight (capped at 25)
       - Ads Promotions / Newsletters Bulk derive their confidence from the ad
         confidence / promotions label directly
+
+    subject, body_text, and sender_text are separate so the scorer can weight a
+    keyword hit in the subject line higher than one buried in the body. When
+    they are empty, the combined ``searchable`` string is used as a fallback so
+    older callers still work.
     """
 
     categories: dict[str, int] = {}
@@ -783,16 +788,26 @@ def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence
     }
 
     profile_cats = sender_profile_cats or {}
+    # Use the separated fields when available; fall back to the combined
+    # searchable string for older callers that don't pass them.
+    subject_field = subject if subject else searchable
+    body_field = body_text if body_text else ""
+    sender_field = sender_text if sender_text else searchable
     for name, keywords, exclusions in CATEGORY_RULES:
         if exclusions and keyword_hits(searchable, exclusions):
             continue
-        # Split scoring: subject hits are worth more than body/sender hits.
-        subject_hits = keyword_hits(subject, keywords) if subject else keyword_hits(searchable, keywords)
-        all_hits = keyword_hits(searchable, keywords)
+        # Score keyword hits by where they appear: subject > body > sender.
+        subject_hits = keyword_hits(subject_field, keywords)
+        body_hits = keyword_hits(body_field, keywords) if body_field else []
+        sender_hits = keyword_hits(sender_field, keywords) if sender_field else []
+        # A keyword that appears in both subject and body counts once, at the
+        # higher (subject) weight.
+        all_hits = list(dict.fromkeys(subject_hits + body_hits + sender_hits))
         if not all_hits:
             continue
-        body_only_hits = [h for h in all_hits if h not in subject_hits]
-        keyword_score = min(75, 30 * len(subject_hits) + 20 * len(body_only_hits) + 15 * max(0, len(all_hits) - len(subject_hits) - len(body_only_hits)))
+        body_only = [h for h in body_hits if h not in subject_hits]
+        sender_only = [h for h in sender_hits if h not in subject_hits and h not in body_hits]
+        keyword_score = min(75, 30 * len(subject_hits) + 20 * len(body_only) + 15 * len(sender_only))
         category_label_score = 0
         for gmail_label, buckets in gmail_category_boost.items():
             if gmail_label in labels and name in buckets:
@@ -898,7 +913,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     if getattr(args, "use_sender_profiles", True):
         profile_index = getattr(args, "sender_profiles", {}) or {}
         profile_cats = sender_profile_categories_from_index(profile_index, sender_email, registered_domain)
-    category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats, subject=subject, body_text=body_text)
+    category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats, subject=subject, body_text=clean_body_text(body_text) if body_included else "", sender_text=f"{sender} {sender_domain}")
     # Merge body-derived category hits from a previous full scan when this run
     # used the cache (metadata-only fetch). Cached hits let categorization stay
     # body-aware without re-fetching the body.
