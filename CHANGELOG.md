@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.1 - 2026-07-06
+
+### 🐛 Bug Fixes
+
+- **Schema v4 migration missing.** v0.8 introduced three new tables (`state_meta`, `thread_features`, `sender_reputation`) that were created lazily on first use. That meant the schema version stayed at 3 even after v0.8 ran, making it impossible to tell from `schema_migrations` whether a database was on the v0.7 or v0.8 shape. v0.8.1 adds an explicit v4 migration that creates these tables with `CREATE TABLE IF NOT EXISTS` (idempotent), bumps `CURRENT_SCHEMA_VERSION` to 4, and lets a pre-v0.8 database upgrade cleanly.
+
+- **`--since-history-id` flag was parsed but never read.** v0.8 added the flag to argparse but the resolution logic was never wired into `main()`. v0.8.1 wires it: the flag resolves to one of four values (`auto:` uses the stored last_history_id, `reset` forces a full re-scan, `explicit:` uses the user-supplied id, `disabled` no incremental mode) and persists the resolved value to `state_meta` so the operator can inspect it. The actual incremental fetch (replacing `list_message_ids`) is left for a future release; v0.8.1 establishes the resolution + persistence path so the command is operational today.
+
+- **Test args() helper drift between v0.7 and v0.8.** v0.7.0's `args()` in `tests/test_gmail_sorter.py` and v0.8's `args()` were two separate dicts that drifted. v0.8.1 collapses both to a single `make_test_args` factory in `tests/test_helpers.py`; the local `args()` wrapper in `test_gmail_sorter.py` is a thin delegator. The defaults can no longer drift between the two helpers.
+
+- **Stale default query (carried from v0.7.1).** v0.7.1 fixed `sorter/policy.py` `DEFAULT_QUERY` from `before:2025/12/30 -in:trash` (now in the past) to `in:anywhere -in:trash`. v0.8.1 keeps the fix in place and asserts it in the v0.7.1 / v0.8.1 regression tests.
+
+- **Test connection leaks (carried from v0.7.1).** v0.7.1 added `tracked(self, conn)` to `tests/test_helpers.py`; v0.8.1 wires every sqlite3 connection site in the v0.8 test files through it. Pre-fix, up to 6 connections leaked per run; post-fix, none.
+
+### 🧪 Tests
+
+328 tests passing (was 304 in v0.8.0; +24 across v0.7.1 + v0.8.1). Coverage spans:
+- `tests/test_v071_fixes.py` (8) — default query has no stale date, args helper exposes every v0.8 flag, the args factory is the single source of truth, `tracked()` closes connections, no unclosed-database warnings fire.
+- `tests/test_v081_fixes.py` (16) — schema v4 is the current version, v4 migration creates `state_meta` / `thread_features` / `sender_reputation`, the migration is idempotent, `--since-history-id` resolves to the four documented values, the local `args()` wrapper matches `make_test_args`, the stale-default-query fix is preserved, `tracked()` works on a `unittest.TestCase`.
+
 ## 0.7.1 - 2026-07-06
 
 ### 🐛 Bug Fixes

@@ -15,7 +15,7 @@ import gmail_sorter
 def args(**overrides):
     """Build a minimal argparse-like object for policy tests.
 
-    v0.7.1: the canonical defaults live in :mod:`tests.test_helpers`
+    v0.8.1: the canonical defaults live in :mod:`tests.test_helpers`
     so the same shape is shared across every test file. This thin
     wrapper is kept here for backwards compatibility with tests
     that import ``args`` from this module.

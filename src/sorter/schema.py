@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("sorter.schema")
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 # Each migration is a callable that takes a connection and applies its DDL.
 # Migrations must be idempotent (use IF NOT EXISTS) and must check the current
@@ -159,6 +159,77 @@ def _migrate_to_3(conn: sqlite3.Connection) -> None:
         """
     )
     log.info("schema v3: rewrote %d sender_profile keys for per-category uniqueness", len(rewrites))
+
+
+@_register(4)
+def _migrate_to_4(conn: sqlite3.Connection) -> None:
+    """v4: explicit v0.8 tables.
+
+    v0.8 introduced three new tables that are normally created
+    lazily on first use:
+
+    * ``state_meta`` (incremental.py) — key/value store for the
+      Gmail History API path (``last_history_id``, ``last_scan_at``,
+      ``last_full_scan_at``).
+    * ``thread_features`` (thread_features.py) — per-thread shape
+      aggregates used by the v0.8 conversation-modeling boost.
+    * ``sender_reputation`` (sender_reputation.py) — per-sender
+      lifetime aggregates used by the v0.8 reputation signal.
+
+    v0.8 created them lazily, which meant the schema version
+    stayed at 3 even after v0.8 ran. That made it impossible to
+    tell from ``schema_migrations`` whether a database was on
+    the v0.7 or v0.8 shape. v0.8.1 fixes that by giving the
+    lazy-create tables an explicit schema version. The migration
+    is idempotent (CREATE TABLE IF NOT EXISTS) so v0.8 databases
+    that already created the tables upgrade cleanly.
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS state_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    log.info("schema v4: ensured state_meta exists")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS thread_features (
+            thread_id TEXT PRIMARY KEY,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            distinct_senders INTEGER NOT NULL DEFAULT 0,
+            top_category TEXT NOT NULL DEFAULT '',
+            top_category_share REAL NOT NULL DEFAULT 0.0,
+            has_attachment_count INTEGER NOT NULL DEFAULT 0,
+            has_unsubscribe_count INTEGER NOT NULL DEFAULT 0,
+            date_span_days INTEGER NOT NULL DEFAULT 0,
+            protected_fraction REAL NOT NULL DEFAULT 0.0,
+            first_seen TEXT NOT NULL DEFAULT '',
+            last_seen TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    log.info("schema v4: ensured thread_features exists")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sender_reputation (
+            sender_key TEXT PRIMARY KEY,
+            total_messages INTEGER NOT NULL DEFAULT 0,
+            avg_ad_confidence REAL NOT NULL DEFAULT 0.0,
+            protected_fraction REAL NOT NULL DEFAULT 0.0,
+            ad_fraction REAL NOT NULL DEFAULT 0.0,
+            first_seen TEXT NOT NULL DEFAULT '',
+            last_seen TEXT NOT NULL DEFAULT '',
+            reputation_score INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    log.info("schema v4: ensured sender_reputation exists")
 
 
 def _ensure_migrations_table(conn: sqlite3.Connection) -> set[int]:

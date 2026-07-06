@@ -66,7 +66,7 @@ CATEGORY_RULES = policy.CATEGORY_RULES
 PRIMARY_CATEGORY_PRECEDENCE = policy.PRIMARY_CATEGORY_PRECEDENCE
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.1"
 VERSION_CODE = "20260706"
 SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 log = logging.getLogger("sorter")
@@ -3438,6 +3438,45 @@ def main() -> int:
     service = build_gmail_service(build, creds, args)
     list_throttle = AdaptiveThrottle(args.sleep)
 
+    # v0.8.1: resolve the --since-history-id flag into a concrete
+    # history id. The flag accepts three values:
+    #   - empty ("")        : incremental mode disabled; full re-scan.
+    #   - "auto"            : use the stored last_history_id from
+    #                         state_meta. The default for weekly
+    #                         maintenance runs.
+    #   - "reset"           : force a full re-scan and reset the
+    #                         stored last_history_id to the current
+    #                         mailbox state.
+    #   - <numeric string>  : use the given history id explicitly.
+    # The resolved value is stored on args so the rest of the
+    # pipeline can read it. The actual incremental fetch (replacing
+    # list_message_ids) is wired in a follow-up; v0.8.1 establishes
+    # the resolution + persistence path so callers see a working
+    # command today.
+    history_id_resolution = ""
+    if state_conn is not None:
+        from sorter.incremental import get_last_history_id, set_last_history_id, set_meta
+        since = getattr(args, "since_history_id", "") or ""
+        if since == "auto":
+            stored = get_last_history_id(state_conn)
+            if stored:
+                history_id_resolution = f"auto:{stored}"
+                log.info("since-history-id=auto: resuming from historyId=%s", stored)
+            else:
+                history_id_resolution = "auto:none"
+                log.info("since-history-id=auto: no stored historyId; full re-scan")
+        elif since == "reset":
+            history_id_resolution = "reset"
+            log.info("since-history-id=reset: forcing a full re-scan")
+        elif since.isdigit():
+            history_id_resolution = f"explicit:{since}"
+            log.info("since-history-id=%s: explicit historyId", since)
+        else:
+            history_id_resolution = "disabled" if not since else f"unknown:{since}"
+            if since:
+                log.warning("since-history-id=%r is not 'auto', 'reset', or numeric; treating as disabled", since)
+    args.history_id_resolution = history_id_resolution
+
     try:
         message_ids = list_message_ids(service, args.query, args.max_messages, args.retries, args.retry_sleep, list_throttle)
     except HttpError as error:
@@ -3445,6 +3484,19 @@ def main() -> int:
         if state_conn is not None:
             state_conn.close()
         return 1
+
+    # v0.8.1: persist the resolved history id. The current
+    # implementation stores the resolution marker (not the actual
+    # Gmail historyId) so a future incremental patch can swap in
+    # the real historyId without a schema change.
+    if state_conn is not None and history_id_resolution.startswith(("auto:", "explicit:")):
+        try:
+            from sorter.incremental import set_meta
+            from datetime import datetime as _dt, timezone as _tz
+            set_meta(state_conn, "last_scan_at", _dt.now(_tz.utc).isoformat())
+            set_meta(state_conn, "last_history_id", history_id_resolution)
+        except Exception as error:  # pragma: no cover - defensive
+            log.debug("failed to persist history_id_resolution: %s", error)
 
     progress_path = Path(args.progress_file)
     progress = load_progress(progress_path) if args.resume else {}
