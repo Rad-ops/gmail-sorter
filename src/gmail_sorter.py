@@ -119,6 +119,7 @@ class Decision:
     message_size_estimate: int = 0
     body_len: int = 0
     body_category_hits: list[str] = field(default_factory=list)
+    body_text_excerpt: str = ""
     list_unsubscribe: str = ""
     body_unsubscribe_links: list[str] = field(default_factory=list)
     attachment_names: list[str] = field(default_factory=list)
@@ -892,6 +893,15 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         if cached_body:
             body_len = cached_body.get("body_len", 0)
             body_included = True
+    # Compute the cleaned body excerpt once and reuse it. The excerpt is what
+    # v0.7 stores in message_features.body_text_excerpt so the next scan can
+    # embed the real body text without re-fetching from Gmail. The excerpt is
+    # bounded to BODY_EXCERPT_FOR_FEATURES (4000 chars) and uses the same
+    # quote/footer stripping as categorization, so replies quoting a promo
+    # email do not leak the promo's body into the cached excerpt.
+    body_excerpt_for_features = ""
+    if body_included and body_text:
+        body_excerpt_for_features = clean_body_text(body_text, keep_chars=BODY_EXCERPT_FOR_FEATURES)
     ad_confidence, reasons, negative_reasons = score_ad(headers, labels, sender, sender_domain, subject, snippet, config)
     if body_included:
         # Use the cleaned body (quotes/footers stripped) for categorization so a
@@ -1128,6 +1138,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         message_size_estimate=int(message.get("sizeEstimate") or 0),
         body_len=body_len,
         body_category_hits=body_hit_categories,
+        body_text_excerpt=body_excerpt_for_features,
         list_unsubscribe=headers.get("list-unsubscribe", ""),
         body_unsubscribe_links=body_unsubscribe_links,
         attachment_names=attachment_names,
@@ -1303,10 +1314,15 @@ def body_category_hits(body_text: str) -> dict[str, list[str]]:
 
 
 def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Decision], scan_mode: str) -> None:
-    """Cache compact, privacy-light body features per message.
+    """Cache compact body features per message.
 
-    Only the body length, the category keyword names that hit in the body, and
-    the unsubscribe count are stored. Raw body text is never persisted.
+    Persists the body length, the category keyword names that hit in the body,
+    the unsubscribe count, and a privacy-bounded cleaned body excerpt. The
+    excerpt is what the embedding centroid learner reads on the next scan so it
+    can learn from real message semantics instead of the category-hit names
+    alone. Raw body text is never persisted: the excerpt is bounded to
+    :data:`BODY_EXCERPT_FOR_FEATURES` and stripped of quoted reply chains and
+    footer markers.
     """
 
     if conn is None or not decisions:
@@ -1323,6 +1339,7 @@ def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Dec
                 json.dumps(item.body_category_hits, ensure_ascii=False),
                 len(item.body_unsubscribe_links),
                 scan_mode,
+                item.body_text_excerpt or "",
                 now,
             )
         )
@@ -1330,13 +1347,17 @@ def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Dec
         return
     conn.executemany(
         """
-        INSERT INTO message_features (message_id, body_len, body_category_hits_json, body_unsubscribe_count, scan_mode, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO message_features (
+            message_id, body_len, body_category_hits_json, body_unsubscribe_count,
+            scan_mode, body_text_excerpt, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(message_id) DO UPDATE SET
             body_len=excluded.body_len,
             body_category_hits_json=excluded.body_category_hits_json,
             body_unsubscribe_count=excluded.body_unsubscribe_count,
             scan_mode=excluded.scan_mode,
+            body_text_excerpt=excluded.body_text_excerpt,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -1357,9 +1378,9 @@ def load_body_features_index(conn: sqlite3.Connection | None) -> dict[str, dict[
     if conn is None:
         return index
     cur = conn.execute(
-        "SELECT message_id, body_len, body_category_hits_json, body_unsubscribe_count FROM message_features WHERE scan_mode='full'"
+        "SELECT message_id, body_len, body_category_hits_json, body_unsubscribe_count, body_text_excerpt FROM message_features WHERE scan_mode='full'"
     )
-    for message_id, body_len, hits_json, unsub_count in cur.fetchall():
+    for message_id, body_len, hits_json, unsub_count, body_excerpt in cur.fetchall():
         try:
             hits = json.loads(hits_json or "[]")
         except json.JSONDecodeError:
@@ -1368,6 +1389,7 @@ def load_body_features_index(conn: sqlite3.Connection | None) -> dict[str, dict[
             "body_len": int(body_len or 0),
             "body_category_hits": list(hits),
             "body_unsubscribe_count": int(unsub_count or 0),
+            "body_text_excerpt": body_excerpt or "",
         }
     return index
 
@@ -2336,6 +2358,15 @@ def load_manifest_ids(path: Path) -> set[str]:
 # Packets are written to data/ which is gitignored.
 
 AI_REVIEW_BODY_EXCERPT_CHARS = 1200
+# Cleaned-body excerpt persisted to message_features.body_text_excerpt. The
+# centroid learner in update_category_centroids embeds this text (plus
+# subject+snippet) instead of just the body_category_hits names, so the
+# embeddings learn from real message semantics. The excerpt goes through the
+# same quote/footer stripping that categorization uses, so a reply quoting a
+# promo email does not leak the promo body into the cached text. The bound
+# keeps the local SQLite cache from growing unboundedly on a multi-year
+# mailbox.
+BODY_EXCERPT_FOR_FEATURES = 4000
 
 
 def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: int, body_excerpt_chars: int = AI_REVIEW_BODY_EXCERPT_CHARS, sender_profiles: dict[str, dict[str, int]] | None = None, thread_dominant: dict[str, str] | None = None) -> int:
