@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0 - 2026-07-06
+
+### 📦 Safer Archive Stage
+
+- Archive now requires an independent bulk-mail signal (List-Unsubscribe, List-Id, one-click unsubscribe, bulk/list precedence, campaign header, Gmail Promotions, or a body unsubscribe link) in addition to meeting `--archive-threshold`. A one-off message that only scored high on subject/snippet keywords is no longer pulled out of the inbox.
+- Added `--archive-threshold` (default 65) so the archive confidence gate is tunable independently of the ad classification threshold.
+- Added a recency guard `--archive-min-age-days` and `--archive-skip-unread` so recent or unread mail can be kept in the inbox during archive runs.
+- Recorded a per-message `archive_reason` describing the evidence used, surfaced in a new dashboard "Archive Review" table.
+- Added archive apply caps mirroring the trash controls: `--max-archive-total`, `--max-archive-per-domain`, and `--archive-canary-limit`.
+
+### 🏷️ Cleaner Labeling
+
+- Catch-all `Review` and `Updates` buckets are still shown on the dashboard but are no longer applied as `Sorter/Review` / `Sorter/Updates` Gmail labels, so generic mail stops getting tagged across the whole mailbox.
+- Added a single `primary_category` per message (chosen by a protected/priority-first precedence) for cleaner filing and reporting, surfaced in the dashboard recent-sample table.
+
+### 🧪 Tests
+
+- Added regression tests for bulk-signal-gated archive, the unread archive guard, catch-all label skipping, primary-category precedence, and archive caps.
+
 ## 0.3.3 - 2026-07-05
 
 ### 📊 Benchmarks And Project Linkage

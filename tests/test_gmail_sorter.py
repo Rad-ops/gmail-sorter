@@ -14,6 +14,9 @@ def args(**overrides):
 
     defaults = {
         "ad_threshold": 65,
+        "archive_threshold": 65,
+        "archive_min_age_days": 0,
+        "archive_skip_unread": False,
         "trash_threshold": 90,
         "pre_2020_trash_threshold": 75,
         "stage": "classify",
@@ -124,6 +127,107 @@ class GmailSorterPolicyTests(unittest.TestCase):
         self.assertIn("Priority Attachments", real_item.categories)
         self.assertFalse(inline_item.has_real_attachment)
         self.assertTrue(inline_item.has_attachment)
+
+
+class ArchiveAndLabelPolicyTests(unittest.TestCase):
+    """Regression tests for the improved archive/labeling policy."""
+
+    def _promo(self, extra_headers=None, snippet="Huge sale 50% off, shop now", subject="Flash sale 50% off ends tonight"):
+        headers = {
+            "From": "Deals <deals@promo.shopmail.co>",
+            "Subject": subject,
+            "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+        }
+        headers.update(extra_headers or {})
+        return message(payload(headers), labels=["CATEGORY_PROMOTIONS"], snippet=snippet)
+
+    def test_high_score_without_bulk_signal_is_not_archived(self):
+        # A one-off high-scoring subject with no bulk-mail headers and no Gmail
+        # promotions label must not be archived out of the inbox.
+        msg = message(
+            payload(
+                {
+                    "From": "Person <person@shopmail.co>",
+                    "Subject": "Flash sale 50% off ends tonight last chance",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="shop now new arrivals just dropped",
+        )
+        item = gmail_sorter.decide(msg, args(stage="archive"), gmail_sorter.Config())
+        self.assertGreaterEqual(item.ad_confidence, 65)
+        self.assertNotIn("archive", item.planned_actions)
+        self.assertEqual(item.archive_reason, "")
+        self.assertIn("archive_no_bulk_signal", item.negative_reasons)
+
+    def test_bulk_signal_promo_is_archived_with_reason(self):
+        msg = self._promo(extra_headers={"List-Unsubscribe": "<https://promo.shopmail.co/u>"})
+        item = gmail_sorter.decide(msg, args(stage="archive"), gmail_sorter.Config())
+        self.assertIn("archive", item.planned_actions)
+        self.assertIn("list_unsubscribe_header", item.archive_reason)
+
+    def test_archive_skips_unread_when_requested(self):
+        msg = self._promo(extra_headers={"List-Unsubscribe": "<https://promo.shopmail.co/u>"})
+        msg["labelIds"] = ["CATEGORY_PROMOTIONS", "UNREAD"]
+        item = gmail_sorter.decide(msg, args(stage="archive", archive_skip_unread=True), gmail_sorter.Config())
+        self.assertNotIn("archive", item.planned_actions)
+        self.assertIn("archive_skipped_unread", item.negative_reasons)
+
+    def test_review_catch_all_is_not_labeled(self):
+        # Generic mail that only lands in the Review bucket should not create a
+        # Sorter/Review label.
+        msg = message(
+            payload(
+                {
+                    "From": "Someone <someone@friendsmail.co>",
+                    "Subject": "hey",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="just checking in",
+        )
+        item = gmail_sorter.decide(msg, args(stage="label"), gmail_sorter.Config())
+        self.assertIn("Review", item.categories)
+        self.assertNotIn("label:Review", item.planned_actions)
+        self.assertEqual(item.planned_actions, [])
+
+    def test_primary_category_prefers_protected_bucket(self):
+        self.assertEqual(
+            gmail_sorter.pick_primary_category(["Ads Promotions", "Finance", "Shopping"]),
+            "Finance",
+        )
+        self.assertEqual(
+            gmail_sorter.pick_primary_category(["Priority Immigration", "Ads Promotions"]),
+            "Priority Immigration",
+        )
+
+    def test_archive_total_and_domain_caps(self):
+        decisions = [
+            gmail_sorter.Decision(
+                message_id=f"m{i}",
+                thread_id="t",
+                date="2024-01-01",
+                sender="Deals <deals@promo.example.com>",
+                sender_email="deals@promo.example.com",
+                sender_domain="promo.example.com",
+                registered_domain="example.com",
+                subject="Sale",
+                snippet="",
+                planned_actions=["label:Ads Promotions", "archive"],
+            )
+            for i in range(5)
+        ]
+        capped = argparse.Namespace(
+            max_archive_total=3,
+            max_archive_per_domain=0,
+            archive_canary_limit=0,
+            apply=False,
+            stage="archive",
+        )
+        gmail_sorter.apply_archive_policy_caps(decisions, capped)
+        archived = [d for d in decisions if "archive" in d.planned_actions]
+        self.assertEqual(len(archived), 3)
+        self.assertTrue(any("archive_total_cap:3" in d.negative_reasons for d in decisions))
 
 
 if __name__ == "__main__":
