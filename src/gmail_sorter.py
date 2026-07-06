@@ -40,6 +40,7 @@ from typing import Any
 from sorter import policy
 from sorter.keywords import compile_keywords, contains_any, keyword_hits, regex_hits
 from sorter.config_loader import apply_overrides, load_policy_overrides
+from sorter.embeddings import compute_embedding_scores, cosine_similarity
 
 
 # Re-export policy names for backwards compatibility.
@@ -914,6 +915,29 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         profile_index = getattr(args, "sender_profiles", {}) or {}
         profile_cats = sender_profile_categories_from_index(profile_index, sender_email, registered_domain)
     category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats, subject=subject, body_text=clean_body_text(body_text) if body_included else "", sender_text=f"{sender} {sender_domain}")
+    # Embedding-based semantic scoring (hybrid). When an embedding backend is
+    # available and centroids have been learned, compute the cosine similarity
+    # between this message's text and each category centroid. The embedding
+    # score can *boost* a category the keyword rules scored low on, but never
+    # *lowers* a keyword score — it's max(keyword, embedding). This catches
+    # semantic matches the lexical rules miss (e.g. a bank statement with no
+    # "bank" keyword still embeds close to the Finance centroid). Falls back
+    # to keyword-only when no backend is available.
+    embedding_backend = getattr(args, "_embedding_backend", None)
+    category_centroids = getattr(args, "category_centroids", {}) or {}
+    if embedding_backend and category_centroids:
+        embed_text = f"{subject} {snippet}"
+        if body_included and body_text:
+            embed_text += f" {clean_body_text(body_text)[:2000]}"
+        embed_scores = compute_embedding_scores(embed_text, category_centroids, embedding_backend)
+        for cat, sim in embed_scores.items():
+            if cat in NON_LABEL_CATEGORIES:
+                continue
+            emb_conf = int(sim * 100)
+            if emb_conf > category_confidence.get(cat, 0):
+                category_confidence[cat] = emb_conf
+                if emb_conf >= getattr(args, "label_confidence", 50):
+                    reasons.append(f"embedding_boost:{cat}:{sim:.2f}")
     # Merge body-derived category hits from a previous full scan when this run
     # used the cache (metadata-only fetch). Cached hits let categorization stay
     # body-aware without re-fetching the body.
@@ -1265,6 +1289,17 @@ def open_state_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS category_centroid (
+            category TEXT PRIMARY KEY,
+            embedding_json TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -1426,6 +1461,99 @@ def load_body_features_index(conn: sqlite3.Connection | None) -> dict[str, dict[
             "body_unsubscribe_count": int(unsub_count or 0),
         }
     return index
+
+
+def load_category_centroids(conn: sqlite3.Connection | None) -> dict[str, list[float]]:
+    """Load per-category centroid embeddings from SQLite.
+
+    Centroids are average embedding vectors learned from past high-confidence
+    decisions. Used by the embedding pre-classifier to compute semantic
+    similarity scores for each category.
+    """
+
+    centroids: dict[str, list[float]] = {}
+    if conn is None:
+        return centroids
+    try:
+        cur = conn.execute("SELECT category, embedding_json, dimension FROM category_centroid")
+        for category, emb_json, dim in cur.fetchall():
+            try:
+                vec = json.loads(emb_json or "[]")
+                if vec and len(vec) == dim:
+                    centroids[category] = [float(x) for x in vec]
+            except (json.JSONDecodeError, TypeError):
+                continue
+    except sqlite3.OperationalError:
+        pass
+    return centroids
+
+
+def update_category_centroids(
+    conn: sqlite3.Connection | None,
+    decisions: list[Decision],
+    backend: Any,
+    confidence_floor: int = 70,
+    max_messages_per_category: int = 500,
+) -> int:
+    """Recompute per-category centroid embeddings from high-confidence decisions.
+
+    For each category, collects messages with that category at confidence >=
+    floor, embeds their subject + body excerpt, averages the vectors, and stores
+    the centroid in SQLite. Returns the number of centroids updated.
+
+    Only categories with at least 3 high-confidence messages get a centroid, so
+    a new category doesn't get a noisy centroid from one message.
+    """
+
+    if conn is None or backend is None:
+        return 0
+    from sorter.embeddings import average_vectors
+
+    # Group messages by category.
+    cat_messages: dict[str, list[str]] = defaultdict(list)
+    for item in decisions:
+        for cat, conf in item.category_confidence.items():
+            if cat in NON_LABEL_CATEGORIES:
+                continue
+            if conf >= confidence_floor:
+                text = f"{item.subject} {item.snippet}"
+                if item.body_category_hits:
+                    text += f" {' '.join(item.body_category_hits)}"
+                cat_messages[cat].append(text[:2000])
+
+    now = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    for category, texts in cat_messages.items():
+        if len(texts) < 3:
+            continue
+        # Cap the number of messages embedded per category to avoid unbounded
+        # growth on very large mailboxes.
+        sample = texts[:max_messages_per_category]
+        vectors = []
+        for text in sample:
+            vec = backend.embed(text)
+            if vec:
+                vectors.append(vec)
+        if len(vectors) < 3:
+            continue
+        centroid = average_vectors(vectors)
+        if not centroid:
+            continue
+        conn.execute(
+            """
+            INSERT INTO category_centroid (category, embedding_json, dimension, message_count, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(category) DO UPDATE SET
+                embedding_json=excluded.embedding_json,
+                dimension=excluded.dimension,
+                message_count=excluded.message_count,
+                updated_at=excluded.updated_at
+            """,
+            (category, json.dumps(centroid, ensure_ascii=False), len(centroid), len(vectors), now),
+        )
+        updated += 1
+    conn.commit()
+    return updated
 
 
 def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Decision], confidence_floor: int = 65) -> None:
@@ -2957,6 +3085,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
     parser.add_argument("--sender-profile-floor", type=int, default=65, help="Only learn profiles from decisions at or above this ad confidence (protected mail always contributes).")
     parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
+    parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
+    parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
+    parser.add_argument("--embedding-model", default="local", help="Model name for the HTTP embedding endpoint.")
+    parser.add_argument("--embedding-st-model", default="", help="sentence-transformers model name (e.g. all-MiniLM-L6-v2). Used when --embedding-endpoint is empty. Requires the sentence-transformers package.")
+    parser.add_argument("--embedding-confidence-floor", type=int, default=70, help="Only learn centroids from decisions at or above this confidence.")
     parser.add_argument("--apply", action="store_true", help="Actually modify Gmail for the selected stage.")
     parser.add_argument("--trash-obvious-ads", action="store_true", help="Allow trash actions during --stage trash.")
     parser.add_argument("--i-understand-trash", action="store_true", help="Required with --apply --stage trash --trash-obvious-ads.")
@@ -3027,14 +3160,34 @@ def main() -> int:
     args.sender_profiles = load_sender_profile_index(state_conn) if getattr(args, "use_sender_profiles", True) else {}
     args.cached_body_features = load_body_features_index(state_conn) if getattr(args, "scan", "metadata") == "full" and not args.refresh_existing else {}
     args.thread_dominant_categories = load_thread_dominant_categories(state_conn) if getattr(args, "use_thread_aware", False) else {}
+    # Embedding backend and centroids: optional semantic classification layer.
+    args._embedding_backend = None
+    args.category_centroids = {}
+    if getattr(args, "use_embeddings", False):
+        from sorter.embeddings import create_embedding_backend
+        args._embedding_backend = create_embedding_backend(
+            endpoint=getattr(args, "embedding_endpoint", ""),
+            model=getattr(args, "embedding_model", "local"),
+            st_model=getattr(args, "embedding_st_model", ""),
+        )
+        if args._embedding_backend is not None:
+            args.category_centroids = load_category_centroids(state_conn)
+            if args.category_centroids:
+                log.info("embedding backend active; %d category centroids loaded", len(args.category_centroids))
+            else:
+                log.info("embedding backend active but no centroids yet; will learn after this scan")
+        else:
+            log.warning("--use-embeddings requested but no backend available; falling back to keyword-only")
     profile_count = len(args.sender_profiles)
     cache_count = len(args.cached_body_features)
     thread_count = len(args.thread_dominant_categories)
+    centroid_count = len(args.category_centroids)
     print(
         f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}"
         + (f"; sender profiles loaded={profile_count}" if profile_count else "")
         + (f"; cached body features={cache_count} (will fetch metadata-only for these)" if cache_count else "")
         + (f"; thread-aware dominant categories={thread_count}" if thread_count else "")
+        + (f"; embedding centroids={centroid_count}" if centroid_count else "")
     )
     progress = scan_messages(message_ids, progress, creds, build, args, config)
     save_progress(progress_path, progress)
@@ -3045,6 +3198,10 @@ def main() -> int:
         update_sender_profiles(state_conn, decisions, confidence_floor=args.sender_profile_floor)
     if getattr(args, "scan", "metadata") == "full":
         upsert_message_features(state_conn, decisions, scan_mode="full")
+    if getattr(args, "_embedding_backend", None) is not None:
+        updated = update_category_centroids(state_conn, decisions, args._embedding_backend, confidence_floor=args.embedding_confidence_floor)
+        if updated:
+            print(f"Updated {updated} category centroid embeddings.", flush=True)
     stale_progress_count = len(progress) - len(decisions)
     if stale_progress_count > 0:
         print(f"Ignoring {stale_progress_count} cached decisions outside the current query/report set.")

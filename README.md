@@ -5,7 +5,7 @@ long-unmanaged mailboxes. It scans, classifies, and reports before any change
 is made, then applies label, archive, trash, and relabel stages only when
 explicitly requested.
 
-**Version:** `0.5.1` · **Schema version:** 1
+**Version:** `0.6.0` · **Schema version:** 1
 
 Companion local-AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack)
 
@@ -140,6 +140,7 @@ The merge step adjusts decisions where the AI suggests a different label above `
 - **Per-category confidence.** Each category gets a 0–100 score. Subject keyword hits weight 30 each (the sender chose those words), body hits 20, sender/domain hits 15. Categories below `--label-confidence` (default 50) are dropped unless protected. `--max-labels-per-message` (default 3) caps applied labels.
 - **Sender → category profiles.** High-confidence decisions are accumulated per sender/domain in SQLite. On a re-run, a profile can surface a category the subject keywords missed — the mailbox self-improves pass over pass.
 - **Body-aware scanning.** `--scan full` feeds a bounded, cleaned slice of the decoded body (quotes and footers stripped) to the classifier. Ad confidence is still scored on headers + subject + snippet so a long promotional body does not inflate trash scores. Body features are cached in SQLite so re-runs skip the expensive fetch.
+- **Embedding pre-classifier.** `--use-embeddings` computes a dense embedding for each message and compares it to per-category centroid vectors learned from past high-confidence decisions. The final confidence is `max(keyword_score, embedding_similarity * 100)` — the keyword rules provide the explainable floor, the embedding provides the semantic ceiling. This catches semantic matches the lexical rules miss (e.g. a bank statement with no "bank" keyword). Uses the local LLM server's `/v1/embeddings` endpoint or sentence-transformers; falls back to keyword-only when unavailable.
 - **Catch-all labels.** `Review` and `Updates` appear on the dashboard but are never applied as Gmail labels.
 - **Primary category.** Each message gets one `primary_category` chosen by a protected/priority-first precedence.
 
@@ -193,6 +194,9 @@ PyYAML is optional; built-in defaults are used when the file or library is absen
 | `--max-labels-per-message 3` | Cap applied Sorter labels per message |
 | `--use-sender-profiles` / `--no-sender-profiles` | Toggle sender-profile assist |
 | `--use-thread-aware` | Propagate thread's dominant category to catch-all replies |
+| `--use-embeddings` | Enable embedding-based semantic classification (hybrid with keywords) |
+| `--embedding-endpoint URL` | OpenAI-compatible /v1/embeddings endpoint |
+| `--embedding-st-model NAME` | sentence-transformers model (offline, if installed) |
 
 ### Archive
 
@@ -265,7 +269,7 @@ Folders marked *local only* are gitignored because they can contain message IDs,
 .venv/bin/python -m unittest discover -s tests
 ```
 
-40 tests cover the classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, the relabel label diff, undo, resume, AI review export/merge, confidence/cap behavior, and body cleaning.
+51 tests cover the classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, the relabel label diff, undo, resume, AI review export/merge, confidence/cap behavior, body cleaning, thread-aware labeling, and embedding-based semantic classification.
 
 ## Documentation
 

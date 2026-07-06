@@ -36,6 +36,8 @@ def args(**overrides):
         "relabel_label": "",
         "use_thread_aware": False,
         "thread_dominant_categories": {},
+        "_embedding_backend": None,
+        "category_centroids": {},
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -890,6 +892,119 @@ class LabelingImprovementsTests(unittest.TestCase):
             self.assertIn("Finance", packet["available_categories"])
             self.assertEqual(packet["sender_past_categories"], ["Finance"])
             self.assertEqual(packet["thread_dominant_category"], "Finance")
+
+
+class EmbeddingClassifierTests(unittest.TestCase):
+    """Tests for the embedding-based semantic classifier (hybrid scoring)."""
+
+    def test_cosine_similarity_pure_python(self):
+        from sorter.embeddings import cosine_similarity
+        # Identical vectors -> 1.0
+        self.assertAlmostEqual(cosine_similarity([1, 0, 0], [1, 0, 0]), 1.0)
+        # Orthogonal vectors -> 0.0
+        self.assertAlmostEqual(cosine_similarity([1, 0], [0, 1]), 0.0)
+        # Empty/zero -> 0.0
+        self.assertEqual(cosine_similarity([], [1, 2]), 0.0)
+        self.assertEqual(cosine_similarity([0, 0], [1, 1]), 0.0)
+        # Different lengths -> 0.0
+        self.assertEqual(cosine_similarity([1, 2, 3], [1, 2]), 0.0)
+
+    def test_compute_embedding_scores_with_mock_backend(self):
+        from sorter.embeddings import compute_embedding_scores
+
+        class MockBackend:
+            def embed(self, text):
+                # Return a fixed vector so similarity is deterministic.
+                return [0.9, 0.1, 0.0]
+
+        centroids = {
+            "Finance": [0.8, 0.2, 0.0],
+            "Health": [0.0, 0.1, 0.9],
+        }
+        scores = compute_embedding_scores("some text", centroids, MockBackend())
+        self.assertIn("Finance", scores)
+        self.assertIn("Health", scores)
+        self.assertGreater(scores["Finance"], scores["Health"])
+
+    def test_compute_embedding_scores_returns_empty_when_no_backend(self):
+        from sorter.embeddings import compute_embedding_scores
+        scores = compute_embedding_scores("text", {"Finance": [1, 2]}, None)
+        self.assertEqual(scores, {})
+
+    def test_embedding_boosts_category_keyword_missed(self):
+        # A message with no finance keywords whose embedding is close to the
+        # Finance centroid should get Finance via the embedding boost.
+        class MockBackend:
+            def embed(self, text):
+                # High similarity to Finance centroid, low to Health.
+                return [0.9, 0.05, 0.05]
+
+        ns = args(label_confidence=50)
+        ns._embedding_backend = MockBackend()
+        ns.category_centroids = {
+            "Finance": [0.85, 0.1, 0.05],
+            "Health": [0.0, 0.1, 0.9],
+        }
+        msg = message(
+            payload(
+                {
+                    "From": "Updates <updates@updates.testmail.co>",
+                    "Subject": "Your monthly statement",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="please review your account balance",
+        )
+        item = gmail_sorter.decide(msg, ns, gmail_sorter.Config())
+        self.assertIn("Finance", item.categories)
+        self.assertTrue(any(r.startswith("embedding_boost:Finance") for r in item.reasons))
+
+    def test_embedding_never_lowers_keyword_score(self):
+        # When the keyword score is higher than the embedding score, the
+        # keyword score should win (max, not average).
+        class MockBackend:
+            def embed(self, text):
+                # Low similarity to Finance.
+                return [0.1, 0.1, 0.8]
+
+        ns = args(label_confidence=0)
+        ns._embedding_backend = MockBackend()
+        ns.category_centroids = {"Finance": [0.9, 0.05, 0.05]}
+        msg = message(
+            payload(
+                {
+                    "From": "Bank <statements@bank.testmail.co>",
+                    "Subject": "Your bank statement payment invoice tax",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="bank statement payment payroll invoice tax cra",
+        )
+        item = gmail_sorter.decide(msg, ns, gmail_sorter.Config())
+        # Finance should be present from keywords (not embedding).
+        self.assertIn("Finance", item.categories)
+        # The keyword score should be higher than the embedding score.
+        self.assertGreater(item.category_confidence.get("Finance", 0), 50)
+
+    def test_fallback_to_keyword_only_when_no_backend(self):
+        # When _embedding_backend is None, the sorter should work exactly as
+        # before (keyword-only scoring).
+        ns = args()
+        ns._embedding_backend = None
+        ns.category_centroids = {}
+        msg = message(
+            payload(
+                {
+                    "From": "Bank <statements@bank.testmail.co>",
+                    "Subject": "Your bank statement",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="bank statement payment",
+        )
+        item = gmail_sorter.decide(msg, ns, gmail_sorter.Config())
+        self.assertIn("Finance", item.categories)
+        self.assertFalse(any(r.startswith("embedding_boost") for r in item.reasons))
 
 
 if __name__ == "__main__":

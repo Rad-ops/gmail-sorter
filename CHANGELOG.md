@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0 - 2026-07-06
+
+### 🧠 Embedding Pre-Classifier (Hybrid Keyword + Semantic)
+
+- New `--use-embeddings` flag enables an optional semantic classification layer. Each message's subject + body excerpt is embedded into a dense vector and compared to per-category centroid vectors learned from past high-confidence decisions.
+- The final category confidence is `max(keyword_score, embedding_similarity * 100)` — the keyword rules provide the explainable floor, the embedding provides the semantic ceiling. This catches semantic matches the lexical rules miss (e.g. a bank statement with no "bank" keyword still embeds close to the Finance centroid).
+- Two backends: HTTP endpoint (local LLM server's `/v1/embeddings`) or sentence-transformers (offline). Falls back to keyword-only when neither is available.
+- Per-category centroids are stored in a new `category_centroid` SQLite table and updated after each scan from decisions at or above `--embedding-confidence-floor` (default 70). A category needs at least 3 high-confidence messages before a centroid is created.
+- All vector math is pure Python (no numpy dependency). Embeddings are not reversible — they do not contain readable email content.
+- New module: `src/sorter/embeddings.py` (embedding client, centroid management, cosine similarity).
+- New CLI flags: `--use-embeddings`, `--embedding-endpoint`, `--embedding-model`, `--embedding-st-model`, `--embedding-confidence-floor`.
+
+### 📚 Documentation
+
+- README updated with the embedding pre-classifier in the labeling model section and CLI reference.
+- HANDOVER.md Section 13 (architectural suggestions) updated: item A (embedding pre-classifier) is now marked as **implemented**.
+
+### 🧪 Tests
+
+- 51 tests passing. Added 6 embedding regression tests: cosine similarity math, embedding scores with mock backend, embedding boost on keyword miss, embedding never lowers keyword score, fallback to keyword-only, and empty-backend handling.
+
 ## 0.5.2 - 2026-07-06
 
 ### 🐛 Bug Fixes

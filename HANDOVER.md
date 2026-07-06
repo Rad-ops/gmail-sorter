@@ -531,29 +531,27 @@ keyword, but it's clearly Finance. A clinic email says "See you Tuesday at 3"
 — no "appointment" keyword, but it's clearly Health. The keyword rules miss
 these, and the sender profile + thread-aware fixes only paper over the gap.
 
-**Proposed architecture:**
-1. **Embedding-based pre-classifier.** Compute a dense embedding for each
-   message (subject + bounded body) and compare it to per-category centroid
-   embeddings derived from past high-confidence decisions. This gives a
-   semantic similarity score (0–1) per category that captures "this email
-   *means* Finance" even without the keyword "bank."
-2. **Hybrid scoring.** The final category confidence becomes:
-   `max(keyword_score, embedding_similarity * 100)` — the keyword rules
-   provide the explainable floor, the embedding provides the semantic ceiling.
-   The `reasons` list records both so the dashboard stays explainable.
-3. **Centroid learning.** After each scan, update the per-category centroid
-   from new high-confidence decisions (stored in SQLite alongside
-   `sender_profile`). The centroids improve pass over pass, like the sender
-   profiles do today.
-4. **Privacy.** Embeddings are computed locally (the local-AI stack's
-   embedding model, or a small sentence-transformer). No body text leaves the
-   machine. The centroid vectors are not reversible — they don't contain
-   readable email content.
+### A. Embedding pre-classifier (IMPLEMENTED in v0.6.0)
 
-**Why this is worth it:** The keyword rules will always have a long tail of
-misses. An embedding pre-classifier catches the semantic matches the keywords
-can't, and the AI review pipeline becomes the fallback for the few that *both*
-miss. This is the single highest-value architectural change.
+**Status:** Done. `--use-embeddings` computes a dense embedding for each
+message and compares it to per-category centroid vectors learned from past
+high-confidence decisions. The final confidence is
+`max(keyword_score, embedding_similarity * 100)`. Two backends: HTTP endpoint
+(local LLM server's `/v1/embeddings`) or sentence-transformers. Falls back to
+keyword-only when unavailable. Centroids stored in `category_centroid` SQLite
+table. New module: `src/sorter/embeddings.py`. 6 regression tests added.
+
+**What was built:**
+1. `src/sorter/embeddings.py` — `HttpEmbeddingBackend`, `SentenceTransformerBackend`, `compute_embedding_scores()`, `cosine_similarity()` (pure Python, no numpy), `average_vectors()`, `create_embedding_backend()`.
+2. `category_centroid` SQLite table — stores per-category average embedding vectors.
+3. `load_category_centroids()` / `update_category_centroids()` — load before scan, update after scan from decisions at or above `--embedding-confidence-floor` (default 70).
+4. Hybrid scoring in `decide()` — `max(keyword_confidence, embedding_similarity * 100)` per category. Reasons record `embedding_boost:<cat>:<sim>` when the embedding wins.
+5. CLI flags: `--use-embeddings`, `--embedding-endpoint`, `--embedding-model`, `--embedding-st-model`, `--embedding-confidence-floor`.
+
+**What remains for the next model:**
+- Run a first scan with `--use-embeddings` to learn initial centroids, then a second scan to benefit from them.
+- Consider adding a confidence-calibration curve (item E) to validate that the embedding similarity scores are well-calibrated.
+- The `sentence-transformers` backend requires PyTorch; the HTTP backend is lighter and preferred when the local LLM server is running.
 
 ### B. Replace per-keyword scoring with a lightweight trained classifier
 
@@ -646,16 +644,22 @@ maintainability.
 
 | Priority | Improvement | Effort | Impact |
 | --- | --- | --- | --- |
-| 1 | A. Embedding pre-classifier (hybrid) | High | Highest — fixes the long tail of semantic misses |
+| 1 | ~~A. Embedding pre-classifier (hybrid)~~ ✅ Done in v0.6.0 | — | — |
 | 2 | E. Confidence calibration + golden set | Medium | High — turns confidence from a guess into a metric |
 | 3 | D. Sender reputation table | Medium | Medium — auto-suggests blocklist, stronger priors |
 | 4 | B. Trained classifier on labeled data | Medium | Medium — replaces hand-tuned weights |
 | 5 | C. Thread-level conversation modeling | Medium | Medium — more principled than plurality vote |
 | 6 | F. Full module split | Low | Low — maintainability, not accuracy |
 
-My strong recommendation is to start with **A (embedding pre-classifier)**
-because it addresses the root cause the user identified: "we rely heavily on
-keywords and domains, shouldn't we rely more on context?" An embedding model
-captures context; the keyword rules stay as the explainable floor; the AI
-review pipeline catches the rest. The hybrid is the architecture that makes
-the sorter genuinely smart without sacrificing safety or explainability.
+**A (embedding pre-classifier)** is now implemented in v0.6.0. It addresses
+the root cause the user identified: "we rely heavily on keywords and domains,
+shouldn't we rely more on context?" An embedding model captures context; the
+keyword rules stay as the explainable floor; the AI review pipeline catches
+the rest. The hybrid is the architecture that makes the sorter genuinely smart
+without sacrificing safety or explainability.
+
+The next model should evaluate the **remaining** items (B–F) and decide which
+to implement next. My recommendation for the next priority is **E (confidence
+calibration + golden set)** because it turns the embedding similarity scores
+into measurable, tunable probabilities — without calibration, we can't know
+if a similarity of 0.7 actually means "70% likely correct."
