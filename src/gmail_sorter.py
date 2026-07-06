@@ -17,6 +17,7 @@ import base64
 import csv
 import html
 import json
+import logging
 import re
 import socket
 import sqlite3
@@ -31,225 +32,45 @@ from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
+# Policy data and pure keyword matching live in the sorter package so the
+# cleanup rules can be edited and config-driven without touching Gmail I/O or
+# apply paths. These names are re-exported here for backwards compatibility with
+# the companion scripts (trash_rescue_audit, apply_domain_trash_policy) and the
+# tests, which all do `import gmail_sorter`.
+from sorter import policy
+from sorter.keywords import compile_keywords, contains_any, keyword_hits, regex_hits
+from sorter.config_loader import apply_overrides, load_policy_overrides
 
-READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
-MAIL_SCOPE = "https://mail.google.com/"
-DEFAULT_QUERY = "before:2025/12/30 -in:trash"
-ROOT_LABEL = "Sorter"
+
+# Re-export policy names for backwards compatibility.
+READONLY_SCOPE = policy.READONLY_SCOPE
+MODIFY_SCOPE = policy.MODIFY_SCOPE
+MAIL_SCOPE = policy.MAIL_SCOPE
+DEFAULT_QUERY = policy.DEFAULT_QUERY
+ROOT_LABEL = policy.ROOT_LABEL
+NON_LABEL_CATEGORIES = policy.NON_LABEL_CATEGORIES
+BULK_MAIL_REASONS = policy.BULK_MAIL_REASONS
+AD_SUBJECT_KEYWORDS = policy.AD_SUBJECT_KEYWORDS
+AD_BODY_KEYWORDS = policy.AD_BODY_KEYWORDS
+AD_SENDER_KEYWORDS = policy.AD_SENDER_KEYWORDS
+STRONG_PROMO_SUBJECT_PATTERNS = policy.STRONG_PROMO_SUBJECT_PATTERNS
+PROMO_SENDER_LOCALPARTS = policy.PROMO_SENDER_LOCALPARTS
+TRANSACTIONAL_KEYWORDS = policy.TRANSACTIONAL_KEYWORDS
+IMPORTANT_LABELS = policy.IMPORTANT_LABELS
+PROTECTED_CATEGORIES = policy.PROTECTED_CATEGORIES
+IMMIGRATION_KEYWORDS = policy.IMMIGRATION_KEYWORDS
+STUDIES_KEYWORDS = policy.STUDIES_KEYWORDS
+CATEGORY_RULES = policy.CATEGORY_RULES
+PRIMARY_CATEGORY_PRECEDENCE = policy.PRIMARY_CATEGORY_PRECEDENCE
+
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 VERSION_CODE = "20260706"
+SCHEMA_VERSION = 1
+log = logging.getLogger("sorter")
 
-# Catch-all categories that describe "we did not learn anything useful" rather
-# than a real filing decision. Labeling every message with these just clutters
-# the mailbox with Sorter/Review and Sorter/Updates on generic mail, so they are
-# tracked for the dashboard but never turned into an applied Gmail label.
-NON_LABEL_CATEGORIES = {"Review", "Updates"}
 
-# Independent bulk-mail signals. Archive now requires real evidence that a
-# message is machine-sent bulk mail, not just a subject line that happens to
-# score high. This is the same evidence family perfect_ad_match relies on, but
-# used as an archive gate so one-off high-scoring mail is not pulled from the
-# inbox.
-BULK_MAIL_REASONS = {
-    "gmail_category_promotions",
-    "list_unsubscribe_header",
-    "one_click_unsubscribe_header",
-    "list_id_header",
-    "bulk_or_list_precedence",
-    "campaign_header",
-    "body_unsubscribe_link",
-}
 
-# These keyword groups are policy inputs, not throwaway search terms. A message
-# only becomes trash-eligible when promotional evidence wins against the
-# protection rules below.
-AD_SUBJECT_KEYWORDS = [
-    "sale",
-    "deal",
-    "deals",
-    "discount",
-    "promo",
-    "promotion",
-    "coupon",
-    "offer",
-    "limited time",
-    "save ",
-    "% off",
-    "free shipping",
-    "clearance",
-    "flash sale",
-    "black friday",
-    "cyber monday",
-    "newsletter",
-    "new arrivals",
-    "just dropped",
-    "shop now",
-    "last chance",
-    "ends tonight",
-    "exclusive",
-]
-
-AD_BODY_KEYWORDS = [
-    "unsubscribe",
-    "manage preferences",
-    "email preferences",
-    "view in browser",
-    "view this email in your browser",
-    "you are receiving this email because",
-    "marketing email",
-    "promotional email",
-    "privacy policy",
-]
-
-AD_SENDER_KEYWORDS = ["newsletter", "marketing", "promo", "promotions", "offers", "deals"]
-
-STRONG_PROMO_SUBJECT_PATTERNS = [
-    r"\b\d{1,2}%\s*off\b",
-    r"\b\d{1,2}\s*percent\s*off\b",
-    r"\b(?:last chance|final hours|ends tonight|today only)\b",
-    r"\b(?:flash sale|clearance|warehouse sale|summer sale|winter sale)\b",
-    r"\b(?:black friday|cyber monday|boxing day)\b",
-    r"\b(?:free shipping|free delivery)\b",
-    r"\b(?:shop now|new arrivals|just dropped)\b",
-]
-
-PROMO_SENDER_LOCALPARTS = {
-    "deals",
-    "email",
-    "hello",
-    "info",
-    "marketing",
-    "newsletter",
-    "newsletters",
-    "offers",
-    "promo",
-    "promotions",
-    "sales",
-}
-
-TRANSACTIONAL_KEYWORDS = [
-    "2fa",
-    "account alert",
-    "appointment",
-    "bank",
-    "bill",
-    "booking",
-    "code",
-    "confirm your email",
-    "delivery",
-    "document",
-    "e-transfer",
-    "invoice",
-    "login",
-    "mfa",
-    "order",
-    "password",
-    "payment",
-    "payroll",
-    "receipt",
-    "refund",
-    "reset",
-    "security",
-    "shipment",
-    "shipped",
-    "statement",
-    "tax",
-    "ticket",
-    "transaction",
-    "verification",
-    "verify",
-]
-
-IMPORTANT_LABELS = {"CATEGORY_PRIMARY", "STARRED", "IMPORTANT"}
-# Protected categories are the hard stop list. If a message lands here, it can
-# still be labeled for review, but it should not be archived or trashed.
-PROTECTED_CATEGORIES = {
-    "Account Security",
-    "Finance",
-    "Government Legal",
-    "Health",
-    "Insurance",
-    "Priority Attachments",
-    "Priority Immigration",
-    "Priority Studies",
-    "Receipts Orders",
-    "Utilities",
-    "Work School"  # Added
-}
-
-IMMIGRATION_KEYWORDS = [
-    "immigration",
-    "ircc",
-    "cic",
-    "visa",
-    "work permit",
-    "study permit",
-    "permanent residence",
-    "pr card",
-    "express entry",
-    "biometrics",
-    "lawyer",
-    "law firm",
-    "legal counsel",
-    "barrister",
-    "solicitor",
-    "marolia",
-    "pinaz",
-    "tiffani",
-    "ronen",
-    "raquel",
-    "jemma",
-    "jonalyn",
-    "oskoii",
-    "oskooii",
-    "oskoui",
-    "osgoode",
-]
-
-STUDIES_KEYWORDS = [
-    "university",
-    "college",
-    "course",
-    "class",
-    "assignment",
-    "tuition",
-    "transcript",
-    "diploma",
-    "degree",
-    "registrar",
-    "student",
-    "student record",
-    "academic",
-    "study permit",
-    "enrolment",
-    "enrollment",
-    "exam",
-    "grade",
-    "syllabus",
-]
-
-CATEGORY_RULES = [
-    ("Priority Immigration", IMMIGRATION_KEYWORDS, []),
-    ("Priority Studies", STUDIES_KEYWORDS, []),
-    ("Finance", ["bank", "credit card", "debit", "statement", "payment", "payroll", "invoice", "tax", "cra", "irs", "etransfer", "e-transfer"], []),
-    ("Receipts Orders", ["receipt", "order", "purchase", "shipment", "shipped", "delivered", "delivery", "tracking", "refund", "return"], []),
-    ("Account Security", ["password", "reset", "verification", "verify", "security alert", "new login", "sign-in", "2fa", "mfa", "authentication", "code"], []),
-    ("Travel", ["flight", "airline", "hotel", "reservation", "booking", "boarding", "itinerary", "rental car", "airbnb", "uber", "lyft"], []),
-    ("Health", ["appointment", "clinic", "doctor", "dentist", "pharmacy", "prescription", "medical", "health", "uhn", "myuhn", "hospital", "specialist"], []),
-    ("Government Legal", ["government", "court", "legal", "visa", "immigration", "passport", "license", "notice"], []),
-    ("Work School", ["meeting", "calendar", "deadline", "project", "assignment", "university", "college", "school", "course", "class"], []),
-    ("Social", ["facebook", "instagram", "linkedin", "twitter", "x.com", "reddit", "discord", "snapchat", "tiktok"], []),
-    ("Subscriptions", ["subscription", "renewal", "membership", "plan", "trial", "billing cycle"], []),
-    ("Shopping", ["cart", "wishlist", "store", "shop", "retailer", "coupon", "discount"], []),
-    ("Job Search", ["application", "resume", "interview", "recruiter", "job alert", "candidate", "position"], []),
-    ("Housing", ["rent", "lease", "landlord", "tenant", "mortgage", "property", "apartment", "condo"], ["hospital", "clinic", "health network"]),
-    ("Utilities", ["utility", "hydro", "internet", "mobile", "phone bill", "electricity", "gas bill"], []),
-    ("Insurance", ["insurance", "policy", "claim", "premium", "coverage"], []),
-    ("Crypto Finance Risk", ["crypto", "bitcoin", "ethereum", "wallet", "exchange", "trading"], []),
-    ("Old Account Evidence", ["welcome to", "confirm your account", "activate your account", "account created", "username", "registered"], []),
-]
 
 
 @dataclass
@@ -304,6 +125,7 @@ class Decision:
     review_priority: str = "normal"
     action_done: str = "no"
     scanned_at: str = ""
+    schema_version: int = SCHEMA_VERSION
 
 
 class AdaptiveThrottle:
@@ -489,71 +311,6 @@ def parse_date(raw_date: str, internal_date: str | None) -> str:
     return ""
 
 
-def contains_any(text: str, keywords: list[str]) -> list[str]:
-    """Substring keyword match (legacy).
-
-    Kept for the few places where a literal substring is genuinely intended
-    (e.g. unsubscribe URL detection is handled separately). Classification and
-    ad scoring use keyword_hits() instead, which applies word boundaries so a
-    domain like "example.com" no longer matches the studies keyword "exam".
-    """
-
-    lowered = text.lower()
-    return [keyword for keyword in keywords if keyword in lowered]
-
-
-_WORDLIKE_RE = re.compile(r"^[a-z0-9]+(?:[\s'][a-z0-9]+)*[a-z0-9]$|^[a-z0-9]$")
-_KEYWORD_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
-
-
-def _keyword_to_pattern(keyword: str) -> str:
-    """One keyword -> a regex alternation piece with boundary when word-like."""
-
-    if _WORDLIKE_RE.match(keyword):
-        return rf"\b{re.escape(keyword)}\b"
-    return re.escape(keyword)
-
-
-def compile_keywords(keywords: list[str]) -> re.Pattern[str]:
-    """Compile a keyword list into one fast alternation regex with boundaries.
-
-    Word-like keywords (letters/digits/spaces/apostrophes) get \\b boundaries so
-    "exam" does not match "example.com" and "class" does not match
-    "classification". Keywords containing punctuation (e.g. "% off", "2fa")
-    are matched as escaped substrings since \\b does not behave around
-    non-word characters.
-    """
-
-    key = tuple(sorted(keywords))
-    cached = _KEYWORD_CACHE.get(key)
-    if cached is not None:
-        return cached
-    pieces = [_keyword_to_pattern(kw) for kw in key if kw]
-    pattern = re.compile("|".join(pieces) or "(?!)", re.IGNORECASE)
-    _KEYWORD_CACHE[key] = pattern
-    return pattern
-
-
-def keyword_hits(text: str, keywords: list[str]) -> list[str]:
-    """Return the keywords present in text using word-boundary matching.
-
-    Word-like keywords (letters/digits/spaces/apostrophes) get \\b boundaries so
-    "exam" does not match "example.com" and "class" does not match
-    "classification". Keywords containing punctuation (e.g. "% off") are
-    matched as escaped substrings since \\b does not behave around non-word
-    characters. Each keyword is reported once, in input order, so callers can
-    build readable reason strings from the hits.
-    """
-
-    if not text or not keywords:
-        return []
-    lowered = text.lower()
-    return [keyword for keyword in keywords if re.search(_keyword_to_pattern(keyword), lowered)]
-
-
-def regex_hits(text: str, patterns: list[str]) -> list[str]:
-    lowered = text.lower()
-    return [pattern for pattern in patterns if re.search(pattern, lowered)]
 
 
 def sender_localpart(sender_email: str) -> str:
@@ -947,35 +704,8 @@ def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[s
     return sorted(set(categories))
 
 
-# Precedence used to choose a single primary category. Protected/priority
-# buckets win so the primary label reflects the safest, most specific filing
-# decision instead of an arbitrary alphabetical pick.
-PRIMARY_CATEGORY_PRECEDENCE = [
-    "Priority Immigration",
-    "Priority Studies",
-    "Priority Attachments",
-    "Account Security",
-    "Finance",
-    "Government Legal",
-    "Health",
-    "Insurance",
-    "Receipts Orders",
-    "Utilities",
-    "Work School",
-    "Travel",
-    "Housing",
-    "Job Search",
-    "Subscriptions",
-    "Crypto Finance Risk",
-    "Old Account Evidence",
-    "Shopping",
-    "Social",
-    "Forums",
-    "Ads Promotions",
-    "Newsletters Bulk",
-    "Updates",
-    "Review",
-]
+# Precedence used to choose a single primary category is imported from
+# sorter.policy (PRIMARY_CATEGORY_PRECEDENCE) so it can be config-driven.
 
 
 def pick_primary_category(categories: list[str]) -> str:
@@ -1226,6 +956,7 @@ def decision_from_dict(data: dict[str, Any]) -> Decision:
     data.setdefault("message_size_estimate", 0)
     data.setdefault("body_len", 0)
     data.setdefault("body_category_hits", [])
+    data.setdefault("schema_version", 0)
     if "primary_category" not in data:
         data["primary_category"] = pick_primary_category(data.get("categories", []) or [])
     data.setdefault("archive_reason", "")
@@ -2721,6 +2452,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[logging.StreamHandler(sys.stderr)],
+    )
+    run_log = PROJECT_DIR / "data" / "runs" / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.log"
+    try:
+        run_log.parent.mkdir(parents=True, exist_ok=True)
+        logging.getLogger().addHandler(logging.FileHandler(run_log, encoding="utf-8"))
+        log.info("run log: %s", run_log)
+    except OSError:
+        log.warning("could not open run log at %s", run_log)
+    apply_overrides(load_policy_overrides(PROJECT_DIR / "config" / "policy.yaml"))
+    log.info("gmail-sorter %s (%s) schema_version=%s", APP_VERSION, VERSION_CODE, SCHEMA_VERSION)
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)
     args.apply_progress_every = max(1, args.apply_progress_every)

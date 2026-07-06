@@ -10,7 +10,7 @@
 
 Dashboard-centered Gmail cleanup tool for older mail. It scans messages before December 30, 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
 
-Current version: `0.4.0` (`20260706`).
+Current version: `0.5.0` (`20260706`).
 
 Companion AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack). This repo is the mailbox cleanup tool; the local AI stack repo documents the Qwen3.6, DeepSeek 32B, and Gemma planner setup used around it.
 
@@ -19,6 +19,7 @@ Companion AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops
 | Stage | Purpose | Safety posture |
 | --- | --- | --- |
 | 🏷️ Label | Mark and organize mail without moving it. | Lowest risk |
+| 🏷️ Relabel | Read bodies and re-apply the corrected `Sorter/*` labels, removing stale ones. | Reviewable |
 | 📦 Archive | Move low-value bulk mail out of the inbox. | Reviewable |
 | 🗑️ Trash | Move only high-confidence promotional mail to Trash. | Explicit flags required |
 | 🧯 Rescue audit | Re-check Trash before permanent deletion. | Conservative |
@@ -28,12 +29,19 @@ Companion AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops
 
 ```text
 sorter/
-  src/                 Python source
-  config/              allowlist and blocklist
+  src/
+    gmail_sorter.py     runnable core (CLI, scan, decide, apply, reports, dashboard)
+    sorter/             package: policy data, keyword matcher, config loader
+      policy.py         keyword lists, category rules, precedence, defaults
+      keywords.py       word-boundary keyword matching
+      config_loader.py  optional config/policy.yaml overrides
+    trash_rescue_audit.py
+    apply_domain_trash_policy.py
+  config/              allowlist, blocklist, and optional policy.yaml overrides
   secrets/             Gmail OAuth credentials and tokens; never committed
   reports/             generated dashboards and CSV/JSON reports; local only
   manifests/           reviewed action manifests; local only
-  data/                resumable progress cache and SQLite state; local only
+  data/                resumable progress cache, SQLite state, and run logs; local only
   docs/                notes and future documentation
 ```
 
@@ -86,6 +94,30 @@ Labels only:
 ```bash
 python3 src/gmail_sorter.py --stage label --apply --resume
 ```
+
+Re-label mail the sorter already labeled once, using the email body for better accuracy (re-run after the first pass taught the sender profiles):
+
+```bash
+python3 src/gmail_sorter.py \
+  --stage relabel \
+  --scan full \
+  --resume \
+  --refresh-existing \
+  --attachment-details
+```
+
+Review the dry-run dashboard and `manifests/relabel_manifest.json` (before→after per message), then apply:
+
+```bash
+python3 src/gmail_sorter.py \
+  --stage relabel \
+  --scan full \
+  --apply \
+  --resume \
+  --prune-empty-labels
+```
+
+Relabel only ever touches the `Sorter/*` namespace — your user-created labels and Gmail system labels are never removed. A message that now only lands in a catch-all bucket has its stale `Sorter` labels cleared. `--scan full` fetches `format=full` and feeds a bounded slice of the decoded body to the classifier so labels reflect body/header/footer content, not just the subject and snippet; ad confidence is still scored on headers+subject+snippet so a long promotional body does not inflate trash scores.
 
 Archive low-value bulk mail:
 
@@ -388,6 +420,14 @@ python3 src/gmail_sorter.py --resume --workers 8
 `--attachment-details` fetches metadata-rich payloads to report attachment filenames and MIME types. It does not download attachment bytes.
 
 It also allows the report to inspect text/html and text/plain message parts for unsubscribe URLs. The script does not persist email body text; it stores only normalized unsubscribe/preference links in reports.
+
+## 🧠 Labeling Model
+
+- **Word-boundary matching**: keyword rules use `\b` boundaries, so `exam` no longer matches `example.com` and `class` no longer matches `classification`. Punctuation keywords (e.g. `% off`) are matched as escaped substrings.
+- **Sender→category profiles**: high-confidence and protected decisions are accumulated per sender/domain in SQLite. On a re-run, a profile can add a category the subject keywords missed, so the mailbox self-improves pass over pass. Disable with `--no-sender-profiles`.
+- **Primary category**: each message gets one `primary_category` chosen by a protected/priority-first precedence, surfaced on the dashboard.
+- **Catch-all labels**: `Review`/`Updates` are shown on the dashboard but never applied as `Sorter/Review`/`Sorter/Updates` Gmail labels.
+- **Config overrides**: edit `config/policy.yaml` to override keyword groups and thresholds without touching code (PyYAML optional; built-in defaults are used otherwise).
 
 ## Safety
 

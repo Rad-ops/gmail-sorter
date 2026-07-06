@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.0 - 2026-07-06
+
+### 🏷️ Relabel Stage (read body, remove stale labels, re-apply)
+
+- New `--stage relabel`. It reads each message's current `Sorter/*` labels, diffs them against the freshly computed desired categories, and issues one `batchModify` per group carrying both `addLabelIds` and `removeLabelIds`.
+- Only labels in the `Sorter/` namespace are ever removed; user-created and Gmail system labels are never touched. A message that now only lands in a catch-all bucket has its stale `Sorter` labels cleared.
+- Dry-run by default; `--apply` required to change Gmail. Each relabel is recorded in the action ledger.
+- `--prune-empty-labels` deletes `Sorter/*` labels that no longer have any messages after a relabel apply.
+- `manifests/relabel_manifest.json` writes a before→after preview using the live label list (works in dry-run).
+- New dashboard "Relabel Review" section.
+
+### 📖 Body-Aware Scanning
+
+- New `--scan {metadata,full}`. In `full` mode the worker fetches `format=full` and `decide()` decodes a bounded slice of the body text and feeds it to `categorize()`, so labels can be assigned from body/header/footer content, not only subject+snippet. Ad confidence is still scored on headers+subject+snippet so a long promotional body does not inflate the trash score.
+- Records `body_len` and `body_category_hits` per Decision and caches compact derived features (body length, category names hit in the body, unsubscribe count) in a new `message_features` SQLite table. Raw body text is never persisted, so a re-run can reuse body-derived features without re-fetching Gmail.
+
+### 🧠 Sender→Category Profiles
+
+- Added a `sender_profile` SQLite table accumulated from high-confidence and protected decisions. A precomputed profile index is consulted in `decide()` to add a category the subject keywords missed, so a re-run on an already-labeled mailbox self-improves: the first pass teaches the profile, the second pass uses it to fix keyword misses.
+- New flags `--use-sender-profiles`/`--no-sender-profiles`, `--sender-profile-min-weight`, `--sender-profile-floor`.
+
+### 🐛 Word-Boundary Keyword Matching
+
+- `keyword_hits()` applies `\b` boundaries to word-like keywords and escaped substring matching to punctuation keywords. Fixes the substring bug that mislabeled mail: `exam` no longer matches `example.com`, `class` no longer matches `classification`, `sale` no longer matches `salon`. `categorize()`, `score_ad()`, and `is_perfect_ad_match()` switched to the new matcher.
+
+### 🏗️ Architecture
+
+- Split policy data and pure keyword matching into a `sorter/` package: `sorter/policy.py` (keyword lists, rules, precedence, defaults), `sorter/keywords.py` (word-boundary matcher), `sorter/config_loader.py` (optional `config/policy.yaml` overrides). `gmail_sorter.py` re-exports these names so `trash_rescue_audit.py`, `apply_domain_trash_policy.py`, and the tests keep working unchanged.
+- Optional `config/policy.yaml` lets you override keyword groups and thresholds without editing code (requires PyYAML; falls back to built-in defaults if absent).
+- Added `logging` throughout with a per-run log file under `data/runs/`.
+- Added `SCHEMA_VERSION = 1` and a `schema_version` field on `Decision`/progress rows to support future migrations.
+
+### 🧪 Tests
+
+- 29 tests passing. Added regression coverage for word-boundary matching, sender-profile-assisted categorization, body-aware categorization, the relabel label diff (stale removal, user-label safety, empty-desired clear, no-op when correct), and empty-label pruning.
+
 ## 0.4.0 - 2026-07-06
 
 ### 📦 Safer Archive Stage
