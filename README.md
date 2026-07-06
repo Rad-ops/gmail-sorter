@@ -10,7 +10,7 @@
 
 Dashboard-centered Gmail cleanup tool for older mail. It scans messages before December 30, 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
 
-Current version: `0.3.3` (`20260705`).
+Current version: `0.4.0` (`20260706`).
 
 Companion AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack). This repo is the mailbox cleanup tool; the local AI stack repo documents the Qwen3.6, DeepSeek 32B, and Gemma planner setup used around it.
 
@@ -91,6 +91,20 @@ Archive low-value bulk mail:
 
 ```bash
 python3 src/gmail_sorter.py --stage archive --apply --resume
+```
+
+Archive only requires an independent bulk-mail signal (List-Unsubscribe, List-Id, one-click unsubscribe, bulk/list precedence, campaign header, Gmail Promotions, or a body unsubscribe link) plus `--archive-threshold` confidence. A one-off message that only scored high on subject keywords stays in the inbox. Cap and canary an archive apply the same way as trash:
+
+```bash
+python3 src/gmail_sorter.py \
+  --stage archive \
+  --apply \
+  --resume \
+  --archive-canary-limit 100 \
+  --max-archive-per-domain 500 \
+  --max-archive-total 5000 \
+  --archive-skip-unread \
+  --archive-min-age-days 30
 ```
 
 Trash very high-confidence ads only after reviewing the dashboard:
@@ -384,6 +398,17 @@ The default run is classification only. Gmail changes require `--apply`. Trash r
 ```
 
 Protected messages are kept out of archive/trash when they are allowlisted, important/starred/primary, have real attachments, or match protected categories such as immigration, studies, finance, account security, health, government/legal, utilities, insurance, or receipts/orders. Inline marketing images are tracked separately so image-only promotional mail is not overprotected.
+
+Archive is deliberately conservative: a message is only archived when it clears `--archive-threshold` **and** carries an independent bulk-mail signal, so high-scoring one-off mail is not moved out of the inbox. Each archived message records an `archive_reason` explaining the evidence. Catch-all `Review`/`Updates` buckets are shown on the dashboard but never applied as Gmail labels.
+
+Archive safety controls:
+
+- `--archive-threshold N` sets the minimum ad confidence for archive (default 65).
+- `--archive-min-age-days N` keeps mail newer than N days in the inbox.
+- `--archive-skip-unread` never archives unread mail.
+- `--max-archive-per-domain N` caps archive actions per registered domain.
+- `--max-archive-total N` caps the total archive plan.
+- `--archive-canary-limit N` limits an apply run to the first N archive actions.
 
 `perfect_ad_match` means the message reached 100 ad confidence, has multiple independent bulk-mail signals such as Gmail promotions, List-Unsubscribe, List-Id, one-click unsubscribe, bulk precedence, or promotional sender local-parts, and has promotional body/subject content. Perfect matches still respect the same protected-message checks and mixed-thread protection.
 

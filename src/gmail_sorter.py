@@ -38,8 +38,29 @@ MAIL_SCOPE = "https://mail.google.com/"
 DEFAULT_QUERY = "before:2025/12/30 -in:trash"
 ROOT_LABEL = "Sorter"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.3.3"
-VERSION_CODE = "20260705"
+APP_VERSION = "0.4.0"
+VERSION_CODE = "20260706"
+
+# Catch-all categories that describe "we did not learn anything useful" rather
+# than a real filing decision. Labeling every message with these just clutters
+# the mailbox with Sorter/Review and Sorter/Updates on generic mail, so they are
+# tracked for the dashboard but never turned into an applied Gmail label.
+NON_LABEL_CATEGORIES = {"Review", "Updates"}
+
+# Independent bulk-mail signals. Archive now requires real evidence that a
+# message is machine-sent bulk mail, not just a subject line that happens to
+# score high. This is the same evidence family perfect_ad_match relies on, but
+# used as an archive gate so one-off high-scoring mail is not pulled from the
+# inbox.
+BULK_MAIL_REASONS = {
+    "gmail_category_promotions",
+    "list_unsubscribe_header",
+    "one_click_unsubscribe_header",
+    "list_id_header",
+    "bulk_or_list_precedence",
+    "campaign_header",
+    "body_unsubscribe_link",
+}
 
 # These keyword groups are policy inputs, not throwaway search terms. A message
 # only becomes trash-eligible when promotional evidence wins against the
@@ -261,10 +282,12 @@ class Decision:
     snippet: str
     existing_labels: list[str] = field(default_factory=list)
     categories: list[str] = field(default_factory=list)
+    primary_category: str = ""
     ad_confidence: int = 0
     reasons: list[str] = field(default_factory=list)
     negative_reasons: list[str] = field(default_factory=list)
     planned_actions: list[str] = field(default_factory=list)
+    archive_reason: str = ""
     has_attachment: bool = False
     has_real_attachment: bool = False
     attachment_count: int = 0
@@ -837,7 +860,7 @@ def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[s
         name = rule[0]
         keywords = rule[1]
         exclusions = rule[2] if len(rule) > 2 else []
-        
+
         # Only add category if:
         # 1. Any keyword is found
         # 2. No exclusion pattern is present
@@ -852,6 +875,53 @@ def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[s
     if not categories:
         categories.append("Review")
     return sorted(set(categories))
+
+
+# Precedence used to choose a single primary category. Protected/priority
+# buckets win so the primary label reflects the safest, most specific filing
+# decision instead of an arbitrary alphabetical pick.
+PRIMARY_CATEGORY_PRECEDENCE = [
+    "Priority Immigration",
+    "Priority Studies",
+    "Priority Attachments",
+    "Account Security",
+    "Finance",
+    "Government Legal",
+    "Health",
+    "Insurance",
+    "Receipts Orders",
+    "Utilities",
+    "Work School",
+    "Travel",
+    "Housing",
+    "Job Search",
+    "Subscriptions",
+    "Crypto Finance Risk",
+    "Old Account Evidence",
+    "Shopping",
+    "Social",
+    "Forums",
+    "Ads Promotions",
+    "Newsletters Bulk",
+    "Updates",
+    "Review",
+]
+
+
+def pick_primary_category(categories: list[str]) -> str:
+    """Choose one primary category by precedence for cleaner single-label filing."""
+
+    for name in PRIMARY_CATEGORY_PRECEDENCE:
+        if name in categories:
+            return name
+    return categories[0] if categories else "Review"
+
+
+def labelable_categories(categories: list[str]) -> list[str]:
+    """Drop catch-all buckets so generic mail is not tagged Sorter/Review."""
+
+    filtered = [category for category in categories if category not in NON_LABEL_CATEGORIES]
+    return filtered or []
 
 
 def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) -> Decision:
@@ -913,8 +983,46 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     if perfect_ad_match:
         reasons.append("perfect_ad_match")
 
-    planned_actions = [f"label:{category}" for category in categories]
-    can_archive = not protected and ("Newsletters Bulk" in categories or ad_confidence >= args.ad_threshold)
+    primary_category = pick_primary_category(categories)
+    # Only turn meaningful categories into Gmail labels. Catch-all buckets like
+    # Review/Updates are kept for the dashboard but never applied, so generic
+    # mail is not tagged Sorter/Review across the whole mailbox.
+    planned_actions = [f"label:{category}" for category in labelable_categories(categories)]
+
+    is_unread = "UNREAD" in labels
+    recent_cutoff_days = getattr(args, "archive_min_age_days", 0)
+    too_recent_to_archive = False
+    if recent_cutoff_days and message_date:
+        try:
+            age_days = (datetime.now(timezone.utc).date() - datetime.fromisoformat(message_date).date()).days
+            too_recent_to_archive = age_days < recent_cutoff_days
+        except ValueError:
+            too_recent_to_archive = False
+
+    # Archive now requires independent bulk-mail evidence, not just a high ad
+    # score. A one-off message that happens to score high on subject keywords is
+    # no longer pulled out of the inbox. Gmail's own Newsletters/Bulk bucket is
+    # accepted as sufficient bulk evidence on its own.
+    bulk_signal_reasons = sorted(BULK_MAIL_REASONS.intersection(reasons))
+    has_bulk_signal = bool(bulk_signal_reasons) or "Newsletters Bulk" in categories
+    archive_reason = ""
+    can_archive = (
+        not protected
+        and has_bulk_signal
+        and ad_confidence >= args.archive_threshold
+        and not (getattr(args, "archive_skip_unread", False) and is_unread)
+        and not too_recent_to_archive
+    )
+    if can_archive:
+        evidence = bulk_signal_reasons or (["gmail_newsletters_bulk"] if "Newsletters Bulk" in categories else [])
+        archive_reason = f"ad_confidence={ad_confidence};bulk={','.join(evidence)}"
+    elif not protected and ad_confidence >= args.archive_threshold and not has_bulk_signal:
+        negative_reasons.append("archive_no_bulk_signal")
+    elif not protected and has_bulk_signal and getattr(args, "archive_skip_unread", False) and is_unread:
+        negative_reasons.append("archive_skipped_unread")
+    elif not protected and has_bulk_signal and too_recent_to_archive:
+        negative_reasons.append(f"archive_too_recent:{recent_cutoff_days}d")
+
     trash_threshold = args.pre_2020_trash_threshold if is_before_year(message_date, 2020) else args.trash_threshold
     can_trash = not protected and (
         perfect_ad_match
@@ -951,10 +1059,12 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         snippet=snippet,
         existing_labels=labels,
         categories=categories,
+        primary_category=primary_category,
         ad_confidence=ad_confidence,
         reasons=reasons,
         negative_reasons=negative_reasons,
         planned_actions=planned_actions,
+        archive_reason=archive_reason,
         has_attachment=has_attachment,
         has_real_attachment=has_real_attachment,
         attachment_count=real_attachment_count,
@@ -1012,6 +1122,9 @@ def decision_from_dict(data: dict[str, Any]) -> Decision:
     data.setdefault("attachment_count", 1 if data.get("has_real_attachment") else 0)
     data.setdefault("inline_attachment_count", 0)
     data.setdefault("message_size_estimate", 0)
+    if "primary_category" not in data:
+        data["primary_category"] = pick_primary_category(data.get("categories", []) or [])
+    data.setdefault("archive_reason", "")
     return Decision(**{key: data[key] for key in valid if key in data})
 
 
@@ -1215,6 +1328,41 @@ def apply_trash_policy_caps(decisions: list[Decision], args: argparse.Namespace)
             item.planned_actions = [action for action in item.planned_actions if action != "trash"]
             item.negative_reasons.append(f"trash_canary_limit:{args.canary_limit}")
             item.review_priority = "trash_capped_review"
+
+
+def apply_archive_policy_caps(decisions: list[Decision], args: argparse.Namespace) -> None:
+    """Cap planned archive actions the same way trash is capped.
+
+    Archive is reversible, but an archive apply can still pull thousands of
+    messages out of the inbox in one run. These caps give the same total,
+    per-domain, and canary controls the trash stage already has so an archive
+    apply can be proven on a small batch first.
+    """
+
+    def strip_archive(item: Decision, reason: str) -> None:
+        item.planned_actions = [action for action in item.planned_actions if action != "archive"]
+        item.negative_reasons.append(reason)
+        item.review_priority = "archive_capped_review"
+
+    archive_items = [item for item in decisions if "archive" in item.planned_actions]
+    if args.max_archive_total and len(archive_items) > args.max_archive_total:
+        allowed = {item.message_id for item in archive_items[: args.max_archive_total]}
+        for item in archive_items[args.max_archive_total :]:
+            strip_archive(item, f"archive_total_cap:{args.max_archive_total}")
+        archive_items = [item for item in archive_items if item.message_id in allowed]
+
+    if args.max_archive_per_domain:
+        seen: dict[str, int] = defaultdict(int)
+        for item in archive_items:
+            domain = item.registered_domain or item.sender_domain or "(unknown)"
+            seen[domain] += 1
+            if seen[domain] > args.max_archive_per_domain:
+                strip_archive(item, f"archive_domain_cap:{args.max_archive_per_domain}")
+
+    if args.archive_canary_limit and args.apply and args.stage == "archive":
+        remaining = [item for item in decisions if "archive" in item.planned_actions]
+        for item in remaining[args.archive_canary_limit :]:
+            strip_archive(item, f"archive_canary_limit:{args.archive_canary_limit}")
 
 
 def should_refresh(decision: Decision, args: argparse.Namespace) -> bool:
@@ -1923,6 +2071,7 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
     sender_counts = Counter(item.registered_domain or item.sender_domain or "(unknown)" for item in decisions)
     review_counts = Counter(item.review_priority for item in decisions)
     trash_items = [item for item in decisions if item.review_priority in {"trash_review", "thread_review"}]
+    archive_items = [item for item in decisions if "archive" in item.planned_actions]
     protected_ads = [item for item in decisions if item.review_priority == "protected_ad_review"]
     attachment_items = [item for item in decisions if item.has_attachment]
     real_attachment_items = [item for item in decisions if item.has_real_attachment]
@@ -2031,6 +2180,9 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 {render_table(protected_ads, ["ad_confidence", "sender_domain", "subject", "categories", "negative_reasons"], 100)}
 <h2 class="section-title">Attachment Review</h2>
 {render_table(attachment_items, ["date", "sender_domain", "subject", "categories", "ad_confidence", "attachment_names", "attachment_mime_types"], 100)}
+<h2 class="section-title">Archive Review</h2>
+<p class="note">Messages planned for archive now require an independent bulk-mail signal (List-Unsubscribe, List-Id, bulk precedence, campaign header, Gmail Promotions, or a body unsubscribe link), not just a high ad score. The archive reason column shows the evidence used.</p>
+{render_table(archive_items, ["date", "ad_confidence", "primary_category", "sender_domain", "subject", "archive_reason", "planned_actions"], 100)}
 <h2 class="section-title">Header Unsubscribe Domains</h2>
 <p class="note">Separate section for List-Unsubscribe headers, grouped by sender domain and prioritized by ad confidence, volume, and last-seen date.</p>
 {render_unsubscribe_priority(unsubscribe_items, 20)}
@@ -2041,7 +2193,7 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 <h2 class="section-title">Header Unsubscribe Candidates</h2>
 {render_table(unsubscribe_items, ["sender_domain", "sender", "subject", "ad_confidence", "list_unsubscribe"], 100)}
 <h2 class="section-title">Recent Sample</h2>
-{render_table(decisions, ["date", "ad_confidence", "review_priority", "sender_domain", "subject", "categories", "planned_actions"], 100)}
+{render_table(decisions, ["date", "ad_confidence", "review_priority", "sender_domain", "subject", "primary_category", "categories", "planned_actions"], 100)}
 </main></body></html>""",
         encoding="utf-8",
     )
@@ -2083,6 +2235,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blocklist", default=str(PROJECT_DIR / "config" / "blocklist.txt"))
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--ad-threshold", type=int, default=65)
+    parser.add_argument("--archive-threshold", type=int, default=65, help="Minimum ad confidence required to archive; archive also requires an independent bulk-mail signal.")
+    parser.add_argument("--archive-min-age-days", type=int, default=0, help="Do not archive messages newer than this many days; 0 disables the recency guard.")
+    parser.add_argument("--archive-skip-unread", action="store_true", help="Never archive messages that are still unread.")
     parser.add_argument("--trash-threshold", type=int, default=90)
     parser.add_argument("--pre-2020-trash-threshold", type=int, default=75)
     parser.add_argument("--stage", choices=["classify", "label", "archive", "trash"], default="classify")
@@ -2105,6 +2260,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-trash-per-domain", type=int, default=0, help="Cap planned trash actions per registered domain; 0 disables the cap.")
     parser.add_argument("--max-trash-total", type=int, default=0, help="Cap total planned trash actions; 0 disables the cap.")
     parser.add_argument("--canary-limit", type=int, default=0, help="When applying trash, only keep the first N trash actions in the apply set.")
+    parser.add_argument("--max-archive-per-domain", type=int, default=0, help="Cap planned archive actions per registered domain; 0 disables the cap.")
+    parser.add_argument("--max-archive-total", type=int, default=0, help="Cap total planned archive actions; 0 disables the cap.")
+    parser.add_argument("--archive-canary-limit", type=int, default=0, help="When applying archive, only keep the first N archive actions in the apply set.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
     parser.add_argument("--apply", action="store_true", help="Actually modify Gmail for the selected stage.")
     parser.add_argument("--trash-obvious-ads", action="store_true", help="Allow trash actions during --stage trash.")
@@ -2178,6 +2336,10 @@ def main() -> int:
 
     if args.stage == "trash":
         apply_trash_policy_caps(decisions, args)
+        upsert_state_decisions(state_conn, decisions)
+
+    if args.stage in {"archive", "trash"}:
+        apply_archive_policy_caps(decisions, args)
         upsert_state_decisions(state_conn, decisions)
 
     if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
