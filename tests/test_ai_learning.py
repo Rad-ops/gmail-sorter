@@ -193,7 +193,7 @@ class AILearningTests(unittest.TestCase):
         self.assertGreaterEqual(report["profile_bumps"], 1)
         rows = conn.execute(
             "SELECT category, hits FROM sender_profile WHERE key=?",
-            ("sender:noreply@bank.com",),
+            ("sender:noreply@bank.com:receipts orders",),
         ).fetchall()
         cats = {row[0] for row in rows}
         self.assertIn("Receipts Orders", cats)
@@ -216,7 +216,7 @@ class AILearningTests(unittest.TestCase):
         apply_ai_learning(conn, [decision], packets, embedding_backend=None)
         rows = conn.execute(
             "SELECT category FROM sender_profile WHERE key=?",
-            ("domain:bank.com",),
+            ("domain:bank.com:receipts orders",),
         ).fetchall()
         self.assertIn("Receipts Orders", {row[0] for row in rows})
         conn.close()

@@ -435,10 +435,26 @@ def clean_body_text(body_text: str, keep_chars: int = 8000) -> str:
         if _QUOTED_LINE_RE.match(line) or _ON_WROTE_RE.match(line):
             continue
         # Once we hit a footer marker, drop the rest of this block.
+        # The check is rstrip-aware: a line of just ``--`` (the
+        # post-strip form of the standard email signature separator
+        # ``-- \n``) must still match the marker ``-- ``. The rstrip
+        # # normalization lets both the bare ``--`` and the more
+        # # verbose ``-- `` (with trailing whitespace) trigger the
+        # # break.
+        lowered_raw = line.lower()
         lowered = line.strip().lower()
-        if any(lowered.startswith(marker) or lowered == marker for marker in FOOTER_MARKERS):
-            break
-        kept.append(line)
+        for marker in FOOTER_MARKERS:
+            marker_stripped = marker.rstrip()
+            if not marker_stripped:
+                continue
+            if lowered.startswith(marker) or lowered == marker:
+                break
+            if marker_stripped and (lowered == marker_stripped or lowered_raw.lstrip().startswith(marker_stripped + " ") or lowered_raw.lstrip() == marker_stripped):
+                break
+        else:
+            kept.append(line)
+            continue
+        break
     cleaned = "\n".join(kept).strip()
     return cleaned[:keep_chars]
 

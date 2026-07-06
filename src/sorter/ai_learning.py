@@ -122,7 +122,10 @@ def apply_ai_learning(
         for kind, value in (("sender", sender_email), ("domain", registered_domain)):
             if not value:
                 continue
-            key = f"{kind}:{value}"
+            # v0.7: keys are (kind, value, category). The category
+            # segment keeps the per-(sender, category) shape that the
+            # rest of the codebase expects.
+            key = f"{kind}:{value.lower()}:{ai_label.lower()}"
             row = conn.execute(
                 "SELECT hits, protected_hits FROM sender_profile WHERE key=? AND category=?",
                 (key, ai_label),
