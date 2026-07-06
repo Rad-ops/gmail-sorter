@@ -1,43 +1,42 @@
 # Local AI Stack Integration
 
-Updated: 2026-07-05
+Updated: 2026-07-06
 
-Gmail Sorter is the real mailbox workflow. Local AI Coding Stack is the model/runtime notebook that supports it:
+Gmail Sorter is the mailbox workflow; the
+[local AI coding stack](https://github.com/Rad-ops/local-ai-coding-stack) is the
+model/runtime notebook that supports it.
 
-```text
-https://github.com/Rad-ops/gmail-sorter
-https://github.com/Rad-ops/local-ai-coding-stack
-```
+## How the local model is used
 
-## What The Local Model Does Here
+1. The sorter applies Python rules first: sender/domain signals, Gmail labels,
+   unsubscribe headers, promotional language, attachment checks, and protected
+   categories.
+2. For Trash rescue, the sorter exports **bounded review packets** (subject,
+   sender, snippet, a short body excerpt, and the sorter's reasons) — never
+   Gmail credentials, OAuth tokens, or direct mailbox access.
+3. The local model returns a decision such as `keep_trash` or `rescue_review`
+   with a confidence. Both the heuristic and the model must agree before a
+   permanent-delete manifest is produced.
 
-The sorter first applies normal Python rules: sender/domain signals, Gmail labels, unsubscribe headers, promotional language, attachment checks, and protected categories. The local model is a second reviewer for bounded Trash rescue packets.
+## Model roles
 
-The local model does not receive Gmail credentials, OAuth tokens, or direct mailbox access. It sees a small JSON-style packet with the fields needed for review, then returns a decision such as `keep_trash` or `rescue_review`.
-
-## Current Model Roles
-
-| Role | Model | Why it is used |
+| Role | Model | Why |
 | --- | --- | --- |
-| Mailbox review | Qwen3.6-35B-A3B-MTP | Fast enough for thousands of bounded review calls and strong enough for implementation-style classification. |
-| Reasoning fallback | DeepSeek-R1-Distill-Qwen-32B | Kept in the broader stack for deeper reasoning checks. |
-| Planner/architect | Gemma 4 26B MoE / 12B fallback | Kept outside the mailbox pipeline for architecture and planning work. |
+| Mailbox review | Qwen3.6-35B-A3B-MTP | Fast enough for thousands of bounded review calls; strong on implementation-style classification. |
+| Reasoning fallback | DeepSeek-R1-Distill-Qwen-32B | Deeper reasoning checks in the broader stack. |
+| Planner/architect | Gemma 4 26B MoE | Kept outside the mailbox pipeline for architecture and planning. |
 
-## Benchmark To Keep With The AI Stack
+## Recorded benchmark (2026-07-05)
 
-The live 2026-07-05 Qwen3.6 Trash rescue run produced:
+The live Qwen3.6 Trash rescue run:
 
 - 6,531 reviewed rows
-- 10,309,912 prompt tokens
-- 846,873 generated tokens
-- 549.96 average prompt tok/sec
-- 90.92 average generation tok/sec
+- 10,309,912 prompt tokens · 846,873 generated tokens
+- 549.96 avg prompt tok/sec · 90.92 avg generation tok/sec
 - 85.03% weighted draft-token acceptance
 
-The CSV lives in the AI stack repo:
+The benchmark CSV lives in the AI stack repo at
+`benchmarks/gmail-sorter-local-llm-summary-2026-07-05.csv`. Per-message
+prompt/result files are not committed because they may contain private mailbox
+metadata.
 
-```text
-benchmarks/gmail-sorter-local-llm-summary-2026-07-05.csv
-```
-
-Per-message prompt/result files are intentionally not committed because they may contain private mailbox metadata.

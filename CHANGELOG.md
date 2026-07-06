@@ -1,5 +1,113 @@
 # Changelog
 
+## 0.6.0 - 2026-07-06
+
+### 🧠 Embedding Pre-Classifier (Hybrid Keyword + Semantic)
+
+- New `--use-embeddings` flag enables an optional semantic classification layer. Each message's subject + body excerpt is embedded into a dense vector and compared to per-category centroid vectors learned from past high-confidence decisions.
+- The final category confidence is `max(keyword_score, embedding_similarity * 100)` — the keyword rules provide the explainable floor, the embedding provides the semantic ceiling. This catches semantic matches the lexical rules miss (e.g. a bank statement with no "bank" keyword still embeds close to the Finance centroid).
+- Two backends: HTTP endpoint (local LLM server's `/v1/embeddings`) or sentence-transformers (offline). Falls back to keyword-only when neither is available.
+- Per-category centroids are stored in a new `category_centroid` SQLite table and updated after each scan from decisions at or above `--embedding-confidence-floor` (default 70). A category needs at least 3 high-confidence messages before a centroid is created.
+- All vector math is pure Python (no numpy dependency). Embeddings are not reversible — they do not contain readable email content.
+- New module: `src/sorter/embeddings.py` (embedding client, centroid management, cosine similarity).
+- New CLI flags: `--use-embeddings`, `--embedding-endpoint`, `--embedding-model`, `--embedding-st-model`, `--embedding-confidence-floor`.
+
+### 📚 Documentation
+
+- README updated with the embedding pre-classifier in the labeling model section and CLI reference.
+- HANDOVER.md Section 13 (architectural suggestions) updated: item A (embedding pre-classifier) is now marked as **implemented**.
+
+### 🧪 Tests
+
+- 51 tests passing. Added 6 embedding regression tests: cosine similarity math, embedding scores with mock backend, embedding boost on keyword miss, embedding never lowers keyword score, fallback to keyword-only, and empty-backend handling.
+
+## 0.5.2 - 2026-07-06
+
+### 🐛 Bug Fixes
+
+- **B1: Keyword overlaps.** 8 keywords appeared in 2 categories simultaneously (e.g. "study permit" in both Immigration and Studies, "university" in both Studies and Work School). Now each keyword belongs to exactly one category, with the more specific/protected category winning. Verified: zero overlaps across all `CATEGORY_RULES`.
+- **B2: Subject/body split.** `categorize_with_confidence()` was calling `keyword_hits` on the combined `searchable` string, so subject hits were re-counted as body hits and the dead-code `15 * max(0, ...)` term was always 0. Now accepts `subject`, `body_text`, and `sender_text` as truly separate fields and scores correctly (subject: 30, body: 20, sender: 15).
+
+### ✨ Labeling Improvements
+
+- **Q1: Shopping suppressed under Ads.** When Ads Promotions confidence ≥ 65, Shopping is dropped as redundant. Records `shopping_suppressed_under_ads` in `negative_reasons`.
+- **Q3: Thread-aware labeling.** New `--use-thread-aware` flag. `load_thread_dominant_categories()` builds a thread_id → dominant_category map from existing SQLite decisions. In `decide()`, when a message lands in a catch-all (Review), it inherits the thread's dominant category at confidence 55. Never overrides a real keyword match or protected category.
+- **Q7: Enriched AI review packets.** Packets now include `available_categories` (the full vocabulary), `sender_past_categories` (from profiles), and `thread_dominant_category` — context that helps the AI make better suggestions.
+
+### 📚 Documentation
+
+- README restructured into a clean 12-section layout with a full CLI reference and the AI-assisted review section.
+- HANDOVER.md extended with two new sections: "How the script works" (end-to-end flow + why keyword rules, not embeddings) and "Architectural improvement suggestions" (embedding pre-classifier, trained classifier, thread modeling, sender reputation, calibration, module split).
+
+### 🧪 Tests
+
+- 45 tests passing. Added overlap-check, Shopping suppression, thread-aware inheritance (and non-override), and enriched-packet regression tests.
+
+## 0.5.1 - 2026-07-06
+
+### 🎯 Per-Category Confidence and Label Caps
+
+- `categorize_with_confidence()` returns a 0–100 confidence per category. Categories below `--label-confidence` (default 50) are dropped unless protected/priority. `--max-labels-per-message` (default 3) caps applied labels; protected buckets are always kept. Adds `category_confidence` to `Decision`.
+
+### 🧹 Body Cleaning
+
+- `clean_body_text()` strips quoted reply chains, forwarded blocks, and footer/signature lines before category matching. A reply that quotes a promotional email is no longer misclassified as promo, and a long unsubscribe footer does not dominate the body. Unsubscribe link extraction still uses the raw body so footer URLs survive.
+
+### 🔄 Relabel Workflow Improvements
+
+- `--relabel-since-date` and `--relabel-label` restrict a relabel stage to a slice (by date or current Sorter label) without a full rescan.
+- `--undo-relabel <run_id>` reverses a relabel run by swapping recorded adds/removes back. Each relabel apply records previous labels + run_id in the action ledger. Dry-run without `--apply`.
+- `--relabel-run-id` resumes an interrupted relabel apply by skipping messages already recorded in the ledger for that run.
+
+### ⚡ Body-Feature Cache Reuse
+
+- `load_body_features_index()` precomputes cached body features; the worker fetches metadata-only for messages with cached features (when not `--refresh-existing`), and `decide()` reuses the cached body category hits so categorization stays body-aware without a re-fetch.
+
+### 📚 Documentation Overhaul
+
+- Rewrote the README into a standard, well-structured document: quick start, relabel workflow, labeling model, configuration, project layout, safety model, caps table, and performance controls.
+- Cleaned up and consolidated the docs/ notes.
+
+### 🧪 Tests
+
+- 36 tests passing. Added regression coverage for confidence/cap behavior, body cleaning, undo relabel, resume-via-ledger, and cached-body-feature reuse.
+
+## 0.5.0 - 2026-07-06
+
+### 🏷️ Relabel Stage (read body, remove stale labels, re-apply)
+
+- New `--stage relabel`. It reads each message's current `Sorter/*` labels, diffs them against the freshly computed desired categories, and issues one `batchModify` per group carrying both `addLabelIds` and `removeLabelIds`.
+- Only labels in the `Sorter/` namespace are ever removed; user-created and Gmail system labels are never touched. A message that now only lands in a catch-all bucket has its stale `Sorter` labels cleared.
+- Dry-run by default; `--apply` required to change Gmail. Each relabel is recorded in the action ledger.
+- `--prune-empty-labels` deletes `Sorter/*` labels that no longer have any messages after a relabel apply.
+- `manifests/relabel_manifest.json` writes a before→after preview using the live label list (works in dry-run).
+- New dashboard "Relabel Review" section.
+
+### 📖 Body-Aware Scanning
+
+- New `--scan {metadata,full}`. In `full` mode the worker fetches `format=full` and `decide()` decodes a bounded slice of the body text and feeds it to `categorize()`, so labels can be assigned from body/header/footer content, not only subject+snippet. Ad confidence is still scored on headers+subject+snippet so a long promotional body does not inflate the trash score.
+- Records `body_len` and `body_category_hits` per Decision and caches compact derived features (body length, category names hit in the body, unsubscribe count) in a new `message_features` SQLite table. Raw body text is never persisted, so a re-run can reuse body-derived features without re-fetching Gmail.
+
+### 🧠 Sender→Category Profiles
+
+- Added a `sender_profile` SQLite table accumulated from high-confidence and protected decisions. A precomputed profile index is consulted in `decide()` to add a category the subject keywords missed, so a re-run on an already-labeled mailbox self-improves: the first pass teaches the profile, the second pass uses it to fix keyword misses.
+- New flags `--use-sender-profiles`/`--no-sender-profiles`, `--sender-profile-min-weight`, `--sender-profile-floor`.
+
+### 🐛 Word-Boundary Keyword Matching
+
+- `keyword_hits()` applies `\b` boundaries to word-like keywords and escaped substring matching to punctuation keywords. Fixes the substring bug that mislabeled mail: `exam` no longer matches `example.com`, `class` no longer matches `classification`, `sale` no longer matches `salon`. `categorize()`, `score_ad()`, and `is_perfect_ad_match()` switched to the new matcher.
+
+### 🏗️ Architecture
+
+- Split policy data and pure keyword matching into a `sorter/` package: `sorter/policy.py` (keyword lists, rules, precedence, defaults), `sorter/keywords.py` (word-boundary matcher), `sorter/config_loader.py` (optional `config/policy.yaml` overrides). `gmail_sorter.py` re-exports these names so `trash_rescue_audit.py`, `apply_domain_trash_policy.py`, and the tests keep working unchanged.
+- Optional `config/policy.yaml` lets you override keyword groups and thresholds without editing code (requires PyYAML; falls back to built-in defaults if absent).
+- Added `logging` throughout with a per-run log file under `data/runs/`.
+- Added `SCHEMA_VERSION = 1` and a `schema_version` field on `Decision`/progress rows to support future migrations.
+
+### 🧪 Tests
+
+- 29 tests passing. Added regression coverage for word-boundary matching, sender-profile-assisted categorization, body-aware categorization, the relabel label diff (stale removal, user-label safety, empty-desired clear, no-op when correct), and empty-label pruning.
+
 ## 0.4.0 - 2026-07-06
 
 ### 📦 Safer Archive Stage

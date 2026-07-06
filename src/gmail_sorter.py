@@ -17,6 +17,7 @@ import base64
 import csv
 import html
 import json
+import logging
 import re
 import socket
 import sqlite3
@@ -31,225 +32,46 @@ from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
+# Policy data and pure keyword matching live in the sorter package so the
+# cleanup rules can be edited and config-driven without touching Gmail I/O or
+# apply paths. These names are re-exported here for backwards compatibility with
+# the companion scripts (trash_rescue_audit, apply_domain_trash_policy) and the
+# tests, which all do `import gmail_sorter`.
+from sorter import policy
+from sorter.keywords import compile_keywords, contains_any, keyword_hits, regex_hits
+from sorter.config_loader import apply_overrides, load_policy_overrides
+from sorter.embeddings import compute_embedding_scores, cosine_similarity
 
-READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
-MAIL_SCOPE = "https://mail.google.com/"
-DEFAULT_QUERY = "before:2025/12/30 -in:trash"
-ROOT_LABEL = "Sorter"
+
+# Re-export policy names for backwards compatibility.
+READONLY_SCOPE = policy.READONLY_SCOPE
+MODIFY_SCOPE = policy.MODIFY_SCOPE
+MAIL_SCOPE = policy.MAIL_SCOPE
+DEFAULT_QUERY = policy.DEFAULT_QUERY
+ROOT_LABEL = policy.ROOT_LABEL
+NON_LABEL_CATEGORIES = policy.NON_LABEL_CATEGORIES
+BULK_MAIL_REASONS = policy.BULK_MAIL_REASONS
+AD_SUBJECT_KEYWORDS = policy.AD_SUBJECT_KEYWORDS
+AD_BODY_KEYWORDS = policy.AD_BODY_KEYWORDS
+AD_SENDER_KEYWORDS = policy.AD_SENDER_KEYWORDS
+STRONG_PROMO_SUBJECT_PATTERNS = policy.STRONG_PROMO_SUBJECT_PATTERNS
+PROMO_SENDER_LOCALPARTS = policy.PROMO_SENDER_LOCALPARTS
+TRANSACTIONAL_KEYWORDS = policy.TRANSACTIONAL_KEYWORDS
+IMPORTANT_LABELS = policy.IMPORTANT_LABELS
+PROTECTED_CATEGORIES = policy.PROTECTED_CATEGORIES
+IMMIGRATION_KEYWORDS = policy.IMMIGRATION_KEYWORDS
+STUDIES_KEYWORDS = policy.STUDIES_KEYWORDS
+CATEGORY_RULES = policy.CATEGORY_RULES
+PRIMARY_CATEGORY_PRECEDENCE = policy.PRIMARY_CATEGORY_PRECEDENCE
+
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 VERSION_CODE = "20260706"
+SCHEMA_VERSION = 1
+log = logging.getLogger("sorter")
 
-# Catch-all categories that describe "we did not learn anything useful" rather
-# than a real filing decision. Labeling every message with these just clutters
-# the mailbox with Sorter/Review and Sorter/Updates on generic mail, so they are
-# tracked for the dashboard but never turned into an applied Gmail label.
-NON_LABEL_CATEGORIES = {"Review", "Updates"}
 
-# Independent bulk-mail signals. Archive now requires real evidence that a
-# message is machine-sent bulk mail, not just a subject line that happens to
-# score high. This is the same evidence family perfect_ad_match relies on, but
-# used as an archive gate so one-off high-scoring mail is not pulled from the
-# inbox.
-BULK_MAIL_REASONS = {
-    "gmail_category_promotions",
-    "list_unsubscribe_header",
-    "one_click_unsubscribe_header",
-    "list_id_header",
-    "bulk_or_list_precedence",
-    "campaign_header",
-    "body_unsubscribe_link",
-}
 
-# These keyword groups are policy inputs, not throwaway search terms. A message
-# only becomes trash-eligible when promotional evidence wins against the
-# protection rules below.
-AD_SUBJECT_KEYWORDS = [
-    "sale",
-    "deal",
-    "deals",
-    "discount",
-    "promo",
-    "promotion",
-    "coupon",
-    "offer",
-    "limited time",
-    "save ",
-    "% off",
-    "free shipping",
-    "clearance",
-    "flash sale",
-    "black friday",
-    "cyber monday",
-    "newsletter",
-    "new arrivals",
-    "just dropped",
-    "shop now",
-    "last chance",
-    "ends tonight",
-    "exclusive",
-]
-
-AD_BODY_KEYWORDS = [
-    "unsubscribe",
-    "manage preferences",
-    "email preferences",
-    "view in browser",
-    "view this email in your browser",
-    "you are receiving this email because",
-    "marketing email",
-    "promotional email",
-    "privacy policy",
-]
-
-AD_SENDER_KEYWORDS = ["newsletter", "marketing", "promo", "promotions", "offers", "deals"]
-
-STRONG_PROMO_SUBJECT_PATTERNS = [
-    r"\b\d{1,2}%\s*off\b",
-    r"\b\d{1,2}\s*percent\s*off\b",
-    r"\b(?:last chance|final hours|ends tonight|today only)\b",
-    r"\b(?:flash sale|clearance|warehouse sale|summer sale|winter sale)\b",
-    r"\b(?:black friday|cyber monday|boxing day)\b",
-    r"\b(?:free shipping|free delivery)\b",
-    r"\b(?:shop now|new arrivals|just dropped)\b",
-]
-
-PROMO_SENDER_LOCALPARTS = {
-    "deals",
-    "email",
-    "hello",
-    "info",
-    "marketing",
-    "newsletter",
-    "newsletters",
-    "offers",
-    "promo",
-    "promotions",
-    "sales",
-}
-
-TRANSACTIONAL_KEYWORDS = [
-    "2fa",
-    "account alert",
-    "appointment",
-    "bank",
-    "bill",
-    "booking",
-    "code",
-    "confirm your email",
-    "delivery",
-    "document",
-    "e-transfer",
-    "invoice",
-    "login",
-    "mfa",
-    "order",
-    "password",
-    "payment",
-    "payroll",
-    "receipt",
-    "refund",
-    "reset",
-    "security",
-    "shipment",
-    "shipped",
-    "statement",
-    "tax",
-    "ticket",
-    "transaction",
-    "verification",
-    "verify",
-]
-
-IMPORTANT_LABELS = {"CATEGORY_PRIMARY", "STARRED", "IMPORTANT"}
-# Protected categories are the hard stop list. If a message lands here, it can
-# still be labeled for review, but it should not be archived or trashed.
-PROTECTED_CATEGORIES = {
-    "Account Security",
-    "Finance",
-    "Government Legal",
-    "Health",
-    "Insurance",
-    "Priority Attachments",
-    "Priority Immigration",
-    "Priority Studies",
-    "Receipts Orders",
-    "Utilities",
-    "Work School"  # Added
-}
-
-IMMIGRATION_KEYWORDS = [
-    "immigration",
-    "ircc",
-    "cic",
-    "visa",
-    "work permit",
-    "study permit",
-    "permanent residence",
-    "pr card",
-    "express entry",
-    "biometrics",
-    "lawyer",
-    "law firm",
-    "legal counsel",
-    "barrister",
-    "solicitor",
-    "marolia",
-    "pinaz",
-    "tiffani",
-    "ronen",
-    "raquel",
-    "jemma",
-    "jonalyn",
-    "oskoii",
-    "oskooii",
-    "oskoui",
-    "osgoode",
-]
-
-STUDIES_KEYWORDS = [
-    "university",
-    "college",
-    "course",
-    "class",
-    "assignment",
-    "tuition",
-    "transcript",
-    "diploma",
-    "degree",
-    "registrar",
-    "student",
-    "student record",
-    "academic",
-    "study permit",
-    "enrolment",
-    "enrollment",
-    "exam",
-    "grade",
-    "syllabus",
-]
-
-CATEGORY_RULES = [
-    ("Priority Immigration", IMMIGRATION_KEYWORDS, []),
-    ("Priority Studies", STUDIES_KEYWORDS, []),
-    ("Finance", ["bank", "credit card", "debit", "statement", "payment", "payroll", "invoice", "tax", "cra", "irs", "etransfer", "e-transfer"], []),
-    ("Receipts Orders", ["receipt", "order", "purchase", "shipment", "shipped", "delivered", "delivery", "tracking", "refund", "return"], []),
-    ("Account Security", ["password", "reset", "verification", "verify", "security alert", "new login", "sign-in", "2fa", "mfa", "authentication", "code"], []),
-    ("Travel", ["flight", "airline", "hotel", "reservation", "booking", "boarding", "itinerary", "rental car", "airbnb", "uber", "lyft"], []),
-    ("Health", ["appointment", "clinic", "doctor", "dentist", "pharmacy", "prescription", "medical", "health", "uhn", "myuhn", "hospital", "specialist"], []),
-    ("Government Legal", ["government", "court", "legal", "visa", "immigration", "passport", "license", "notice"], []),
-    ("Work School", ["meeting", "calendar", "deadline", "project", "assignment", "university", "college", "school", "course", "class"], []),
-    ("Social", ["facebook", "instagram", "linkedin", "twitter", "x.com", "reddit", "discord", "snapchat", "tiktok"], []),
-    ("Subscriptions", ["subscription", "renewal", "membership", "plan", "trial", "billing cycle"], []),
-    ("Shopping", ["cart", "wishlist", "store", "shop", "retailer", "coupon", "discount"], []),
-    ("Job Search", ["application", "resume", "interview", "recruiter", "job alert", "candidate", "position"], []),
-    ("Housing", ["rent", "lease", "landlord", "tenant", "mortgage", "property", "apartment", "condo"], ["hospital", "clinic", "health network"]),
-    ("Utilities", ["utility", "hydro", "internet", "mobile", "phone bill", "electricity", "gas bill"], []),
-    ("Insurance", ["insurance", "policy", "claim", "premium", "coverage"], []),
-    ("Crypto Finance Risk", ["crypto", "bitcoin", "ethereum", "wallet", "exchange", "trading"], []),
-    ("Old Account Evidence", ["welcome to", "confirm your account", "activate your account", "account created", "username", "registered"], []),
-]
 
 
 @dataclass
@@ -283,6 +105,7 @@ class Decision:
     existing_labels: list[str] = field(default_factory=list)
     categories: list[str] = field(default_factory=list)
     primary_category: str = ""
+    category_confidence: dict[str, int] = field(default_factory=dict)
     ad_confidence: int = 0
     reasons: list[str] = field(default_factory=list)
     negative_reasons: list[str] = field(default_factory=list)
@@ -293,6 +116,8 @@ class Decision:
     attachment_count: int = 0
     inline_attachment_count: int = 0
     message_size_estimate: int = 0
+    body_len: int = 0
+    body_category_hits: list[str] = field(default_factory=list)
     list_unsubscribe: str = ""
     body_unsubscribe_links: list[str] = field(default_factory=list)
     attachment_names: list[str] = field(default_factory=list)
@@ -302,6 +127,7 @@ class Decision:
     review_priority: str = "normal"
     action_done: str = "no"
     scanned_at: str = ""
+    schema_version: int = SCHEMA_VERSION
 
 
 class AdaptiveThrottle:
@@ -487,14 +313,6 @@ def parse_date(raw_date: str, internal_date: str | None) -> str:
     return ""
 
 
-def contains_any(text: str, keywords: list[str]) -> list[str]:
-    lowered = text.lower()
-    return [keyword for keyword in keywords if keyword in lowered]
-
-
-def regex_hits(text: str, patterns: list[str]) -> list[str]:
-    lowered = text.lower()
-    return [pattern for pattern in patterns if re.search(pattern, lowered)]
 
 
 def sender_localpart(sender_email: str) -> str:
@@ -548,9 +366,78 @@ def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000) -> str:
     return "\n".join(chunks)[:max_chars]
 
 
-def extract_body_unsubscribe_links(payload: dict[str, Any], limit: int = 20) -> list[str]:
-    # Keep reports privacy-light: inspect transient body text, persist only scrubbed unsubscribe targets.
-    body_text = html.unescape(collect_body_text(payload))
+# Footer/signature markers that carry no classification signal. A line matching
+# these starts a footer block that is dropped before category matching so a
+# promotional footer under a real reply does not flip the message into Ads.
+FOOTER_MARKERS = [
+    "unsubscribe",
+    "manage preferences",
+    "email preferences",
+    "you are receiving this",
+    "sent from my iphone",
+    "sent from my ipad",
+    "sent from my android",
+    "sent from my blackberry",
+    "get outlook for android",
+    "get outlook for ios",
+    "this email and any attachments",
+    "confidentiality notice",
+    "disclaimer:",
+    "regards,",
+    "-- ",
+    "_",
+]
+
+# A quoted-reply line in plain text starts with one or more '>'. A top forwarded
+# block usually starts with "----- Original Message -----" or "On ... wrote:".
+_QUOTED_LINE_RE = re.compile(r"^\s*>+")
+_FORWARD_HEADER_RE = re.compile(r"^\s*-{2,}\s*(Original Message|Forwarded message)\s*-{2,}", re.IGNORECASE)
+_ON_WROTE_RE = re.compile(r"^\s*on .+wrote:\s*$", re.IGNORECASE)
+
+
+def clean_body_text(body_text: str, keep_chars: int = 8000) -> str:
+    """Strip quoted reply chains, forwarded blocks, and footer signatures.
+
+    The cleaned text is what the category rules see, so a reply that quotes a
+    promotional email is not misclassified as promo, and a long unsubscribe
+    footer under a real message does not dominate the body. Unsubscribe link
+    extraction still uses the raw body, so footer URLs are not lost.
+    """
+
+    if not body_text:
+        return ""
+    lines = body_text.splitlines()
+    kept: list[str] = []
+    in_forward_block = False
+    for line in lines:
+        if _FORWARD_HEADER_RE.match(line):
+            in_forward_block = True
+            continue
+        if in_forward_block:
+            # A forwarded block ends at the first blank line after headers, but
+            # to be safe we drop until we leave the quoted region entirely.
+            if _QUOTED_LINE_RE.match(line) or _ON_WROTE_RE.match(line):
+                continue
+            in_forward_block = False
+        if _QUOTED_LINE_RE.match(line) or _ON_WROTE_RE.match(line):
+            continue
+        # Once we hit a footer marker, drop the rest of this block.
+        lowered = line.strip().lower()
+        if any(lowered.startswith(marker) or lowered == marker for marker in FOOTER_MARKERS):
+            break
+        kept.append(line)
+    cleaned = "\n".join(kept).strip()
+    return cleaned[:keep_chars]
+
+
+def find_unsubscribe_links_in_text(body_text: str, limit: int = 20) -> list[str]:
+    """Scrub unsubscribe/preference URLs out of already-decoded body text.
+
+    Kept separate from payload walking so a caller that already collected body
+    text (for categorization) can reuse it instead of decoding the payload a
+    second time.
+    """
+
     if not body_text:
         return []
     candidates = re.findall(r"""https?://[^\s"'<>\\)]+|mailto:[^\s"'<>\\)]+""", body_text, flags=re.IGNORECASE)
@@ -568,6 +455,12 @@ def extract_body_unsubscribe_links(payload: dict[str, Any], limit: int = 20) -> 
         if len(links) >= limit:
             break
     return links
+
+
+def extract_body_unsubscribe_links(payload: dict[str, Any], limit: int = 20) -> list[str]:
+    # Keep reports privacy-light: inspect transient body text, persist only scrubbed unsubscribe targets.
+    body_text = html.unescape(collect_body_text(payload))
+    return find_unsubscribe_links_in_text(body_text, limit)
 
 
 def payload_has_attachment(payload: dict[str, Any]) -> bool:
@@ -654,6 +547,15 @@ def is_before_year(message_date: str, year: int) -> bool:
     try:
         return int(message_date[:4]) < year
     except ValueError:
+        return False
+
+
+def _date_le(message_date: str, cutoff_iso: str) -> bool:
+    """Return True when message_date (YYYY-MM-DD) is on or before cutoff."""
+
+    try:
+        return message_date[:10] <= cutoff_iso[:10]
+    except Exception:
         return False
 
 
@@ -764,9 +666,9 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
         reasons.append("campaign_header")
 
     for prefix, hits, weight, cap in [
-        ("sender", contains_any(sender, AD_SENDER_KEYWORDS), 8, 25),
-        ("subject", contains_any(subject, AD_SUBJECT_KEYWORDS), 10, 35),
-        ("snippet", contains_any(snippet, AD_BODY_KEYWORDS), 12, 30),
+        ("sender", keyword_hits(sender, AD_SENDER_KEYWORDS), 8, 25),
+        ("subject", keyword_hits(subject, AD_SUBJECT_KEYWORDS), 10, 35),
+        ("snippet", keyword_hits(snippet, AD_BODY_KEYWORDS), 12, 30),
     ]:
         if hits:
             score += min(cap, weight * len(hits))
@@ -784,7 +686,7 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
 
     # Transactional words pull the score down. A receipt or account alert from a
     # promotional sender is still a durable record.
-    negative_hits = contains_any(searchable, TRANSACTIONAL_KEYWORDS)
+    negative_hits = keyword_hits(searchable, TRANSACTIONAL_KEYWORDS)
     if negative_hits:
         score -= min(70, 18 * len(negative_hits))
         negative_reasons.extend(f"transactional:{hit}" for hit in negative_hits)
@@ -827,9 +729,9 @@ def is_perfect_ad_match(
         ]
     )
     promo_content_signals = (
-        len(contains_any(subject, AD_SUBJECT_KEYWORDS))
+        len(keyword_hits(subject, AD_SUBJECT_KEYWORDS))
         + len(regex_hits(subject, STRONG_PROMO_SUBJECT_PATTERNS))
-        + len(contains_any(snippet, AD_BODY_KEYWORDS))
+        + len(keyword_hits(snippet, AD_BODY_KEYWORDS))
     )
     disqualifiers = {
         "allowlisted_sender_or_domain",
@@ -848,64 +750,96 @@ def is_perfect_ad_match(
     )
 
 
-def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[str]:
-    """Assign dashboard labels from evidence; this does not apply Gmail labels."""
+def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence: int, sender_profile_cats: dict[str, int] | None = None, subject: str = "", body_text: str = "", sender_text: str = "") -> dict[str, int]:
+    """Return {category: confidence 0-100} from evidence.
 
-    categories: list[str] = []
+    Confidence is the policy input that lets the relabel/label stages apply only
+    meaningful categories instead of every keyword that happened to hit. A
+    category that matches only one weak keyword scores low and can be dropped by
+    a --label-confidence floor, while a protected bucket that matches several
+    keywords plus a sender profile scores high and is kept.
+
+    Scoring model (intentionally simple and explainable):
+      - subject keyword hits: 30 each (strong signal — the sender chose these words)
+      - body keyword hits: 20 each (weaker — body text is longer and noisier)
+      - sender/domain keyword hits: 15 each (sender metadata)
+      - keyword family capped at 75
+      - a Gmail CATEGORY_* label for the bucket adds 30
+      - a sender-profile hit adds the learned weight (capped at 25)
+      - Ads Promotions / Newsletters Bulk derive their confidence from the ad
+        confidence / promotions label directly
+
+    subject, body_text, and sender_text are separate so the scorer can weight a
+    keyword hit in the subject line higher than one buried in the body. When
+    they are empty, the combined ``searchable`` string is used as a fallback so
+    older callers still work.
+    """
+
+    categories: dict[str, int] = {}
     if ad_confidence >= 65:
-        categories.append("Ads Promotions")
+        categories["Ads Promotions"] = ad_confidence
     elif "CATEGORY_PROMOTIONS" in labels:
-        categories.append("Newsletters Bulk")
-    for rule in CATEGORY_RULES:
-        name = rule[0]
-        keywords = rule[1]
-        exclusions = rule[2] if len(rule) > 2 else []
+        categories["Newsletters Bulk"] = 60
 
-        # Only add category if:
-        # 1. Any keyword is found
-        # 2. No exclusion pattern is present
-        if contains_any(searchable, keywords) and not contains_any(searchable, exclusions):
-            categories.append(name)
-    if "CATEGORY_SOCIAL" in labels:
-        categories.append("Social")
-    if "CATEGORY_UPDATES" in labels and not categories:
-        categories.append("Updates")
+    # Map Gmail CATEGORY_* labels to sorter categories for a confidence boost.
+    gmail_category_boost = {
+        "CATEGORY_UPDATES": {"Account Security", "Finance", "Receipts Orders", "Utilities", "Subscriptions"},
+        "CATEGORY_SOCIAL": {"Social"},
+        "CATEGORY_FORUMS": {"Forums"},
+    }
+
+    profile_cats = sender_profile_cats or {}
+    # Use the separated fields when available; fall back to the combined
+    # searchable string for older callers that don't pass them.
+    subject_field = subject if subject else searchable
+    body_field = body_text if body_text else ""
+    sender_field = sender_text if sender_text else searchable
+    for name, keywords, exclusions in CATEGORY_RULES:
+        if exclusions and keyword_hits(searchable, exclusions):
+            continue
+        # Score keyword hits by where they appear: subject > body > sender.
+        subject_hits = keyword_hits(subject_field, keywords)
+        body_hits = keyword_hits(body_field, keywords) if body_field else []
+        sender_hits = keyword_hits(sender_field, keywords) if sender_field else []
+        # A keyword that appears in both subject and body counts once, at the
+        # higher (subject) weight.
+        all_hits = list(dict.fromkeys(subject_hits + body_hits + sender_hits))
+        if not all_hits:
+            continue
+        body_only = [h for h in body_hits if h not in subject_hits]
+        sender_only = [h for h in sender_hits if h not in subject_hits and h not in body_hits]
+        keyword_score = min(75, 30 * len(subject_hits) + 20 * len(body_only) + 15 * len(sender_only))
+        category_label_score = 0
+        for gmail_label, buckets in gmail_category_boost.items():
+            if gmail_label in labels and name in buckets:
+                category_label_score = 30
+                break
+        profile_score = min(25, profile_cats.get(name, 0))
+        categories[name] = min(100, keyword_score + category_label_score + profile_score)
+
+    if "CATEGORY_SOCIAL" in labels and "Social" not in categories:
+        categories["Social"] = 60
     if "CATEGORY_FORUMS" in labels:
-        categories.append("Forums")
+        categories["Forums"] = max(categories.get("Forums", 0), 60)
+    if "CATEGORY_UPDATES" in labels and not categories:
+        categories["Updates"] = 50
     if not categories:
-        categories.append("Review")
-    return sorted(set(categories))
+        categories["Review"] = 30
+    return categories
 
 
-# Precedence used to choose a single primary category. Protected/priority
-# buckets win so the primary label reflects the safest, most specific filing
-# decision instead of an arbitrary alphabetical pick.
-PRIMARY_CATEGORY_PRECEDENCE = [
-    "Priority Immigration",
-    "Priority Studies",
-    "Priority Attachments",
-    "Account Security",
-    "Finance",
-    "Government Legal",
-    "Health",
-    "Insurance",
-    "Receipts Orders",
-    "Utilities",
-    "Work School",
-    "Travel",
-    "Housing",
-    "Job Search",
-    "Subscriptions",
-    "Crypto Finance Risk",
-    "Old Account Evidence",
-    "Shopping",
-    "Social",
-    "Forums",
-    "Ads Promotions",
-    "Newsletters Bulk",
-    "Updates",
-    "Review",
-]
+def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[str]:
+    """Assign dashboard labels from evidence; this does not apply Gmail labels.
+
+    Kept as a thin wrapper over :func:`categorize_with_confidence` for callers
+    that only want the category names.
+    """
+
+    return sorted(categorize_with_confidence(searchable, labels, ad_confidence).keys())
+
+
+# Precedence used to choose a single primary category is imported from
+# sorter.policy (PRIMARY_CATEGORY_PRECEDENCE) so it can be config-driven.
 
 
 def pick_primary_category(categories: list[str]) -> str:
@@ -937,19 +871,139 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     snippet = message.get("snippet", "")
     message_date = parse_date(headers.get("date", ""), message.get("internalDate"))
     searchable = " ".join([sender, sender_domain, subject, snippet])
+    # Body-aware scanning: when the payload is fetched with format=full
+    # (--scan full), include a bounded slice of the decoded body in the text the
+    # category rules see. This lets categorization use the email body, header,
+    # footer, and unsubscribe evidence instead of only the subject and snippet.
+    # Ad confidence is intentionally still scored on headers+subject+snippet so
+    # a long promotional body does not inflate the trash score.
+    body_text = html.unescape(collect_body_text(payload))
+    body_len = len(body_text)
+    category_searchable = searchable
+    body_included = bool(body_len) and getattr(args, "scan", "metadata") == "full"
+    cached_body: dict[str, Any] = {}
+    if not body_included and getattr(args, "scan", "metadata") == "full":
+        # No fresh body in this payload (metadata-only fetch used the cache).
+        # Reuse the cached body category hits so categorization is still
+        # body-aware without a re-fetch.
+        cached_index = getattr(args, "cached_body_features", {}) or {}
+        cached_body = cached_index.get(message.get("id", ""), {})
+        if cached_body:
+            body_len = cached_body.get("body_len", 0)
+            body_included = True
     ad_confidence, reasons, negative_reasons = score_ad(headers, labels, sender, sender_domain, subject, snippet, config)
+    if body_included:
+        # Use the cleaned body (quotes/footers stripped) for categorization so a
+        # reply that quotes a promo email is not misclassified. Unsubscribe link
+        # extraction below still uses the raw body_text so footer URLs survive.
+        if body_text:
+            category_searchable = f"{searchable}\n{clean_body_text(body_text)}"
+            reasons.append(f"body_included:{body_len}")
+        elif cached_body:
+            for hit_cat in cached_body.get("body_category_hits", []):
+                reasons.append(f"cached_body:{hit_cat}")
+    body_hit_categories = sorted(body_category_hits(body_text).keys()) if body_included and body_text else (cached_body.get("body_category_hits", []) if cached_body else [])
     age_boost = age_score_boost(message_date)
     if age_boost and ad_confidence >= args.ad_threshold:
         ad_confidence = min(100, ad_confidence + age_boost)
         reasons.append(f"older_mail_boost:{age_boost}")
-    categories = categorize(searchable, labels, ad_confidence)
+    # Sender history feeds both categorization confidence (a learned weight
+    # boosts a matched category) and a fallback that surfaces a category the
+    # subject keywords missed entirely.
+    profile_cats: dict[str, int] = {}
+    if getattr(args, "use_sender_profiles", True):
+        profile_index = getattr(args, "sender_profiles", {}) or {}
+        profile_cats = sender_profile_categories_from_index(profile_index, sender_email, registered_domain)
+    category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats, subject=subject, body_text=clean_body_text(body_text) if body_included else "", sender_text=f"{sender} {sender_domain}")
+    # Embedding-based semantic scoring (hybrid). When an embedding backend is
+    # available and centroids have been learned, compute the cosine similarity
+    # between this message's text and each category centroid. The embedding
+    # score can *boost* a category the keyword rules scored low on, but never
+    # *lowers* a keyword score — it's max(keyword, embedding). This catches
+    # semantic matches the lexical rules miss (e.g. a bank statement with no
+    # "bank" keyword still embeds close to the Finance centroid). Falls back
+    # to keyword-only when no backend is available.
+    embedding_backend = getattr(args, "_embedding_backend", None)
+    category_centroids = getattr(args, "category_centroids", {}) or {}
+    if embedding_backend and category_centroids:
+        embed_text = f"{subject} {snippet}"
+        if body_included and body_text:
+            embed_text += f" {clean_body_text(body_text)[:2000]}"
+        embed_scores = compute_embedding_scores(embed_text, category_centroids, embedding_backend)
+        for cat, sim in embed_scores.items():
+            if cat in NON_LABEL_CATEGORIES:
+                continue
+            emb_conf = int(sim * 100)
+            if emb_conf > category_confidence.get(cat, 0):
+                category_confidence[cat] = emb_conf
+                if emb_conf >= getattr(args, "label_confidence", 50):
+                    reasons.append(f"embedding_boost:{cat}:{sim:.2f}")
+    # Merge body-derived category hits from a previous full scan when this run
+    # used the cache (metadata-only fetch). Cached hits let categorization stay
+    # body-aware without re-fetching the body.
+    if body_hit_categories and cached_body:
+        for hit_cat in body_hit_categories:
+            if hit_cat in NON_LABEL_CATEGORIES:
+                continue
+            category_confidence[hit_cat] = max(category_confidence.get(hit_cat, 0), 60)
+    # Merge sender-profile-only categories that the keyword rules missed.
+    min_profile_weight = getattr(args, "sender_profile_min_weight", 6)
+    for category, weight in profile_cats.items():
+        if category in NON_LABEL_CATEGORIES or category in category_confidence:
+            continue
+        if weight >= min_profile_weight:
+            category_confidence[category] = min(100, weight)
+            reasons.append(f"sender_profile:{category}:{weight}")
     has_attachment = payload_has_attachment(payload)
     real_attachment_count, inline_attachment_count = attachment_counts(payload)
     has_real_attachment = real_attachment_count > 0
     if has_real_attachment:
-        categories.append("Priority Attachments")
-        categories = sorted(set(categories))
-    body_unsubscribe_links = extract_body_unsubscribe_links(payload)
+        category_confidence["Priority Attachments"] = 100
+    # Q1: Suppress Shopping when Ads Promotions is high-confidence — it's
+    # redundant to tag a promo email with both Ads Promotions and Shopping.
+    if "Ads Promotions" in category_confidence and category_confidence["Ads Promotions"] >= 65:
+        if "Shopping" in category_confidence:
+            del category_confidence["Shopping"]
+            negative_reasons.append("shopping_suppressed_under_ads")
+    # Apply the confidence floor and per-message cap. Protected/priority buckets
+    # are always kept (safety first), and the primary category is always kept so
+    # the dashboard's single-label view never loses its anchor.
+    label_confidence = getattr(args, "label_confidence", 0)
+    max_labels = getattr(args, "max_labels_per_message", 0)
+    always_keep = PROTECTED_CATEGORIES | {"Ads Promotions", "Newsletters Bulk"}
+    kept: list[tuple[str, int]] = []
+    dropped: list[str] = []
+    for name, conf in sorted(category_confidence.items(), key=lambda kv: kv[1], reverse=True):
+        if name in NON_LABEL_CATEGORIES or name in always_keep or conf >= label_confidence:
+            kept.append((name, conf))
+        else:
+            dropped.append(f"{name}:{conf}")
+    if max_labels and len(kept) > max_labels:
+        protected_kept = [(n, c) for n, c in kept if n in always_keep]
+        optional = [(n, c) for n, c in kept if n not in always_keep]
+        optional.sort(key=lambda kv: kv[1], reverse=True)
+        allowed_optional = optional[: max(0, max_labels - len(protected_kept))]
+        for name, conf in optional[len(allowed_optional):]:
+            dropped.append(f"{name}:cap")
+        kept = protected_kept + allowed_optional
+    if dropped:
+        negative_reasons.append(f"low_confidence_labels:{','.join(dropped)}")
+    categories = sorted(name for name, _ in kept)
+    category_confidence_kept = {name: conf for name, conf in kept}
+    # Q3: Thread-aware labeling. If the message landed in a catch-all (Review)
+    # and --use-thread-aware is on, inherit the thread's dominant category from
+    # past decisions. This fixes replies in a Finance/Immigration thread that
+    # have no category keywords of their own. Never overrides a real keyword
+    # match or a protected category; only fills the catch-all gap.
+    if getattr(args, "use_thread_aware", False) and set(categories).issubset(NON_LABEL_CATEGORIES):
+        thread_map = getattr(args, "thread_dominant_categories", {}) or {}
+        thread_id = message.get("threadId", "")
+        dominant = thread_map.get(thread_id, "")
+        if dominant and dominant not in NON_LABEL_CATEGORIES:
+            categories = sorted(set(categories) | {dominant})
+            category_confidence_kept[dominant] = 55
+            reasons.append(f"thread_inherited:{dominant}")
+    body_unsubscribe_links = find_unsubscribe_links_in_text(body_text) if body_included else extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
     # This is the main safety gate. A protected message can still be reported
     # and labeled, but archive/trash actions are removed before apply.
@@ -1060,6 +1114,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         existing_labels=labels,
         categories=categories,
         primary_category=primary_category,
+        category_confidence=category_confidence_kept,
         ad_confidence=ad_confidence,
         reasons=reasons,
         negative_reasons=negative_reasons,
@@ -1070,6 +1125,8 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         attachment_count=real_attachment_count,
         inline_attachment_count=inline_attachment_count,
         message_size_estimate=int(message.get("sizeEstimate") or 0),
+        body_len=body_len,
+        body_category_hits=body_hit_categories,
         list_unsubscribe=headers.get("list-unsubscribe", ""),
         body_unsubscribe_links=body_unsubscribe_links,
         attachment_names=attachment_names,
@@ -1122,6 +1179,10 @@ def decision_from_dict(data: dict[str, Any]) -> Decision:
     data.setdefault("attachment_count", 1 if data.get("has_real_attachment") else 0)
     data.setdefault("inline_attachment_count", 0)
     data.setdefault("message_size_estimate", 0)
+    data.setdefault("body_len", 0)
+    data.setdefault("body_category_hits", [])
+    data.setdefault("category_confidence", {})
+    data.setdefault("schema_version", 0)
     if "primary_category" not in data:
         data["primary_category"] = pick_primary_category(data.get("categories", []) or [])
     data.setdefault("archive_reason", "")
@@ -1200,8 +1261,372 @@ def open_state_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sender_profile (
+            key TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            category TEXT NOT NULL,
+            hits INTEGER NOT NULL DEFAULT 0,
+            protected_hits INTEGER NOT NULL DEFAULT 0,
+            last_seen TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sender_profile_kind ON sender_profile(kind, category)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_features (
+            message_id TEXT PRIMARY KEY,
+            body_len INTEGER NOT NULL DEFAULT 0,
+            body_category_hits_json TEXT NOT NULL DEFAULT '[]',
+            body_unsubscribe_count INTEGER NOT NULL DEFAULT 0,
+            scan_mode TEXT NOT NULL DEFAULT 'metadata',
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS category_centroid (
+            category TEXT PRIMARY KEY,
+            embedding_json TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
+
+
+def sender_profile_key(kind: str, value: str) -> str:
+    return f"{kind}:{value.lower()}"
+
+
+def load_sender_profile_index(conn: sqlite3.Connection | None, min_hits: int = 3) -> dict[str, dict[str, int]]:
+    """Precompute a sender/domain -> {category: weight} index for the scan.
+
+    decide() runs in worker threads without DB access, so the index is built
+    once before the scan and consulted via args.sender_profiles. Sender rows
+    outweigh domain rows so a specific address beats a noisy domain.
+    """
+
+    index: dict[str, dict[str, int]] = defaultdict(dict)
+    if conn is None:
+        return {}
+    for kind, weight in (("sender", 3), ("domain", 1)):
+        cur = conn.execute(
+            "SELECT key, category, hits FROM sender_profile WHERE kind=? AND hits>=?",
+            (kind, min_hits),
+        )
+        for key, category, hits in cur.fetchall():
+            index[key][category] += hits * weight
+    return {key: dict(cats) for key, cats in index.items()}
+
+
+def load_thread_dominant_categories(conn: sqlite3.Connection | None, progress: dict[str, Decision] | None = None) -> dict[str, str]:
+    """Build a thread_id -> dominant_category map from existing decisions.
+
+    Used by --use-thread-aware to propagate a thread's dominant category to
+    replies that would otherwise land in a catch-all (Review). Only non-catch-all
+    categories with confidence >= 50 contribute. The dominant category is the
+    one with the highest total confidence across the thread's known messages.
+    """
+
+    dominant: dict[str, str] = {}
+    if conn is None:
+        return dominant
+    try:
+        cur = conn.execute(
+            "SELECT thread_id, categories_json, ad_confidence, protected FROM messages"
+        )
+        thread_cats: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for thread_id, cats_json, ad_conf, protected in cur.fetchall():
+            try:
+                cats = json.loads(cats_json or "[]")
+            except json.JSONDecodeError:
+                continue
+            for cat in cats:
+                if cat in NON_LABEL_CATEGORIES:
+                    continue
+                weight = 2 if protected else 1
+                thread_cats[thread_id][cat] += weight
+        for thread_id, cats in thread_cats.items():
+            if cats:
+                dominant[thread_id] = max(cats.items(), key=lambda kv: kv[1])[0]
+    except sqlite3.OperationalError:
+        pass
+    return dominant
+
+
+def sender_profile_categories_from_index(index: dict[str, dict[str, int]], sender_email: str, registered_domain: str) -> dict[str, int]:
+    """Look up learned categories for a sender/domain from the precomputed index."""
+
+    weighted: dict[str, int] = defaultdict(int)
+    for kind, value in (("sender", sender_email), ("domain", registered_domain)):
+        if not value:
+            continue
+        for category, weight in index.get(sender_profile_key(kind, value), {}).items():
+            weighted[category] += weight
+    return dict(weighted)
+
+
+def body_category_hits(body_text: str) -> dict[str, list[str]]:
+    """Return {category: [matched keywords]} found in the body text only.
+
+    Used to cache which category rules the body satisfied so a re-run can reuse
+    the body-derived features without re-fetching the message from Gmail.
+    """
+
+    hits: dict[str, list[str]] = {}
+    if not body_text:
+        return hits
+    for name, keywords, _exclusions in CATEGORY_RULES:
+        matched = keyword_hits(body_text, keywords)
+        if matched:
+            hits[name] = matched
+    return hits
+
+
+def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Decision], scan_mode: str) -> None:
+    """Cache compact, privacy-light body features per message.
+
+    Only the body length, the category keyword names that hit in the body, and
+    the unsubscribe count are stored. Raw body text is never persisted.
+    """
+
+    if conn is None or not decisions:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for item in decisions:
+        if not item.body_len:
+            continue
+        rows.append(
+            (
+                item.message_id,
+                item.body_len,
+                json.dumps(item.body_category_hits, ensure_ascii=False),
+                len(item.body_unsubscribe_links),
+                scan_mode,
+                now,
+            )
+        )
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO message_features (message_id, body_len, body_category_hits_json, body_unsubscribe_count, scan_mode, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            body_len=excluded.body_len,
+            body_category_hits_json=excluded.body_category_hits_json,
+            body_unsubscribe_count=excluded.body_unsubscribe_count,
+            scan_mode=excluded.scan_mode,
+            updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def load_body_features_index(conn: sqlite3.Connection | None) -> dict[str, dict[str, Any]]:
+    """Precompute a message_id -> body-features index for cache-skip scans.
+
+    When --scan full is used without --refresh-existing, the worker can fetch
+    metadata-only for messages whose body features are already cached, saving
+    Gmail quota. decide() then consults this index to apply the cached body
+    category hits so categorization is still body-aware without re-fetching.
+    """
+
+    index: dict[str, dict[str, Any]] = {}
+    if conn is None:
+        return index
+    cur = conn.execute(
+        "SELECT message_id, body_len, body_category_hits_json, body_unsubscribe_count FROM message_features WHERE scan_mode='full'"
+    )
+    for message_id, body_len, hits_json, unsub_count in cur.fetchall():
+        try:
+            hits = json.loads(hits_json or "[]")
+        except json.JSONDecodeError:
+            hits = []
+        index[message_id] = {
+            "body_len": int(body_len or 0),
+            "body_category_hits": list(hits),
+            "body_unsubscribe_count": int(unsub_count or 0),
+        }
+    return index
+
+
+def load_category_centroids(conn: sqlite3.Connection | None) -> dict[str, list[float]]:
+    """Load per-category centroid embeddings from SQLite.
+
+    Centroids are average embedding vectors learned from past high-confidence
+    decisions. Used by the embedding pre-classifier to compute semantic
+    similarity scores for each category.
+    """
+
+    centroids: dict[str, list[float]] = {}
+    if conn is None:
+        return centroids
+    try:
+        cur = conn.execute("SELECT category, embedding_json, dimension FROM category_centroid")
+        for category, emb_json, dim in cur.fetchall():
+            try:
+                vec = json.loads(emb_json or "[]")
+                if vec and len(vec) == dim:
+                    centroids[category] = [float(x) for x in vec]
+            except (json.JSONDecodeError, TypeError):
+                continue
+    except sqlite3.OperationalError:
+        pass
+    return centroids
+
+
+def update_category_centroids(
+    conn: sqlite3.Connection | None,
+    decisions: list[Decision],
+    backend: Any,
+    confidence_floor: int = 70,
+    max_messages_per_category: int = 500,
+) -> int:
+    """Recompute per-category centroid embeddings from high-confidence decisions.
+
+    For each category, collects messages with that category at confidence >=
+    floor, embeds their subject + body excerpt, averages the vectors, and stores
+    the centroid in SQLite. Returns the number of centroids updated.
+
+    Only categories with at least 3 high-confidence messages get a centroid, so
+    a new category doesn't get a noisy centroid from one message.
+    """
+
+    if conn is None or backend is None:
+        return 0
+    from sorter.embeddings import average_vectors
+
+    # Group messages by category.
+    cat_messages: dict[str, list[str]] = defaultdict(list)
+    for item in decisions:
+        for cat, conf in item.category_confidence.items():
+            if cat in NON_LABEL_CATEGORIES:
+                continue
+            if conf >= confidence_floor:
+                text = f"{item.subject} {item.snippet}"
+                if item.body_category_hits:
+                    text += f" {' '.join(item.body_category_hits)}"
+                cat_messages[cat].append(text[:2000])
+
+    now = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    for category, texts in cat_messages.items():
+        if len(texts) < 3:
+            continue
+        # Cap the number of messages embedded per category to avoid unbounded
+        # growth on very large mailboxes.
+        sample = texts[:max_messages_per_category]
+        vectors = []
+        for text in sample:
+            vec = backend.embed(text)
+            if vec:
+                vectors.append(vec)
+        if len(vectors) < 3:
+            continue
+        centroid = average_vectors(vectors)
+        if not centroid:
+            continue
+        conn.execute(
+            """
+            INSERT INTO category_centroid (category, embedding_json, dimension, message_count, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(category) DO UPDATE SET
+                embedding_json=excluded.embedding_json,
+                dimension=excluded.dimension,
+                message_count=excluded.message_count,
+                updated_at=excluded.updated_at
+            """,
+            (category, json.dumps(centroid, ensure_ascii=False), len(centroid), len(vectors), now),
+        )
+        updated += 1
+    conn.commit()
+    return updated
+
+
+def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Decision], confidence_floor: int = 65) -> None:
+    """Accumulate high-confidence category decisions per sender/domain.
+
+    Profiles are learned only from decisions at or above confidence_floor so
+    borderline guesses do not poison the sender history. Protected messages
+    still contribute their category (immigration/studies/etc.) because those
+    are exactly the labels we want to remember for a sender.
+    """
+
+    if conn is None or not decisions:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for item in decisions:
+        if not item.categories or item.ad_confidence < confidence_floor and not item.protected:
+            continue
+        for category in item.categories:
+            if category in NON_LABEL_CATEGORIES:
+                continue
+            for kind, value in (("sender", item.sender_email), ("domain", item.registered_domain or item.sender_domain)):
+                if not value:
+                    continue
+                rows.append(
+                    (
+                        sender_profile_key(kind, value),
+                        kind,
+                        category,
+                        1,
+                        1 if item.protected else 0,
+                        item.date or now[:10],
+                        now,
+                    )
+                )
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO sender_profile (key, kind, category, hits, protected_hits, last_seen, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            hits=sender_profile.hits+excluded.hits,
+            protected_hits=sender_profile.protected_hits+excluded.protected_hits,
+            last_seen=MAX(sender_profile.last_seen, excluded.last_seen),
+            updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def sender_profile_categories(conn: sqlite3.Connection | None, sender_email: str, registered_domain: str, min_hits: int = 3) -> dict[str, int]:
+    """Return {category: weight} a sender/domain has been labeled as before.
+
+    Sender-level hits outweigh domain-level hits so a single noisy domain does
+    not override a specific address. Returns an empty dict when there is no
+    usable history, so callers can fall back to keyword classification.
+    """
+
+    if conn is None:
+        return {}
+    weighted: dict[str, int] = defaultdict(int)
+    for kind, value, weight in (("sender", sender_email, 3), ("domain", registered_domain, 1)):
+        if not value:
+            continue
+        cur = conn.execute(
+            "SELECT category, hits FROM sender_profile WHERE key=? AND hits>=?",
+            (sender_profile_key(kind, value), min_hits),
+        )
+        for category, hits in cur.fetchall():
+            weighted[category] += hits * weight
+    return dict(weighted)
 
 
 def upsert_state_decisions(conn: sqlite3.Connection | None, decisions: list[Decision]) -> None:
@@ -1409,13 +1834,20 @@ def scan_messages(
 
     def worker(message_id: str) -> tuple[str, Decision | None, str | None]:
         try:
+            cached_index = getattr(args, "cached_body_features", {}) or {}
+            # When a previous full scan cached this message's body features and
+            # the user did not ask for a full refresh, fetch metadata-only and
+            # let decide() reapply the cached body category hits. This avoids a
+            # costly format=full fetch per message on re-runs.
+            full_fetch = args.attachment_details or getattr(args, "scan", "metadata") == "full"
+            use_cache = full_fetch and message_id in cached_index and not getattr(args, "refresh_existing", False)
             message = get_message_metadata(
                 service_for_thread(),
                 message_id,
                 args.retries,
                 args.retry_sleep,
                 throttle,
-                args.attachment_details,
+                full_fetch and not use_cache,
             )
             return message_id, decide(message, args, config), None
         except Exception as error:
@@ -1535,6 +1967,230 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
             upsert_state_decisions(state_conn, chunk)
             if batch_index == 1 or batch_index == batch_count or batch_index % args.apply_progress_every == 0:
                 print(f"Applied label/archive batch {batch_index}/{batch_count}...", flush=True)
+
+
+def write_relabel_manifest(path: Path, decisions: list[Decision], service: Any, args: argparse.Namespace) -> None:
+    """Write a before->after relabel preview without applying anything.
+
+    Uses each message's current Sorter labels (captured at scan time) and the
+    freshly computed desired categories. Works in dry-run because it only reads
+    the existing label list; labels that do not exist yet are reported as adds.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    id_to_name: dict[str, str] = {}
+    if service is not None:
+        name_to_id = list_labels(service, args.retries, args.retry_sleep)
+        id_to_name = {lid: name for name, lid in name_to_id.items()}
+    sorter_label_ids = {lid for lid, name in id_to_name.items() if name.startswith(f"{ROOT_LABEL}/")}
+    rows = []
+    for item in decisions:
+        current = sorted(id_to_name[lid] for lid in item.existing_labels if lid in sorter_label_ids)
+        desired = sorted(f"{ROOT_LABEL}/{category}" for category in labelable_categories(item.categories))
+        add = sorted(set(desired) - set(current))
+        remove = sorted(set(current) - set(desired))
+        if add or remove or current:
+            rows.append(
+                {
+                    "message_id": item.message_id,
+                    "date": item.date,
+                    "sender_domain": item.sender_domain,
+                    "subject": item.subject,
+                    "primary_category": item.primary_category,
+                    "current_sorter_labels": current,
+                    "desired_sorter_labels": desired,
+                    "add_labels": add,
+                    "remove_labels": remove,
+                }
+            )
+    payload = {
+        "stage": "relabel",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "message_count": len(rows),
+        "items": rows,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def list_labels(service: Any, retries: int, retry_sleep: float) -> dict[str, str]:
+    """Return {label_name: label_id} for all user labels."""
+
+    existing = execute_with_retries(service.users().labels().list(userId="me"), retries, retry_sleep).get("labels", [])
+    return {label.get("name", ""): label.get("id", "") for label in existing}
+
+
+def compute_relabel_plan(item: Decision, sorter_label_ids: set[str], desired_name_to_id: dict[str, str]) -> tuple[set[str], set[str]]:
+    """Diff a message's current Sorter labels against the desired set.
+
+    Returns (add_ids, remove_ids). Only labels in the Sorter/ namespace are
+    ever removed; user-created and Gmail system labels are never touched. The
+    desired set is empty for messages that only land in catch-all buckets, so a
+    relabel pass clears stale Sorter labels off generic mail.
+    """
+
+    current_sorter = {lid for lid in item.existing_labels if lid in sorter_label_ids}
+    desired_ids = set(desired_name_to_id.values())
+    return desired_ids - current_sorter, current_sorter - desired_ids
+
+
+def apply_relabel(service: Any, decisions: list[Decision], args: argparse.Namespace, state_conn: sqlite3.Connection | None = None) -> None:
+    """Remove stale Sorter/* labels and apply the corrected set in one pass.
+
+    This is the re-run path for a mailbox the sorter already labeled once. It
+    uses each message's current Sorter labels (captured at scan time) and the
+    freshly computed desired categories, then issues one batchModify per group
+    carrying both addLabelIds and removeLabelIds. Non-Sorter labels are never
+    touched, and protected messages are still labeled (just correctly).
+    """
+
+    started = time.monotonic()
+    name_to_id = list_labels(service, args.retries, args.retry_sleep)
+    sorter_label_ids = {lid for name, lid in name_to_id.items() if name.startswith(f"{ROOT_LABEL}/")}
+
+    desired_categories = sorted({category for item in decisions for category in labelable_categories(item.categories)})
+    desired_names = [f"{ROOT_LABEL}/{category}" for category in desired_categories]
+    created = get_or_create_labels(service, desired_names, args.retries, args.retry_sleep)
+    name_to_id.update(created)
+
+    planned: list[tuple[Decision, set[str], set[str]]] = []
+    run_id = getattr(args, "relabel_run_id", "") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    already_applied = load_relabel_run_applied(state_conn, run_id)
+    skipped = 0
+    for item in decisions:
+        if item.message_id in already_applied:
+            skipped += 1
+            item.action_done = "yes"
+            continue
+        desired_name_to_id = {f"{ROOT_LABEL}/{category}": created[f"{ROOT_LABEL}/{category}"] for category in labelable_categories(item.categories)}
+        add_ids, remove_ids = compute_relabel_plan(item, sorter_label_ids, desired_name_to_id)
+        if add_ids or remove_ids:
+            planned.append((item, add_ids, remove_ids))
+
+    grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[Decision]] = {}
+    for item, add_ids, remove_ids in planned:
+        grouped.setdefault((tuple(sorted(add_ids)), tuple(sorted(remove_ids))), []).append(item)
+
+    batch_count = sum((len(items) + args.batch_size - 1) // args.batch_size for items in grouped.values())
+    print(
+        f"Relabel plan: {len(planned)} messages need label changes in {batch_count} batchModify calls; "
+        f"{len(desired_categories)} target Sorter labels.",
+        flush=True,
+    )
+
+    batch_index = 0
+    id_to_name = {lid: name for name, lid in name_to_id.items()}
+    if skipped:
+        print(f"Relabel resume: skipping {skipped} messages already applied in run_id={run_id}.", flush=True)
+    for (add_ids, remove_ids), items in grouped.items():
+        for start in range(0, len(items), args.batch_size):
+            batch_index += 1
+            chunk = items[start : start + args.batch_size]
+            body: dict[str, list[str]] = {"ids": [item.message_id for item in chunk]}
+            if add_ids:
+                body["addLabelIds"] = list(add_ids)
+            if remove_ids:
+                body["removeLabelIds"] = list(remove_ids)
+            execute_with_retries(service.users().messages().batchModify(userId="me", body=body), args.retries, args.retry_sleep)
+            for item in chunk:
+                item.action_done = "yes"
+                previous = sorted(id_to_name.get(lid, lid) for lid in item.existing_labels if lid in sorter_label_ids)
+                detail = json.dumps({"run_id": run_id, "removed": sorted(remove_ids), "added": sorted(add_ids), "previous_labels": previous}, ensure_ascii=False)
+                record_action_ledger(state_conn, args.stage, "relabel", item.message_id, status="success", detail=detail)
+            upsert_state_decisions(state_conn, chunk)
+            if batch_index == 1 or batch_index == batch_count or batch_index % args.apply_progress_every == 0:
+                print(f"Relabeled batch {batch_index}/{batch_count}...", flush=True)
+    print(f"Relabel run_id={run_id}. Undo with --undo-relabel {run_id}.", flush=True)
+
+
+def load_relabel_run_applied(conn: sqlite3.Connection | None, run_id: str) -> set[str]:
+    """Return message IDs already applied in a relabel run (for resume)."""
+
+    if conn is None or not run_id:
+        return set()
+    rows = conn.execute(
+        "SELECT message_id FROM action_ledger WHERE stage='relabel' AND action='relabel' AND detail LIKE ?",
+        (f'%"run_id": "{run_id}"%',),
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def undo_relabel(service: Any, run_id: str, args: argparse.Namespace, state_conn: sqlite3.Connection | None = None) -> int:
+    """Reverse a relabel run by swapping the recorded adds/removes back.
+
+    Reads the action_ledger rows for ``run_id``, restores each message's
+    previous Sorter labels (re-adding what was removed and removing what was
+    added), and records an ``undo_relabel`` ledger entry. Non-Sorter labels are
+    never touched. Requires --apply to change Gmail; otherwise prints a dry-run
+    preview.
+    """
+
+    if state_conn is None:
+        print("Undo requires the SQLite state database (not --disable-state-db).", file=sys.stderr)
+        return 2
+    rows = state_conn.execute(
+        "SELECT message_id, detail FROM action_ledger WHERE stage='relabel' AND action='relabel' AND detail LIKE ? ORDER BY id",
+        (f'%"run_id": "{run_id}"%',),
+    ).fetchall()
+    if not rows:
+        print(f"No relabel ledger rows found for run_id={run_id}.", file=sys.stderr)
+        return 1
+    name_to_id = list_labels(service, args.retries, args.retry_sleep)
+    id_to_name = {lid: name for name, lid in name_to_id.items()}
+    planned = 0
+    grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[str]] = {}
+    for message_id, detail_json in rows:
+        try:
+            detail = json.loads(detail_json or "{}")
+        except json.JSONDecodeError:
+            continue
+        # Reverse: undo adds by removing them, undo removes by re-adding them.
+        remove_ids = {lid for lid in detail.get("added", []) if lid in name_to_id.values()}
+        add_ids = {lid for lid in detail.get("removed", []) if lid in name_to_id.values()}
+        if not add_ids and not remove_ids:
+            continue
+        planned += 1
+        grouped.setdefault((tuple(sorted(add_ids)), tuple(sorted(remove_ids))), []).append(message_id)
+
+    batch_count = sum((len(ids) + args.batch_size - 1) // args.batch_size for ids in grouped.values())
+    print(f"Undo relabel run_id={run_id}: {planned} messages, {batch_count} batchModify calls.", flush=True)
+    if not args.apply:
+        print("DRY RUN: no Gmail changes. Re-run with --apply to undo.", flush=True)
+        return 0
+    batch_index = 0
+    for (add_ids, remove_ids), message_ids in grouped.items():
+        for start in range(0, len(message_ids), args.batch_size):
+            batch_index += 1
+            chunk = message_ids[start : start + args.batch_size]
+            body: dict[str, list[str]] = {"ids": chunk}
+            if add_ids:
+                body["addLabelIds"] = list(add_ids)
+            if remove_ids:
+                body["removeLabelIds"] = list(remove_ids)
+            execute_with_retries(service.users().messages().batchModify(userId="me", body=body), args.retries, args.retry_sleep)
+            for message_id in chunk:
+                record_action_ledger(state_conn, "relabel", "undo_relabel", message_id, status="success", detail=json.dumps({"undo_run_id": run_id}))
+            if batch_index == 1 or batch_index == batch_count or batch_index % args.apply_progress_every == 0:
+                print(f"Undo batch {batch_index}/{batch_count}...", flush=True)
+    print(f"Undone relabel run_id={run_id}.", flush=True)
+    return 0
+
+
+def prune_empty_sorter_labels(service: Any, retries: int, retry_sleep: float) -> list[str]:
+    """Delete Sorter/* labels that no longer have any messages."""
+
+    labels = execute_with_retries(service.users().labels().list(userId="me"), retries, retry_sleep).get("labels", [])
+    pruned: list[str] = []
+    for label in labels:
+        name = label.get("name", "")
+        if not name.startswith(f"{ROOT_LABEL}/"):
+            continue
+        if int(label.get("messagesTotal", 0) or 0) == 0:
+            try:
+                execute_with_retries(service.users().labels().delete(userId="me", id=label["id"]), retries, retry_sleep)
+                pruned.append(name)
+            except Exception as error:
+                print(f"Could not prune empty label {name}: {error}", file=sys.stderr)
+    return pruned
 
 
 def write_csv(path: Path, decisions: list[Decision]) -> None:
@@ -1754,6 +2410,150 @@ def load_manifest_ids(path: Path) -> set[str]:
 
     data = json.loads(path.read_text(encoding="utf-8"))
     return set(data.get("message_ids", []))
+
+
+# --- AI label review packet export/merge -------------------------------------
+#
+# The code classifies with keyword rules + sender profiles + confidence scoring.
+# That is fast and explainable, but it cannot understand context, intent, or
+# nuance the way a language model can. So low-confidence decisions are exported
+# as bounded review packets for an AI (local Qwen, Opencode, or any model) to
+# inspect, suggest corrections, and write back. The script then merges both
+# opinions before applying.
+#
+# Privacy: packets contain sender, subject, snippet, a bounded body excerpt
+# (max 1200 chars, quotes/footers stripped), and the code's decision + reasons.
+# They do NOT contain OAuth tokens, full body text, or attachment bytes.
+# Packets are written to data/ which is gitignored.
+
+AI_REVIEW_BODY_EXCERPT_CHARS = 1200
+
+
+def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: int, body_excerpt_chars: int = AI_REVIEW_BODY_EXCERPT_CHARS, sender_profiles: dict[str, dict[str, int]] | None = None, thread_dominant: dict[str, str] | None = None) -> int:
+    """Export low-confidence decisions as JSONL for AI label review.
+
+    A message is exported when its highest category confidence is below the
+    threshold, OR it landed in a catch-all bucket (Review/Updates), OR it has
+    conflicting non-protected categories. Messages at 100% confidence are
+    skipped — the code is sure, no AI review needed.
+
+    Packets are enriched with the full list of available categories (so the AI
+    knows the vocabulary), the sender's past categories (from profiles), and the
+    thread's dominant category — all context that helps the AI make a better
+    suggestion than the keyword rules alone.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The full category vocabulary the AI can choose from.
+    available_categories = sorted(
+        set(name for name, _, _ in CATEGORY_RULES)
+        | {"Ads Promotions", "Newsletters Bulk", "Review", "Updates", "Priority Attachments", "Social", "Forums"}
+    )
+    profiles = sender_profiles or {}
+    threads = thread_dominant or {}
+    packets: list[dict[str, Any]] = []
+    for item in decisions:
+        max_conf = max(item.category_confidence.values()) if item.category_confidence else 0
+        is_catchall = bool(NON_LABEL_CATEGORIES.intersection(item.categories))
+        has_conflict = len([c for c in item.categories if c not in NON_LABEL_CATEGORIES]) > 2
+        if max_conf >= 100 and not is_catchall:
+            continue
+        if max_conf >= threshold and not is_catchall and not has_conflict:
+            continue
+        # Build a bounded body excerpt from snippet + any cached body hits.
+        body_excerpt = item.snippet or ""
+        if item.body_category_hits:
+            body_excerpt += f"\n[body keywords: {', '.join(item.body_category_hits)}]"
+        body_excerpt = body_excerpt[:body_excerpt_chars]
+        # Enrich: sender's past categories from the profile index.
+        sender_past = sorted(
+            profiles.get(f"sender:{item.sender_email.lower()}", {}).keys()
+            | profiles.get(f"domain:{(item.registered_domain or item.sender_domain or '').lower()}", {}).keys()
+        ) if profiles else []
+        # Enrich: thread's dominant category.
+        thread_dominant_cat = threads.get(item.thread_id, "")
+        packets.append({
+            "message_id": item.message_id,
+            "thread_id": item.thread_id,
+            "date": item.date,
+            "sender": item.sender,
+            "sender_email": item.sender_email,
+            "sender_domain": item.sender_domain,
+            "registered_domain": item.registered_domain,
+            "subject": item.subject,
+            "body_excerpt": body_excerpt,
+            "code_categories": item.categories,
+            "code_primary_category": item.primary_category,
+            "code_confidence": item.category_confidence,
+            "code_reasons": item.reasons,
+            "code_negative_reasons": item.negative_reasons,
+            "protected": item.protected,
+            "has_attachment": item.has_attachment,
+            "has_real_attachment": item.has_real_attachment,
+            "list_unsubscribe": item.list_unsubscribe[:200] if item.list_unsubscribe else "",
+            "available_categories": available_categories,
+            "sender_past_categories": sender_past,
+            "thread_dominant_category": thread_dominant_cat,
+            "ai_label": "",
+            "ai_confidence": 0,
+            "ai_reason": "",
+            "ai_reviewed": False,
+        })
+    with path.open("w", encoding="utf-8") as file:
+        for packet in packets:
+            file.write(json.dumps(packet, ensure_ascii=False) + "\n")
+    return len(packets)
+
+
+def merge_ai_labels(decisions: list[Decision], path: Path, min_ai_confidence: float = 0.7) -> tuple[int, int]:
+    """Merge AI-reviewed labels back into decisions.
+
+    Reads the reviewed JSONL and adjusts a decision when the AI suggests a
+    different label with confidence >= min_ai_confidence (0-1). Protected
+    status is never removed — the AI can add a protected category but cannot
+    take one away. Returns (agreed, overridden) counts.
+    """
+
+    if not path.exists():
+        return 0, 0
+    ai_map: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            packet = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if packet.get("ai_reviewed") and packet.get("ai_label"):
+            ai_map[packet["message_id"]] = packet
+    agreed = 0
+    overridden = 0
+    for item in decisions:
+        packet = ai_map.get(item.message_id)
+        if not packet:
+            continue
+        ai_label = packet["ai_label"]
+        ai_conf = float(packet.get("ai_confidence", 0))
+        if ai_label in item.categories:
+            agreed += 1
+            continue
+        if ai_conf < min_ai_confidence:
+            continue
+        # AI suggests a different label. Apply it with a reason, but never
+        # remove a protected category the code already assigned.
+        if ai_label not in NON_LABEL_CATEGORIES and ai_label not in item.categories:
+            item.categories.append(ai_label)
+            item.categories = sorted(set(item.categories))
+            item.category_confidence[ai_label] = int(ai_conf * 100)
+            item.reasons.append(f"ai_override:{ai_label}:{ai_conf:.2f}")
+            # Re-pick primary if the AI's label is higher precedence.
+            new_primary = pick_primary_category(item.categories)
+            if new_primary != item.primary_category:
+                item.primary_category = new_primary
+            item.planned_actions = [f"label:{c}" for c in labelable_categories(item.categories)]
+            overridden += 1
+    return agreed, overridden
 
 
 def esc(value: Any) -> str:
@@ -2183,6 +2983,9 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 <h2 class="section-title">Archive Review</h2>
 <p class="note">Messages planned for archive now require an independent bulk-mail signal (List-Unsubscribe, List-Id, bulk precedence, campaign header, Gmail Promotions, or a body unsubscribe link), not just a high ad score. The archive reason column shows the evidence used.</p>
 {render_table(archive_items, ["date", "ad_confidence", "primary_category", "sender_domain", "subject", "archive_reason", "planned_actions"], 100)}
+<h2 class="section-title">Relabel Review</h2>
+<p class="note">When run with --stage relabel, the sorter removes stale Sorter/* labels and re-applies the corrected set computed from the latest scan (use --scan full for body-aware relabeling). This preview shows the desired primary/category and the planned label actions per message; the exact before/after diff is written to manifests/relabel_manifest.json.</p>
+{render_table(decisions, ["date", "primary_category", "sender_domain", "subject", "categories", "planned_actions", "body_len"], 100)}
 <h2 class="section-title">Header Unsubscribe Domains</h2>
 <p class="note">Separate section for List-Unsubscribe headers, grouped by sender domain and prioritized by ad confidence, volume, and last-seen date.</p>
 {render_unsubscribe_priority(unsubscribe_items, 20)}
@@ -2236,11 +3039,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--ad-threshold", type=int, default=65)
     parser.add_argument("--archive-threshold", type=int, default=65, help="Minimum ad confidence required to archive; archive also requires an independent bulk-mail signal.")
+    parser.add_argument("--label-confidence", type=int, default=50, help="Minimum per-category confidence to apply a label; categories below this are dropped unless protected/priority. 0 disables the floor.")
+    parser.add_argument("--max-labels-per-message", type=int, default=3, help="Cap applied Sorter labels per message; protected/priority buckets are always kept. 0 disables the cap.")
     parser.add_argument("--archive-min-age-days", type=int, default=0, help="Do not archive messages newer than this many days; 0 disables the recency guard.")
     parser.add_argument("--archive-skip-unread", action="store_true", help="Never archive messages that are still unread.")
     parser.add_argument("--trash-threshold", type=int, default=90)
     parser.add_argument("--pre-2020-trash-threshold", type=int, default=75)
-    parser.add_argument("--stage", choices=["classify", "label", "archive", "trash"], default="classify")
+    parser.add_argument("--stage", choices=["classify", "label", "archive", "trash", "relabel"], default="classify")
     parser.add_argument("--workers", type=int, default=8, help="Parallel read/classification workers. Writes remain sequential.")
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--sleep", type=float, default=0.05)
@@ -2263,7 +3068,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-archive-per-domain", type=int, default=0, help="Cap planned archive actions per registered domain; 0 disables the cap.")
     parser.add_argument("--max-archive-total", type=int, default=0, help="Cap total planned archive actions; 0 disables the cap.")
     parser.add_argument("--archive-canary-limit", type=int, default=0, help="When applying archive, only keep the first N archive actions in the apply set.")
+    parser.add_argument("--prune-empty-labels", action="store_true", help="After a relabel apply, delete Sorter/* labels that no longer have any messages.")
+    parser.add_argument("--relabel-since-date", default="", help="Restrict a relabel stage to messages on or before this YYYY-MM-DD date.")
+    parser.add_argument("--relabel-label", default="", help="Restrict a relabel stage to messages that currently carry this Sorter label (with or without the 'Sorter/' prefix).")
+    parser.add_argument("--undo-relabel", default="", help="Reverse a previous relabel run by its run_id (printed at the end of an apply). Use with --apply to actually undo; otherwise dry-run.")
+    parser.add_argument("--relabel-run-id", default="", help="Reuse a relabel run_id to resume an interrupted apply (skips messages already recorded in the ledger for that run).")
+    parser.add_argument("--export-ai-review", action="store_true", help="After scan, export low-confidence decisions as JSONL review packets for an AI model to inspect and suggest labels.")
+    parser.add_argument("--ai-review-threshold", type=int, default=75, help="Export decisions whose top category confidence is below this for AI review; 100-confidence messages are always skipped.")
+    parser.add_argument("--ai-review-file", default=str(PROJECT_DIR / "data" / "label_review_packets.jsonl"), help="Path to the AI review JSONL file (export and merge both use this path).")
+    parser.add_argument("--merge-ai-labels", action="store_true", help="Before apply, merge AI-reviewed labels from the review file back into decisions. The AI can add a label the code missed; protected status is never removed.")
+    parser.add_argument("--ai-merge-min-confidence", type=float, default=0.7, help="Minimum AI confidence (0-1) required to override the code's label with the AI's suggestion.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
+    parser.add_argument("--scan", choices=["metadata", "full"], default="metadata", help="metadata = headers+snippet (fast); full = also read decoded body text for body-aware categorization. full costs more Gmail quota and is meant for a relabel/re-scan pass.")
+    parser.add_argument("--use-sender-profiles", dest="use_sender_profiles", action="store_true", default=True, help="Use learned sender/domain category history to fix keyword misses (default on).")
+    parser.add_argument("--no-sender-profiles", dest="use_sender_profiles", action="store_false", help="Disable sender-profile-assisted categorization.")
+    parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
+    parser.add_argument("--sender-profile-floor", type=int, default=65, help="Only learn profiles from decisions at or above this ad confidence (protected mail always contributes).")
+    parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
+    parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
+    parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
+    parser.add_argument("--embedding-model", default="local", help="Model name for the HTTP embedding endpoint.")
+    parser.add_argument("--embedding-st-model", default="", help="sentence-transformers model name (e.g. all-MiniLM-L6-v2). Used when --embedding-endpoint is empty. Requires the sentence-transformers package.")
+    parser.add_argument("--embedding-confidence-floor", type=int, default=70, help="Only learn centroids from decisions at or above this confidence.")
     parser.add_argument("--apply", action="store_true", help="Actually modify Gmail for the selected stage.")
     parser.add_argument("--trash-obvious-ads", action="store_true", help="Allow trash actions during --stage trash.")
     parser.add_argument("--i-understand-trash", action="store_true", help="Required with --apply --stage trash --trash-obvious-ads.")
@@ -2273,6 +3099,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[logging.StreamHandler(sys.stderr)],
+    )
+    run_log = PROJECT_DIR / "data" / "runs" / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.log"
+    try:
+        run_log.parent.mkdir(parents=True, exist_ok=True)
+        logging.getLogger().addHandler(logging.FileHandler(run_log, encoding="utf-8"))
+        log.info("run log: %s", run_log)
+    except OSError:
+        log.warning("could not open run log at %s", run_log)
+    apply_overrides(load_policy_overrides(PROJECT_DIR / "config" / "policy.yaml"))
+    log.info("gmail-sorter %s (%s) schema_version=%s", APP_VERSION, VERSION_CODE, SCHEMA_VERSION)
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)
     args.apply_progress_every = max(1, args.apply_progress_every)
@@ -2317,15 +3157,61 @@ def main() -> int:
 
     progress_path = Path(args.progress_file)
     progress = load_progress(progress_path) if args.resume else {}
-    print(f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}")
+    args.sender_profiles = load_sender_profile_index(state_conn) if getattr(args, "use_sender_profiles", True) else {}
+    args.cached_body_features = load_body_features_index(state_conn) if getattr(args, "scan", "metadata") == "full" and not args.refresh_existing else {}
+    args.thread_dominant_categories = load_thread_dominant_categories(state_conn) if getattr(args, "use_thread_aware", False) else {}
+    # Embedding backend and centroids: optional semantic classification layer.
+    args._embedding_backend = None
+    args.category_centroids = {}
+    if getattr(args, "use_embeddings", False):
+        from sorter.embeddings import create_embedding_backend
+        args._embedding_backend = create_embedding_backend(
+            endpoint=getattr(args, "embedding_endpoint", ""),
+            model=getattr(args, "embedding_model", "local"),
+            st_model=getattr(args, "embedding_st_model", ""),
+        )
+        if args._embedding_backend is not None:
+            args.category_centroids = load_category_centroids(state_conn)
+            if args.category_centroids:
+                log.info("embedding backend active; %d category centroids loaded", len(args.category_centroids))
+            else:
+                log.info("embedding backend active but no centroids yet; will learn after this scan")
+        else:
+            log.warning("--use-embeddings requested but no backend available; falling back to keyword-only")
+    profile_count = len(args.sender_profiles)
+    cache_count = len(args.cached_body_features)
+    thread_count = len(args.thread_dominant_categories)
+    centroid_count = len(args.category_centroids)
+    print(
+        f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}"
+        + (f"; sender profiles loaded={profile_count}" if profile_count else "")
+        + (f"; cached body features={cache_count} (will fetch metadata-only for these)" if cache_count else "")
+        + (f"; thread-aware dominant categories={thread_count}" if thread_count else "")
+        + (f"; embedding centroids={centroid_count}" if centroid_count else "")
+    )
     progress = scan_messages(message_ids, progress, creds, build, args, config)
     save_progress(progress_path, progress)
 
     decisions = decisions_for_current_query(progress, message_ids)
     upsert_state_decisions(state_conn, decisions)
+    if getattr(args, "use_sender_profiles", True):
+        update_sender_profiles(state_conn, decisions, confidence_floor=args.sender_profile_floor)
+    if getattr(args, "scan", "metadata") == "full":
+        upsert_message_features(state_conn, decisions, scan_mode="full")
+    if getattr(args, "_embedding_backend", None) is not None:
+        updated = update_category_centroids(state_conn, decisions, args._embedding_backend, confidence_floor=args.embedding_confidence_floor)
+        if updated:
+            print(f"Updated {updated} category centroid embeddings.", flush=True)
     stale_progress_count = len(progress) - len(decisions)
     if stale_progress_count > 0:
         print(f"Ignoring {stale_progress_count} cached decisions outside the current query/report set.")
+
+    if getattr(args, "undo_relabel", ""):
+        code = undo_relabel(service, args.undo_relabel, args, state_conn)
+        if state_conn is not None:
+            state_conn.close()
+        return code
+
     if args.stage == "trash":
         protect_mixed_threads(service, decisions, args.retries, args.retry_sleep, args.thread_check_limit)
 
@@ -2334,12 +3220,39 @@ def main() -> int:
         decisions = [item for item in decisions if item.message_id in manifest_ids]
         print(f"Restricted apply/report set to {len(decisions)} messages from manifest: {args.manifest}")
 
+    if args.stage == "relabel":
+        before_filter = len(decisions)
+        if getattr(args, "relabel_since_date", ""):
+            try:
+                cutoff = datetime.fromisoformat(args.relabel_since_date).date()
+                decisions = [item for item in decisions if item.date and _date_le(item.date, cutoff.isoformat())]
+                print(f"Relabel filter --relabel-since-date {args.relabel_since_date}: {len(decisions)}/{before_filter} messages kept.")
+            except ValueError:
+                print(f"--relabel-since-date must be YYYY-MM-DD; got {args.relabel_since_date}", file=sys.stderr)
+                return 2
+        if getattr(args, "relabel_label", ""):
+            label_map = list_labels(service, args.retries, args.retry_sleep)
+            target_ids = {lid for name, lid in label_map.items() if name == args.relabel_label or name == f"{ROOT_LABEL}/{args.relabel_label}"}
+            if not target_ids:
+                print(f"--relabel-label '{args.relabel_label}' did not match any Gmail label.", file=sys.stderr)
+                return 2
+            decisions = [item for item in decisions if target_ids.intersection(item.existing_labels)]
+            print(f"Relabel filter --relabel-label '{args.relabel_label}': {len(decisions)}/{before_filter} messages kept.")
+
     if args.stage == "trash":
         apply_trash_policy_caps(decisions, args)
         upsert_state_decisions(state_conn, decisions)
 
     if args.stage in {"archive", "trash"}:
         apply_archive_policy_caps(decisions, args)
+        upsert_state_decisions(state_conn, decisions)
+
+    # Merge AI-reviewed labels before apply. The AI file is filled by a model
+    # between the export step and this run; see HANDOVER.md for the workflow.
+    if getattr(args, "merge_ai_labels", False):
+        ai_path = Path(getattr(args, "ai_review_file", ""))
+        agreed, overridden = merge_ai_labels(decisions, ai_path, min_ai_confidence=args.ai_merge_min_confidence)
+        print(f"AI label merge: {agreed} agreed, {overridden} overridden by AI suggestions.", flush=True)
         upsert_state_decisions(state_conn, decisions)
 
     if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
@@ -2359,6 +3272,17 @@ def main() -> int:
         save_progress(progress_path, progress)
         upsert_state_decisions(state_conn, decisions)
 
+    if args.apply and args.stage == "relabel" and decisions:
+        print(f"Applying relabel to {len(decisions)} messages (reading current Sorter/* labels and re-applying the corrected set)...", flush=True)
+        apply_relabel(service, decisions, args, state_conn)
+        if args.prune_empty_labels:
+            pruned = prune_empty_sorter_labels(service, args.retries, args.retry_sleep)
+            print(f"Pruned {len(pruned)} empty Sorter labels." + (f" {', '.join(pruned)}" if pruned else ""))
+        for item in decisions:
+            progress[item.message_id] = item
+        save_progress(progress_path, progress)
+        upsert_state_decisions(state_conn, decisions)
+
     decisions.sort(key=lambda item: (item.ad_confidence, item.date, item.sender_domain), reverse=True)
     out_prefix = Path(args.out_prefix)
     write_csv(out_prefix.with_suffix(".csv"), decisions)
@@ -2367,6 +3291,13 @@ def main() -> int:
     write_storage_report(out_prefix.with_name(out_prefix.name + "_storage.csv"), decisions)
     write_unsubscribe_report(out_prefix.with_name(out_prefix.name + "_unsubscribe.csv"), decisions)
     write_action_manifests(Path(args.manifest_dir), decisions)
+    if args.stage == "relabel":
+        write_relabel_manifest(Path(args.manifest_dir) / "relabel_manifest.json", decisions, service, args)
+    if getattr(args, "export_ai_review", False):
+        ai_path = Path(getattr(args, "ai_review_file", ""))
+        packet_count = export_ai_review_packets(ai_path, decisions, args.ai_review_threshold, sender_profiles=getattr(args, "sender_profiles", {}), thread_dominant=getattr(args, "thread_dominant_categories", {}))
+        print(f"Exported {packet_count} low-confidence decisions for AI review to {ai_path}", flush=True)
+        print("Fill ai_label/ai_confidence/ai_reason/ai_reviewed in that file, then re-run with --merge-ai-labels.", flush=True)
     review_dir = Path(args.review_dir) if args.review_dir else Path(args.manifest_dir) / "review"
     write_review_workflow(review_dir, decisions)
     write_dashboard(out_prefix.with_suffix(".html"), decisions, args)

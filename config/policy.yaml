@@ -1,0 +1,52 @@
+# Optional policy overrides for the Gmail sorter.
+#
+# This file is optional. The built-in defaults in sorter/policy.py are used when
+# this file is missing or when a key is absent. List keys replace the built-in
+# keyword group of the same name (lower-cased attribute name). Edit these to
+# tune classification without touching code.
+#
+# Example:
+#   immigration_keywords:
+#     - immigration
+#     - ircc
+#     - "new lawyer name"
+#   thresholds:
+#     ad_threshold: 70
+#     archive_threshold: 70
+#     trash_threshold: 95
+#     pre_2020_trash_threshold: 80
+#
+# Requires PyYAML only when this file is present and non-empty.
+immigration_keywords:
+  - immigration
+  - ircc
+  - cic
+  - visa
+  - "work permit"
+  - "study permit"
+  - "permanent residence"
+  - "pr card"
+  - "express entry"
+  - biometrics
+  - lawyer
+  - "law firm"
+  - "legal counsel"
+  - barrister
+  - solicitor
+  - marolia
+  - pinaz
+  - tiffani
+  - ronen
+  - raquel
+  - jemma
+  - jonalyn
+  - oskoii
+  - oskooii
+  - oskoui
+  - osgoode
+
+thresholds:
+  ad_threshold: 65
+  archive_threshold: 65
+  trash_threshold: 90
+  pre_2020_trash_threshold: 75
