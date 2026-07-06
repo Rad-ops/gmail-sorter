@@ -34,6 +34,8 @@ def args(**overrides):
         "undo_relabel": "",
         "relabel_since_date": "",
         "relabel_label": "",
+        "use_thread_aware": False,
+        "thread_dominant_categories": {},
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -786,6 +788,108 @@ class AIReviewPacketTests(unittest.TestCase):
             # AI can add Shopping but Priority Immigration must stay.
             self.assertIn("Priority Immigration", decisions[0].categories)
             self.assertTrue(decisions[0].protected)
+
+
+class LabelingImprovementsTests(unittest.TestCase):
+    """Tests for keyword overlap fix, Shopping suppression, thread-aware, enriched packets."""
+
+    def test_no_keyword_overlaps_between_categories(self):
+        # B1: No keyword should appear in more than one CATEGORY_RULES entry.
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "sorter"))
+        from policy import CATEGORY_RULES
+        seen = {}
+        for name, keywords, _ in CATEGORY_RULES:
+            for kw in keywords:
+                self.assertNotIn(kw, seen, f"Keyword {kw!r} in both {seen.get(kw)} and {name}")
+                seen[kw] = name
+
+    def test_shopping_suppressed_when_ads_promotions_high(self):
+        # Q1: A message with both Ads Promotions (>=65) and Shopping should
+        # drop Shopping as redundant.
+        msg = message(
+            payload(
+                {
+                    "From": "Shop <deals@shop.testmail.co>",
+                    "Subject": "50% off sale shop now discount coupon",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            labels=["CATEGORY_PROMOTIONS"],
+            snippet="flash sale clearance shop now free shipping",
+        )
+        item = gmail_sorter.decide(msg, args(label_confidence=0), gmail_sorter.Config())
+        self.assertIn("Ads Promotions", item.categories)
+        self.assertNotIn("Shopping", item.categories)
+        self.assertIn("shopping_suppressed_under_ads", item.negative_reasons)
+
+    def test_thread_aware_inherits_dominant_category(self):
+        # Q3: A reply with no category keywords that would land in Review
+        # should inherit the thread's dominant category. The sender domain is
+        # deliberately neutral so no keyword rule fires.
+        ns = args(use_thread_aware=True, thread_dominant_categories={"thread-1": "Finance"})
+        msg = message(
+            payload(
+                {
+                    "From": "Someone <someone@updates.testmail.co>",
+                    "Subject": "Re: hello",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="thanks for the update",
+        )
+        msg["threadId"] = "thread-1"
+        item = gmail_sorter.decide(msg, ns, gmail_sorter.Config())
+        self.assertIn("Finance", item.categories)
+        self.assertTrue(any(r.startswith("thread_inherited:Finance") for r in item.reasons))
+
+    def test_thread_aware_does_not_override_keyword_match(self):
+        # Q3: Thread-aware should not override a real keyword match.
+        ns = args(use_thread_aware=True, thread_dominant_categories={"thread-1": "Finance"})
+        msg = message(
+            payload(
+                {
+                    "From": "Clinic <clinic@health.testmail.co>",
+                    "Subject": "Your appointment and prescription",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="doctor dentist medical health appointment",
+        )
+        msg["threadId"] = "thread-1"
+        item = gmail_sorter.decide(msg, ns, gmail_sorter.Config())
+        self.assertIn("Health", item.categories)
+
+    def test_enriched_ai_packets_include_context(self):
+        # Q7: AI review packets should include available_categories,
+        # sender_past_categories, and thread_dominant_category.
+        import tempfile
+        decisions = [
+            gmail_sorter.Decision(
+                message_id="m1",
+                thread_id="t1",
+                date="2024-01-01",
+                sender="S <s@bank.testmail.co>",
+                sender_email="s@bank.testmail.co",
+                sender_domain="bank.testmail.co",
+                registered_domain="testmail.co",
+                subject="update",
+                snippet="hello",
+                categories=["Review"],
+                primary_category="Review",
+                category_confidence={"Review": 30},
+            )
+        ]
+        profiles = {"sender:s@bank.testmail.co": {"Finance": 9}}
+        threads = {"t1": "Finance"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "packets.jsonl"
+            gmail_sorter.export_ai_review_packets(path, decisions, threshold=75, sender_profiles=profiles, thread_dominant=threads)
+            packet = json.loads(path.read_text(encoding="utf-8").strip())
+            self.assertIn("available_categories", packet)
+            self.assertIn("Finance", packet["available_categories"])
+            self.assertEqual(packet["sender_past_categories"], ["Finance"])
+            self.assertEqual(packet["thread_dominant_category"], "Finance")
 
 
 if __name__ == "__main__":

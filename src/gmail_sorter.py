@@ -935,6 +935,12 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     has_real_attachment = real_attachment_count > 0
     if has_real_attachment:
         category_confidence["Priority Attachments"] = 100
+    # Q1: Suppress Shopping when Ads Promotions is high-confidence — it's
+    # redundant to tag a promo email with both Ads Promotions and Shopping.
+    if "Ads Promotions" in category_confidence and category_confidence["Ads Promotions"] >= 65:
+        if "Shopping" in category_confidence:
+            del category_confidence["Shopping"]
+            negative_reasons.append("shopping_suppressed_under_ads")
     # Apply the confidence floor and per-message cap. Protected/priority buckets
     # are always kept (safety first), and the primary category is always kept so
     # the dashboard's single-label view never loses its anchor.
@@ -960,6 +966,19 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         negative_reasons.append(f"low_confidence_labels:{','.join(dropped)}")
     categories = sorted(name for name, _ in kept)
     category_confidence_kept = {name: conf for name, conf in kept}
+    # Q3: Thread-aware labeling. If the message landed in a catch-all (Review)
+    # and --use-thread-aware is on, inherit the thread's dominant category from
+    # past decisions. This fixes replies in a Finance/Immigration thread that
+    # have no category keywords of their own. Never overrides a real keyword
+    # match or a protected category; only fills the catch-all gap.
+    if getattr(args, "use_thread_aware", False) and set(categories).issubset(NON_LABEL_CATEGORIES):
+        thread_map = getattr(args, "thread_dominant_categories", {}) or {}
+        thread_id = message.get("threadId", "")
+        dominant = thread_map.get(thread_id, "")
+        if dominant and dominant not in NON_LABEL_CATEGORIES:
+            categories = sorted(set(categories) | {dominant})
+            category_confidence_kept[dominant] = 55
+            reasons.append(f"thread_inherited:{dominant}")
     body_unsubscribe_links = find_unsubscribe_links_in_text(body_text) if body_included else extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
     # This is the main safety gate. A protected message can still be reported
@@ -1273,6 +1292,41 @@ def load_sender_profile_index(conn: sqlite3.Connection | None, min_hits: int = 3
         for key, category, hits in cur.fetchall():
             index[key][category] += hits * weight
     return {key: dict(cats) for key, cats in index.items()}
+
+
+def load_thread_dominant_categories(conn: sqlite3.Connection | None, progress: dict[str, Decision] | None = None) -> dict[str, str]:
+    """Build a thread_id -> dominant_category map from existing decisions.
+
+    Used by --use-thread-aware to propagate a thread's dominant category to
+    replies that would otherwise land in a catch-all (Review). Only non-catch-all
+    categories with confidence >= 50 contribute. The dominant category is the
+    one with the highest total confidence across the thread's known messages.
+    """
+
+    dominant: dict[str, str] = {}
+    if conn is None:
+        return dominant
+    try:
+        cur = conn.execute(
+            "SELECT thread_id, categories_json, ad_confidence, protected FROM messages"
+        )
+        thread_cats: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for thread_id, cats_json, ad_conf, protected in cur.fetchall():
+            try:
+                cats = json.loads(cats_json or "[]")
+            except json.JSONDecodeError:
+                continue
+            for cat in cats:
+                if cat in NON_LABEL_CATEGORIES:
+                    continue
+                weight = 2 if protected else 1
+                thread_cats[thread_id][cat] += weight
+        for thread_id, cats in thread_cats.items():
+            if cats:
+                dominant[thread_id] = max(cats.items(), key=lambda kv: kv[1])[0]
+    except sqlite3.OperationalError:
+        pass
+    return dominant
 
 
 def sender_profile_categories_from_index(index: dict[str, dict[str, int]], sender_email: str, registered_domain: str) -> dict[str, int]:
@@ -2247,16 +2301,28 @@ def load_manifest_ids(path: Path) -> set[str]:
 AI_REVIEW_BODY_EXCERPT_CHARS = 1200
 
 
-def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: int, body_excerpt_chars: int = AI_REVIEW_BODY_EXCERPT_CHARS) -> int:
+def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: int, body_excerpt_chars: int = AI_REVIEW_BODY_EXCERPT_CHARS, sender_profiles: dict[str, dict[str, int]] | None = None, thread_dominant: dict[str, str] | None = None) -> int:
     """Export low-confidence decisions as JSONL for AI label review.
 
     A message is exported when its highest category confidence is below the
     threshold, OR it landed in a catch-all bucket (Review/Updates), OR it has
     conflicting non-protected categories. Messages at 100% confidence are
     skipped — the code is sure, no AI review needed.
+
+    Packets are enriched with the full list of available categories (so the AI
+    knows the vocabulary), the sender's past categories (from profiles), and the
+    thread's dominant category — all context that helps the AI make a better
+    suggestion than the keyword rules alone.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The full category vocabulary the AI can choose from.
+    available_categories = sorted(
+        set(name for name, _, _ in CATEGORY_RULES)
+        | {"Ads Promotions", "Newsletters Bulk", "Review", "Updates", "Priority Attachments", "Social", "Forums"}
+    )
+    profiles = sender_profiles or {}
+    threads = thread_dominant or {}
     packets: list[dict[str, Any]] = []
     for item in decisions:
         max_conf = max(item.category_confidence.values()) if item.category_confidence else 0
@@ -2271,6 +2337,13 @@ def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: i
         if item.body_category_hits:
             body_excerpt += f"\n[body keywords: {', '.join(item.body_category_hits)}]"
         body_excerpt = body_excerpt[:body_excerpt_chars]
+        # Enrich: sender's past categories from the profile index.
+        sender_past = sorted(
+            profiles.get(f"sender:{item.sender_email.lower()}", {}).keys()
+            | profiles.get(f"domain:{(item.registered_domain or item.sender_domain or '').lower()}", {}).keys()
+        ) if profiles else []
+        # Enrich: thread's dominant category.
+        thread_dominant_cat = threads.get(item.thread_id, "")
         packets.append({
             "message_id": item.message_id,
             "thread_id": item.thread_id,
@@ -2290,6 +2363,9 @@ def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: i
             "has_attachment": item.has_attachment,
             "has_real_attachment": item.has_real_attachment,
             "list_unsubscribe": item.list_unsubscribe[:200] if item.list_unsubscribe else "",
+            "available_categories": available_categories,
+            "sender_past_categories": sender_past,
+            "thread_dominant_category": thread_dominant_cat,
             "ai_label": "",
             "ai_confidence": 0,
             "ai_reason": "",
@@ -2880,6 +2956,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-sender-profiles", dest="use_sender_profiles", action="store_false", help="Disable sender-profile-assisted categorization.")
     parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
     parser.add_argument("--sender-profile-floor", type=int, default=65, help="Only learn profiles from decisions at or above this ad confidence (protected mail always contributes).")
+    parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
     parser.add_argument("--apply", action="store_true", help="Actually modify Gmail for the selected stage.")
     parser.add_argument("--trash-obvious-ads", action="store_true", help="Allow trash actions during --stage trash.")
     parser.add_argument("--i-understand-trash", action="store_true", help="Required with --apply --stage trash --trash-obvious-ads.")
@@ -2949,12 +3026,15 @@ def main() -> int:
     progress = load_progress(progress_path) if args.resume else {}
     args.sender_profiles = load_sender_profile_index(state_conn) if getattr(args, "use_sender_profiles", True) else {}
     args.cached_body_features = load_body_features_index(state_conn) if getattr(args, "scan", "metadata") == "full" and not args.refresh_existing else {}
+    args.thread_dominant_categories = load_thread_dominant_categories(state_conn) if getattr(args, "use_thread_aware", False) else {}
     profile_count = len(args.sender_profiles)
     cache_count = len(args.cached_body_features)
+    thread_count = len(args.thread_dominant_categories)
     print(
         f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}"
         + (f"; sender profiles loaded={profile_count}" if profile_count else "")
         + (f"; cached body features={cache_count} (will fetch metadata-only for these)" if cache_count else "")
+        + (f"; thread-aware dominant categories={thread_count}" if thread_count else "")
     )
     progress = scan_messages(message_ids, progress, creds, build, args, config)
     save_progress(progress_path, progress)
@@ -3058,7 +3138,7 @@ def main() -> int:
         write_relabel_manifest(Path(args.manifest_dir) / "relabel_manifest.json", decisions, service, args)
     if getattr(args, "export_ai_review", False):
         ai_path = Path(getattr(args, "ai_review_file", ""))
-        packet_count = export_ai_review_packets(ai_path, decisions, args.ai_review_threshold)
+        packet_count = export_ai_review_packets(ai_path, decisions, args.ai_review_threshold, sender_profiles=getattr(args, "sender_profiles", {}), thread_dominant=getattr(args, "thread_dominant_categories", {}))
         print(f"Exported {packet_count} low-confidence decisions for AI review to {ai_path}", flush=True)
         print("Fill ai_label/ai_confidence/ai_reason/ai_reviewed in that file, then re-run with --merge-ai-labels.", flush=True)
     review_dir = Path(args.review_dir) if args.review_dir else Path(args.manifest_dir) / "review"
