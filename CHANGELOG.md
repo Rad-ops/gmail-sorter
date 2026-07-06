@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.2 - 2026-07-06
+
+### 🐛 Bug Fixes
+
+- **B1: Keyword overlaps.** 8 keywords appeared in 2 categories simultaneously (e.g. "study permit" in both Immigration and Studies, "university" in both Studies and Work School). Now each keyword belongs to exactly one category, with the more specific/protected category winning. Verified: zero overlaps across all `CATEGORY_RULES`.
+- **B2: Subject/body split.** `categorize_with_confidence()` was calling `keyword_hits` on the combined `searchable` string, so subject hits were re-counted as body hits and the dead-code `15 * max(0, ...)` term was always 0. Now accepts `subject`, `body_text`, and `sender_text` as truly separate fields and scores correctly (subject: 30, body: 20, sender: 15).
+
+### ✨ Labeling Improvements
+
+- **Q1: Shopping suppressed under Ads.** When Ads Promotions confidence ≥ 65, Shopping is dropped as redundant. Records `shopping_suppressed_under_ads` in `negative_reasons`.
+- **Q3: Thread-aware labeling.** New `--use-thread-aware` flag. `load_thread_dominant_categories()` builds a thread_id → dominant_category map from existing SQLite decisions. In `decide()`, when a message lands in a catch-all (Review), it inherits the thread's dominant category at confidence 55. Never overrides a real keyword match or protected category.
+- **Q7: Enriched AI review packets.** Packets now include `available_categories` (the full vocabulary), `sender_past_categories` (from profiles), and `thread_dominant_category` — context that helps the AI make better suggestions.
+
+### 📚 Documentation
+
+- README restructured into a clean 12-section layout with a full CLI reference and the AI-assisted review section.
+- HANDOVER.md extended with two new sections: "How the script works" (end-to-end flow + why keyword rules, not embeddings) and "Architectural improvement suggestions" (embedding pre-classifier, trained classifier, thread modeling, sender reputation, calibration, module split).
+
+### 🧪 Tests
+
+- 45 tests passing. Added overlap-check, Shopping suppression, thread-aware inheritance (and non-override), and enriched-packet regression tests.
+
 ## 0.5.1 - 2026-07-06
 
 ### 🎯 Per-Category Confidence and Label Caps

@@ -407,3 +407,255 @@ Profile switcher: `llm-switch` (preferred profile: `qwen36`)
 
 The local AI path is **separate** from the main sorter. The sorter exports
 bounded review packets; the model never receives Gmail credentials.
+
+## 12. How the script works (for the next agent/model)
+
+This section explains the runtime flow end-to-end so a new model can reason
+about what the code does and why it does it that way.
+
+### The scan → decide → report → apply pipeline
+
+```
+1. list_message_ids()        Query Gmail for message IDs matching --query
+2. scan_messages()           Fetch each message (metadata or full body) in parallel
+   └─ decide()               Classify one message:
+      ├─ score_ad()          Score promotional likelihood (0-100) from headers,
+      │                      subject, snippet, bulk-mail headers, sender localpart
+      ├─ categorize_with_confidence()
+      │                      Score each category 0-100 from:
+      │                        - subject keyword hits (30 each — sender chose them)
+      │                        - body keyword hits (20 each — noisier)
+      │                        - sender/domain keyword hits (15 each)
+      │                        - Gmail CATEGORY_* label boost (+30)
+      │                        - sender-profile boost (+25 max)
+      │                      Cap at 75 for the keyword family, 100 total.
+      ├─ Shopping suppressed  If Ads Promotions >= 65, Shopping is dropped
+      ├─ Confidence floor      Categories below --label-confidence dropped
+      │                        (protected/priority always kept)
+      ├─ Label cap             --max-labels-per-message caps applied labels
+      ├─ Thread-aware          If catch-all (Review) and --use-thread-aware,
+      │                        inherit thread's dominant category at 55
+      ├─ Protected check       Allowlist, real attachments, protected categories,
+      │                        IMPORTANT/STARRED/PRIMARY → protected=True
+      ├─ Archive gating        Requires bulk-mail signal + threshold
+      └─ Trash gating          Perfect ad match or ad_confidence >= trash_threshold
+3. save_progress()           Write decisions to JSON progress + SQLite state
+4. write_dashboard()         HTML dashboard with review queues, tables, manifests
+5. [optional] export_ai_review_packets()
+                             Write low-confidence decisions as JSONL for AI review
+6. [optional] merge_ai_labels()
+                             Read AI-reviewed JSONL, adjust decisions where
+                             AI suggests a different label above 0.7 confidence
+                             (protected status never removed)
+7. [optional] --apply        apply_decisions() or apply_relabel() — gated by
+                             stage flags, recorded in action_ledger
+```
+
+### Why keyword rules, not embeddings or a model?
+
+The codebase deliberately uses **keyword rules + confidence scoring** as the
+primary classifier, not embeddings or a neural model. The reasons:
+
+1. **Explainability.** Every decision has a `reasons` list
+   (`subject:bank`, `sender_profile:Finance:9`, `thread_inherited:Finance`)
+   that the dashboard shows. A reviewer can see *why* a message was labeled
+   Finance. An embedding classifier is a black box — you can't explain why
+   "your statement is ready" is Finance.
+
+2. **Determinism.** The same input always produces the same output. A model
+   can be non-deterministic between runs, which makes auditing impossible.
+
+3. **Cost.** Keyword rules run in microseconds on the local machine. A model
+   inference per message would add seconds and GPU/API cost across tens of
+   thousands of messages.
+
+4. **Safety.** The sorter's job is to *not* destroy important mail. A keyword
+   rule that says "immigration/IRCC/visa → protected" is a hard, auditable
+   gate. A model might "forget" to protect a visa email because the embedding
+   was close to a promo email.
+
+### Where keyword rules fall short (and what the AI review pipeline does about it)
+
+Keyword rules can't understand:
+- **Context.** "Your appointment has been rescheduled" from a clinic is Health;
+  from a recruiter is Job Search. The word "appointment" matches both.
+- **Intent.** A promo email titled "Your order is ready" is actually an ad,
+  not a receipt. The word "order" matches Receipts Orders.
+- **Negation.** "Do not reset your password" contains "password" and "reset"
+  but is not a security alert.
+- **Sender ambiguity.** `no-reply@accounts.google.com` sends both security
+  alerts and promotional newsletters. The domain alone can't disambiguate.
+
+The AI review pipeline (Section 4) is the bridge: the code's keyword rules
+make a fast, explainable first pass; low-confidence decisions are exported
+with bounded body excerpts and context; an AI model that *can* understand
+context reviews them and suggests corrections; the script merges both opinions
+before applying. The code never gives the AI Gmail access — only bounded
+packets.
+
+### Key invariants a new model must preserve
+
+1. **Protected messages are never archived or trashed.** This is the single
+   most important safety rule. Any change to `decide()` or `apply_*()` must
+   preserve it.
+2. **Only `Sorter/*` labels are managed.** Never remove user-created or Gmail
+   system labels in relabel.
+3. **AI merge never removes a protected category.** The AI can add a label but
+   cannot take a protected one away.
+4. **Raw body text is never persisted.** Only bounded excerpts (1200 chars,
+   quotes/footers stripped) go into AI packets; only body_len + category hit
+   names go into SQLite.
+5. **Every Gmail write is recorded in the action_ledger.** Every label/archive/
+   trash/relabel call appends a row so it can be audited and undone.
+6. **`--apply` is always required for Gmail changes.** The default run is
+   read-only.
+
+## 13. Architectural improvement suggestions (from the current model's POV)
+
+These are suggestions for the next model/reviewer to evaluate. They reflect
+the current model's assessment of where the architecture is weakest and what
+would move it to the next level. The user will review these alongside another
+model's input before deciding what to run.
+
+### A. Move from keyword matching to context-aware classification
+
+**Current state:** Classification relies on keyword rules
+(`CATEGORY_RULES` in `policy.py`) — lists of words that, when found in the
+subject/body/sender, trigger a category at a confidence score. This is fast
+and explainable but fundamentally **lexical, not semantic**. It cannot
+understand context, intent, or the relationship between words.
+
+**The problem:** Real emails don't contain neat keywords. A bank statement
+says "Your January statement is now available" — no "bank" or "finance"
+keyword, but it's clearly Finance. A clinic email says "See you Tuesday at 3"
+— no "appointment" keyword, but it's clearly Health. The keyword rules miss
+these, and the sender profile + thread-aware fixes only paper over the gap.
+
+**Proposed architecture:**
+1. **Embedding-based pre-classifier.** Compute a dense embedding for each
+   message (subject + bounded body) and compare it to per-category centroid
+   embeddings derived from past high-confidence decisions. This gives a
+   semantic similarity score (0–1) per category that captures "this email
+   *means* Finance" even without the keyword "bank."
+2. **Hybrid scoring.** The final category confidence becomes:
+   `max(keyword_score, embedding_similarity * 100)` — the keyword rules
+   provide the explainable floor, the embedding provides the semantic ceiling.
+   The `reasons` list records both so the dashboard stays explainable.
+3. **Centroid learning.** After each scan, update the per-category centroid
+   from new high-confidence decisions (stored in SQLite alongside
+   `sender_profile`). The centroids improve pass over pass, like the sender
+   profiles do today.
+4. **Privacy.** Embeddings are computed locally (the local-AI stack's
+   embedding model, or a small sentence-transformer). No body text leaves the
+   machine. The centroid vectors are not reversible — they don't contain
+   readable email content.
+
+**Why this is worth it:** The keyword rules will always have a long tail of
+misses. An embedding pre-classifier catches the semantic matches the keywords
+can't, and the AI review pipeline becomes the fallback for the few that *both*
+miss. This is the single highest-value architectural change.
+
+### B. Replace per-keyword scoring with a lightweight trained classifier
+
+**Current state:** Each keyword hit adds a fixed weight (subject: 30, body:
+20, sender: 15). These weights were hand-tuned by guessing.
+
+**Proposed:** Train a small logistic-regression or gradient-boosted classifier
+on the existing labeled data (the SQLite `messages` table has thousands of
+decisions with `categories` and `category_confidence`). Features:
+- keyword hit counts per category (current input)
+- sender-domain one-hot (or embedding)
+- Gmail CATEGORY_* labels
+- hour-of-day / day-of-week (marketing mail is sent at specific times)
+- list-unsubscribe / precedence headers
+
+This would replace the hand-tuned weights with learned weights and likely
+improve accuracy significantly with zero runtime cost (a logistic regression
+is microseconds). The model file is a few KB and can be versioned in Git.
+
+**Risk:** Requires a training step. The user would need to run
+`python3 src/train_classifier.py` after labeling enough mail. But the
+`messages` table already has the labeled data from the first cleanup pass.
+
+### C. Thread-level conversation modeling
+
+**Current state:** `--use-thread-aware` propagates the thread's *dominant*
+category to catch-all replies. But it's a simple plurality vote — it doesn't
+model the *conversation* (who said what, reply chains, forwarded context).
+
+**Proposed:** Build a thread-level feature vector per thread:
+- number of messages, span of dates, distinct senders
+- category distribution across the thread
+- presence of attachments, unsubscribe headers, promotional signals
+
+This thread context feeds into `decide()` as an additional signal: a reply in
+a 10-message Finance thread with attachments gets a much stronger Finance
+boost than a reply in a 2-message thread with mixed categories. This is more
+principled than the current dominant-category plurality.
+
+### D. Sender reputation as a first-class signal
+
+**Current state:** `sender_profile` learns "this sender was labeled Finance 9
+times." But there's no notion of *reputation* — how much mail this sender
+sends, what fraction is promotional, whether they're on a blocklist, etc.
+
+**Proposed:** A `sender_reputation` table:
+- `total_messages`, `avg_ad_confidence`, `protected_fraction`
+- `categories_distribution` (JSON)
+- `first_seen`, `last_seen`
+- `reputation_score` (0–100, derived)
+
+This would:
+- Auto-suggest blocklist entries in the dashboard (domain with 500 messages,
+  95% ad confidence → "suggest blocklist")
+- Provide a stronger prior for new messages from known senders
+- Surface "noisy senders" that should be unsubscribed
+
+### E. Confidence calibration and golden-set testing
+
+**Current state:** Confidence scores (30/20/15 for subject/body/sender) are
+hand-tuned. There's no way to know if a score of 50 actually means "50% likely
+correct."
+
+**Proposed:**
+1. **Golden set.** Manually label 100–200 messages with the "correct"
+   category. Store them in `tests/golden_set.jsonl`.
+2. **Calibration script.** Run the classifier on the golden set and produce a
+   calibration curve: for each confidence bucket (0–10, 10–20, ...), what
+   fraction are actually correct? Apply a Platt-scaling or isotonic regression
+   to map raw scores to calibrated probabilities.
+3. **Regression test.** The golden set becomes a test: if accuracy drops below
+   a threshold, the test fails. This catches regressions when keywords or
+   weights change.
+
+This turns "confidence" from a guess into a measurable, tunable quantity.
+
+### F. Full module split of the core
+
+**Current state:** `gmail_sorter.py` is still ~3100 lines. Policy data and
+keyword matching are in the `sorter/` package, but the Gmail I/O, decide,
+apply, relabel, reports, and dashboard are all in one file.
+
+**Proposed:** Split into `sorter/{gmail_client, scoring, classify, features,
+relabel, reports, dashboard, apply, ai_review, cli}.py`. `gmail_sorter.py`
+becomes a thin shim. This was deferred to keep the live tool safe, but the
+file is now large enough that the split would meaningfully improve
+maintainability.
+
+### Summary of priorities (my recommendation)
+
+| Priority | Improvement | Effort | Impact |
+| --- | --- | --- | --- |
+| 1 | A. Embedding pre-classifier (hybrid) | High | Highest — fixes the long tail of semantic misses |
+| 2 | E. Confidence calibration + golden set | Medium | High — turns confidence from a guess into a metric |
+| 3 | D. Sender reputation table | Medium | Medium — auto-suggests blocklist, stronger priors |
+| 4 | B. Trained classifier on labeled data | Medium | Medium — replaces hand-tuned weights |
+| 5 | C. Thread-level conversation modeling | Medium | Medium — more principled than plurality vote |
+| 6 | F. Full module split | Low | Low — maintainability, not accuracy |
+
+My strong recommendation is to start with **A (embedding pre-classifier)**
+because it addresses the root cause the user identified: "we rely heavily on
+keywords and domains, shouldn't we rely more on context?" An embedding model
+captures context; the keyword rules stay as the explainable floor; the AI
+review pipeline catches the rest. The hybrid is the architecture that makes
+the sorter genuinely smart without sacrificing safety or explainability.
