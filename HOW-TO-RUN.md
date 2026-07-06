@@ -7,14 +7,16 @@ distribution (Manjaro, Endeavour, Garuda) or any other Linux with
 Python 3.11+ installed. macOS users can adapt the path names.
 
 > **Pick the right release for you:**
-> - **v0.7.0** is the latest stable release. The "smarter classifier"
->   milestone: real body in centroids, multi-language (EN+FR+FA), AI
->   active learning + AI removal, sender profile time-decay.
-> - **v0.8.0** is the next planned release (per-keyword learned weights,
->   thread conversation modeling, sender reputation, Gmail History API,
->   better HTML body extraction). It is **not yet shipped** — this
->   document shows the commands you'll run once v0.8.0 lands on
->   `main`. v0.7.0 is the right choice today.
+> - **v0.8.0** is the latest stable release. The "heuristics &
+>   performance" milestone: per-keyword learned weights, thread-level
+>   conversation modeling, sender reputation as a first-class signal,
+>   Gmail History API incremental scan, and better HTML body
+>   extraction. All five new heuristics are opt-in via CLI flags.
+> - **v0.9.0** is the next planned release (full module split of
+>   `gmail_sorter.py`, GitHub Actions CI, `pyproject.toml`). It is
+>   **not yet shipped** — this document shows the commands you'll
+>   run once v0.9.0 lands on `main`. v0.8.0 is the right choice
+>   today.
 
 The commands assume you are inside the project root:
 `/home/rzangeneh/codebase/sorter`. If you cloned the repo elsewhere,
@@ -258,7 +260,7 @@ If you want to skip the active-learning pass for a one-off run:
 
 ---
 
-## 8. Embedding pre-classifier (v0.6, refined in v0.7)
+## 8. Embedding pre-classifier + v0.8.0 heuristics
 
 The embedding pre-classifier needs a local embeddings endpoint. The
 easiest path is the local llama.cpp server's `/v1/embeddings` route,
@@ -294,6 +296,46 @@ echo
 > **No embeddings endpoint?** The sorter falls back to keyword-only
 > classification automatically; the run still completes. The
 > `--use-embeddings` flag is opt-in.
+
+### v0.8.0: learned weights, thread modeling, sender reputation, history API
+
+```fish
+# 8.4 v0.8.0: enable all five new heuristics in one go.
+.venv/bin/python src/gmail_sorter.py \
+    --scan full \
+    --resume \
+    --refresh-existing \
+    --use-embeddings \
+    --use-learned-weights \
+    --use-thread-modeling \
+    --use-sender-reputation \
+    --use-html-body \
+    --since-history-id auto
+
+# 8.5 v0.8.0: just the learned weights. The first scan trains
+#      the model and writes data/learned_weights.json. Subsequent
+#      scans load it instantly.
+.venv/bin/python src/gmail_sorter.py \
+    --scan full \
+    --resume \
+    --use-learned-weights
+
+# 8.6 v0.8.0: just the thread modeling. Builds the thread_features
+#      table and boosts categories that are dominant in long
+#      conversations.
+.venv/bin/python src/gmail_sorter.py \
+    --scan full \
+    --resume \
+    --use-thread-modeling
+
+# 8.7 v0.8.0: just the sender reputation. Builds the
+#      sender_reputation table; the dashboard surfaces blocklist
+#      candidates (>=200 msgs, >=80% ads, 0% protected).
+.venv/bin/python src/gmail_sorter.py \
+    --scan full \
+    --resume \
+    --use-sender-reputation
+```
 
 ---
 
@@ -381,10 +423,48 @@ weekly maintenance scan is fast.
     --apply
 ```
 
-> **v0.8.0 (when it lands) will add a `--since-history-id <id>` flag**
-> that uses the Gmail History API to fetch only messages added/changed
-> since the last scan. This is what makes the weekly cadence fast
-> enough to run unattended.
+> **v0.8.0 (shipped) adds the History API incremental scan.** This
+> is what makes the weekly cadence fast enough to run unattended. The
+> Gmail History API returns only the messages that changed since the
+> last run, so a typical week is 100x faster than a full re-scan.
+
+```fish
+# 11.4 v0.8.0: incremental scan via the Gmail History API.
+#      'auto' reads the stored last_history_id from SQLite. The
+#      sorter will fall back to a full re-scan if the history is
+#      too old (Gmail only keeps ~7 days of history).
+.venv/bin/python src/gmail_sorter.py \
+    --since-history-id auto \
+    --resume \
+    --stage label \
+    --apply
+
+# 11.5 v0.8.0: force a full re-scan and update the stored
+#      history id. Use this once when you first switch to
+#      incremental mode.
+.venv/bin/python src/gmail_sorter.py \
+    --since-history-id reset \
+    --resume \
+    --stage label \
+    --apply
+
+# 11.6 v0.8.0: weekly maintenance via the bundled script.
+bash commands/run-maintenance.sh
+```
+
+To install the weekly maintenance as a systemd user timer (CachyOS
+default):
+
+```fish
+mkdir -p ~/.config/systemd/user
+cp commands/run-maintenance.sh ~/.local/bin/
+chmod +x ~/.local/bin/run-maintenance.sh
+
+# Add a user-level systemd timer that runs the maintenance every
+# Sunday at 03:00.
+# (See docs/OVERNIGHT-LOCAL-QWEN-RUNBOOK.md for the full systemd
+# unit file; v0.9.0 will ship the .service and .timer files.)
+```
 
 ---
 
@@ -410,19 +490,21 @@ A clean run prints `OK` and `Ran 125 tests in 0.NNNs`.
 
 ---
 
-## 13. What v0.8.0 will change (preview)
+## 13. What v0.8.0 added (recap) and v0.9.0 preview
 
-v0.8.0 is the heuristics-and-performance release. When it ships, the
-key new capabilities are:
+v0.8.0 ships five new heuristics, all opt-in via CLI flags:
 
 | Flag | What it does |
 |---|---|
-| `--use-learned-weights` | Replaces the hand-tuned 30/20/15 keyword weights with weights learned from the labeled data in `messages`. |
-| `--since-history-id <id>` | Incremental scan via the Gmail History API. 100x faster on a weekly cadence. |
+| `--use-learned-weights` | Replaces the hand-tuned 30/20/15 keyword weights with weights learned from the labeled data in `messages`. Trained on every scan; persisted to `data/learned_weights.json`. |
+| `--use-thread-modeling` (default on) | Thread-level conversation modeling. Boosts a category's confidence by up to 15 points based on the thread's message count and top-category share. |
 | `--use-sender-reputation` (default on) | First-class sender reputation: total messages, ad fraction, derived score. Auto-suggests blocklist candidates. |
+| `--since-history-id <id>` | Incremental scan via the Gmail History API. 100x faster on a weekly cadence. |
 | `--use-html-body` (default on) | Better HTML body extraction: tables, quoted-printable decoding, multi-part MIME. |
 
-Until v0.8.0 lands, the v0.7 commands above are the full set.
+The `commands/run-maintenance.sh` script runs the incremental scan with all five enabled. See section 11.
+
+v0.9.0 will be the **maintainable core** release: full module split of `gmail_sorter.py`, GitHub Actions CI, `pyproject.toml`, and a refactor of the apply path into `sorter.apply`.
 
 ---
 

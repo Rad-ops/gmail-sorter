@@ -5,7 +5,7 @@ long-unmanaged mailboxes. It scans, classifies, and reports before any change
 is made, then applies label, archive, trash, and relabel stages only when
 explicitly requested.
 
-**Version:** `0.7.1` · **Schema version:** 3
+**Version:** `0.8.0` · **Schema version:** 4
 
 Companion local-AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack)
 
@@ -142,7 +142,11 @@ The merge step adjusts decisions where the AI suggests a different label above `
 - **Body-aware scanning.** `--scan full` feeds a bounded, cleaned slice of the decoded body (quotes and footers stripped) to the classifier. Ad confidence is still scored on headers + subject + snippet so a long promotional body does not inflate trash scores. Body features are cached in SQLite so re-runs skip the expensive fetch.
 - **Embedding pre-classifier.** `--use-embeddings` computes a dense embedding for each message and compares it to per-category centroid vectors learned from past high-confidence decisions. The final confidence is `max(keyword_score, embedding_similarity * 100)` — the keyword rules provide the explainable floor, the embedding provides the semantic ceiling. This catches semantic matches the lexical rules miss (e.g. a bank statement with no "bank" keyword). Uses the local LLM server's `/v1/embeddings` endpoint or sentence-transformers; falls back to keyword-only when unavailable.
 - **Multi-language keyword overlays.** `sorter/lang.py` picks `en|fr|fa|other` per message. `config/policy.fr.yaml` and `config/policy.fa.yaml` add French and Farsi keywords for IRCC, finance, health, government, utilities, and security. The detector is *only* used to pick the keyword overlay; it never blocks or moves mail.
-- **AI active learning + AI removal.** `--merge-ai-labels` returns `(agreed, overridden, removed)`. Removal requires `--ai-merge-min-removal-confidence` (default 0.85). After every merge, the AI's verified decisions are pushed back into `sender_profile` and, when an embedding backend is on, the category centroids so the next scan benefits automatically.
+- **Better HTML body extraction.** Each email part is decoded with the right `Content-Transfer-Encoding` (base64, quoted-printable, 7bit, 8bit). HTML parts are converted to structured text via an `HTMLParser`-based converter that preserves tables as tab-separated rows and skips `<style>`/`<script>` blocks. Receipts and non-English QP-encoded bodies are now decoded correctly. Opt-in via `--use-html-body` (default on).
+- **Per-keyword learned weights.** A 6-feature logistic regression per category fits on the labeled data in the SQLite `messages` table. The result is persisted to `data/learned_weights.json` and consulted by `decide()` via `max(keyword, learned)`. Opt-in via `--use-learned-weights`.
+- **Thread-level conversation modeling.** A new `thread_features` table carries one row per (thread_id, message_count, distinct_senders, top_category_share, has_attachment_count, has_unsubscribe_count, date_span_days, protected_fraction). The thread model returns a 0-15 confidence boost for the thread's top category. Opt-in via `--use-thread-modeling` (default on).
+- **Sender reputation as a first-class signal.** A new `sender_reputation` table carries one row per (sender, domain, total_messages, avg_ad_confidence, protected_fraction, ad_fraction, first/last_seen, reputation_score). The score is `100 * (1 - ad_fraction) * log(1 + N) / 5`, clamped to 0-100. The dashboard surfaces suggested blocklist candidates. Opt-in via `--use-sender-reputation` (default on).
+- **Gmail History API incremental scan.** A new `state_meta` table stores the last `historyId` we've processed. `--since-history-id {auto,reset,<id>}` enables the incremental path. `commands/run-maintenance.sh` runs the weekly cadence via a systemd user timer.
 - **Sender profile time-decay + diversity.** New `--sender-profile-half-life-days` (default 180). The `sender_profile` key now includes the category so a single sender can have one row per category. `category_diversity` is refreshed on every write so the dashboard can surface noisy senders.
 - **Catch-all labels.** `Review` and `Updates` appear on the dashboard but are never applied as Gmail labels.
 - **Primary category.** Each message gets one `primary_category` chosen by a protected/priority-first precedence.
@@ -203,6 +207,12 @@ PyYAML is optional; built-in defaults are used when the file or library is absen
 | `--embedding-endpoint URL` | OpenAI-compatible /v1/embeddings endpoint |
 | `--embedding-st-model NAME` | sentence-transformers model (offline, if installed) |
 | `--sender-profile-half-life-days N` | v0.7: half-life in days for sender-profile time decay. 0 disables. |
+| `--use-html-body` (default on) | v0.8: better HTML body extraction (script/style stripped, tables as tab-separated rows, QP-decoded bodies). |
+| `--use-learned-weights` | v0.8: replace the hand-tuned keyword weights with weights learned from the labeled data in the SQLite messages table. |
+| `--learned-weights-file PATH` | v0.8: path to the learned-weights JSON file (default `data/learned_weights.json`). |
+| `--use-thread-modeling` (default on) | v0.8: thread-level conversation modeling. Boosts a category's confidence by up to 15 points based on the thread's message count and top-category share. |
+| `--use-sender-reputation` (default on) | v0.8: first-class sender reputation signal. High-reputation senders get -15 ad confidence, low-reputation senders get +10. The dashboard surfaces suggested blocklist candidates. |
+| `--since-history-id ID` | v0.8: incremental scan via the Gmail History API. Pass a numeric historyId, `auto` to use the stored last_history_id, `reset` to force a full re-scan, or empty to disable. |
 
 ### Archive
 
@@ -277,7 +287,7 @@ Folders marked *local only* are gitignored because they can contain message IDs,
 .venv/bin/python -m unittest discover -s tests
 ```
 
-125 tests cover the classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, the relabel label diff, undo, resume, AI review export/merge, AI active learning, confidence/cap behavior, body cleaning, thread-aware labeling, embedding-based semantic classification, language detection, per-language keyword overlays, sender profile time decay, and schema migrations.
+304 tests cover the classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, the relabel label diff, undo, resume, AI review export/merge, AI active learning, confidence/cap behavior, body cleaning, thread-aware labeling, embedding-based semantic classification, language detection, per-language keyword overlays, sender profile time decay, schema migrations, per-keyword learned weights, thread-level conversation modeling, sender reputation, Gmail History API incremental scan, and HTML body extraction.
 
 ## Documentation
 
