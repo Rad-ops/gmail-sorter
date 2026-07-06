@@ -362,5 +362,167 @@ class WordBoundaryAndSenderProfileTests(unittest.TestCase):
         self.assertNotIn("Priority Immigration", item.categories)
 
 
+class FakeLabel:
+    def __init__(self, name, lid, messages_total=0):
+        self._name = name
+        self._id = lid
+        self._messages_total = messages_total
+
+    def get(self, key, default=None):
+        return {"name": self._name, "id": self._id, "messagesTotal": self._messages_total}.get(key, default)
+
+    def __getitem__(self, key):
+        return {"name": self._name, "id": self._id, "messagesTotal": self._messages_total}[key]
+
+
+class FakeBatchModifyRequest:
+    def __init__(self, captured, body):
+        self.captured = captured
+        self.body = body
+
+    def execute(self):
+        self.captured.append(self.body)
+        return {}
+
+
+class FakeLabelsListRequest:
+    def __init__(self, labels):
+        self.labels = labels
+
+    def execute(self):
+        return {"labels": self.labels}
+
+
+class FakeLabelsDeleteRequest:
+    def __init__(self, name, captured):
+        self.name = name
+        self.captured = captured
+
+    def execute(self):
+        self.captured.append(self.name)
+        return {}
+
+
+class FakeLabelCreateRequest:
+    def __init__(self, name, name_to_id):
+        self.name = name
+        self.name_to_id = name_to_id
+
+    def execute(self):
+        self.name_to_id[self.name] = f"id-{self.name.replace('/', '_')}"
+        return {"id": self.name_to_id[self.name], "name": self.name}
+
+
+class FakeGmailService:
+    """Minimal Gmail service stub for relabel tests."""
+
+    def __init__(self, labels):
+        self._labels = labels  # list[FakeLabel]
+        self.batch_modify_calls = []
+        self.delete_calls = []
+        self.created = {}
+
+    def users(self):
+        return self
+
+    def labels(self):
+        return self
+
+    def list(self, userId="me"):
+        return FakeLabelsListRequest(self._labels)
+
+    def create(self, userId="me", body=None):
+        return FakeLabelCreateRequest(body["name"], self.created)
+
+    def delete(self, userId="me", id=None):
+        name = next(l._name for l in self._labels if l._id == id)
+        return FakeLabelsDeleteRequest(name, self.delete_calls)
+
+    def messages(self):
+        return self
+
+    def batchModify(self, userId="me", body=None):
+        return FakeBatchModifyRequest(self.batch_modify_calls, body)
+
+
+class RelabelStageTests(unittest.TestCase):
+    """Regression tests for the relabel stage's label diff."""
+
+    def _decision(self, mid, existing_sorter_ids, categories):
+        return gmail_sorter.Decision(
+            message_id=mid,
+            thread_id="t",
+            date="2024-01-01",
+            sender="S <s@x.testmail.co>",
+            sender_email="s@x.testmail.co",
+            sender_domain="x.testmail.co",
+            registered_domain="testmail.co",
+            subject="sub",
+            snippet="",
+            existing_labels=list(existing_sorter_ids),
+            categories=categories,
+        )
+
+    def test_relabel_diffs_and_only_touches_sorter_namespace(self):
+        # existing labels: Sorter/Finance (stale) + a user label "Receipts"
+        # (id user-receipts, must NOT be removed). Desired: Sorter/Ads Promotions.
+        service = FakeGmailService(
+            labels=[
+                FakeLabel("Sorter/Finance", "sl-fin"),
+                FakeLabel("Sorter/Ads Promotions", "sl-ads"),
+                FakeLabel("Receipts", "user-receipts", messages_total=5),
+            ]
+        )
+        ns = argparse.Namespace(
+            retries=1,
+            retry_sleep=0,
+            batch_size=10,
+            apply_progress_every=1,
+            stage="relabel",
+        )
+        decisions = [self._decision("m1", ["sl-fin", "user-receipts"], ["Ads Promotions"])]
+        gmail_sorter.apply_relabel(service, decisions, ns, state_conn=None)
+
+        # Exactly one batchModify carrying add Sorter/Ads Promotions and remove
+        # Sorter/Finance, and never the user Receipts label.
+        self.assertEqual(len(service.batch_modify_calls), 1)
+        call = service.batch_modify_calls[0]
+        self.assertIn("sl-ads", call.get("addLabelIds", []))
+        self.assertIn("sl-fin", call.get("removeLabelIds", []))
+        self.assertNotIn("user-receipts", call.get("removeLabelIds", []))
+        self.assertEqual(decisions[0].action_done, "yes")
+
+    def test_relabel_clears_all_sorter_labels_when_desired_is_empty(self):
+        # A message that now only lands in a catch-all bucket should have all its
+        # Sorter/* labels removed and none added.
+        service = FakeGmailService(labels=[FakeLabel("Sorter/Review", "sl-rev", messages_total=1)])
+        ns = argparse.Namespace(retries=1, retry_sleep=0, batch_size=10, apply_progress_every=1, stage="relabel")
+        decisions = [self._decision("m1", ["sl-rev"], ["Review"])]  # Review is a non-label catch-all
+        gmail_sorter.apply_relabel(service, decisions, ns, state_conn=None)
+        self.assertEqual(len(service.batch_modify_calls), 1)
+        call = service.batch_modify_calls[0]
+        self.assertIn("sl-rev", call.get("removeLabelIds", []))
+        self.assertNotIn("addLabelIds", call)
+
+    def test_relabel_no_op_when_already_correct(self):
+        service = FakeGmailService(labels=[FakeLabel("Sorter/Finance", "sl-fin", messages_total=1)])
+        ns = argparse.Namespace(retries=1, retry_sleep=0, batch_size=10, apply_progress_every=1, stage="relabel")
+        decisions = [self._decision("m1", ["sl-fin"], ["Finance"])]
+        gmail_sorter.apply_relabel(service, decisions, ns, state_conn=None)
+        self.assertEqual(service.batch_modify_calls, [])
+
+    def test_prune_empty_sorter_labels(self):
+        service = FakeGmailService(
+            labels=[
+                FakeLabel("Sorter/Finance", "sl-fin", messages_total=0),
+                FakeLabel("Sorter/Ads Promotions", "sl-ads", messages_total=3),
+                FakeLabel("Inbox", "inbox", messages_total=0),  # system label, must be ignored
+            ]
+        )
+        pruned = gmail_sorter.prune_empty_sorter_labels(service, retries=1, retry_sleep=0)
+        self.assertEqual(pruned, ["Sorter/Finance"])
+        self.assertEqual(len(service.delete_calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

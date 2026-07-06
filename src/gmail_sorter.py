@@ -1838,6 +1838,144 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
                 print(f"Applied label/archive batch {batch_index}/{batch_count}...", flush=True)
 
 
+def write_relabel_manifest(path: Path, decisions: list[Decision], service: Any, args: argparse.Namespace) -> None:
+    """Write a before->after relabel preview without applying anything.
+
+    Uses each message's current Sorter labels (captured at scan time) and the
+    freshly computed desired categories. Works in dry-run because it only reads
+    the existing label list; labels that do not exist yet are reported as adds.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    id_to_name: dict[str, str] = {}
+    if service is not None:
+        name_to_id = list_labels(service, args.retries, args.retry_sleep)
+        id_to_name = {lid: name for name, lid in name_to_id.items()}
+    sorter_label_ids = {lid for lid, name in id_to_name.items() if name.startswith(f"{ROOT_LABEL}/")}
+    rows = []
+    for item in decisions:
+        current = sorted(id_to_name[lid] for lid in item.existing_labels if lid in sorter_label_ids)
+        desired = sorted(f"{ROOT_LABEL}/{category}" for category in labelable_categories(item.categories))
+        add = sorted(set(desired) - set(current))
+        remove = sorted(set(current) - set(desired))
+        if add or remove or current:
+            rows.append(
+                {
+                    "message_id": item.message_id,
+                    "date": item.date,
+                    "sender_domain": item.sender_domain,
+                    "subject": item.subject,
+                    "primary_category": item.primary_category,
+                    "current_sorter_labels": current,
+                    "desired_sorter_labels": desired,
+                    "add_labels": add,
+                    "remove_labels": remove,
+                }
+            )
+    payload = {
+        "stage": "relabel",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "message_count": len(rows),
+        "items": rows,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def list_labels(service: Any, retries: int, retry_sleep: float) -> dict[str, str]:
+    """Return {label_name: label_id} for all user labels."""
+
+    existing = execute_with_retries(service.users().labels().list(userId="me"), retries, retry_sleep).get("labels", [])
+    return {label.get("name", ""): label.get("id", "") for label in existing}
+
+
+def compute_relabel_plan(item: Decision, sorter_label_ids: set[str], desired_name_to_id: dict[str, str]) -> tuple[set[str], set[str]]:
+    """Diff a message's current Sorter labels against the desired set.
+
+    Returns (add_ids, remove_ids). Only labels in the Sorter/ namespace are
+    ever removed; user-created and Gmail system labels are never touched. The
+    desired set is empty for messages that only land in catch-all buckets, so a
+    relabel pass clears stale Sorter labels off generic mail.
+    """
+
+    current_sorter = {lid for lid in item.existing_labels if lid in sorter_label_ids}
+    desired_ids = set(desired_name_to_id.values())
+    return desired_ids - current_sorter, current_sorter - desired_ids
+
+
+def apply_relabel(service: Any, decisions: list[Decision], args: argparse.Namespace, state_conn: sqlite3.Connection | None = None) -> None:
+    """Remove stale Sorter/* labels and apply the corrected set in one pass.
+
+    This is the re-run path for a mailbox the sorter already labeled once. It
+    uses each message's current Sorter labels (captured at scan time) and the
+    freshly computed desired categories, then issues one batchModify per group
+    carrying both addLabelIds and removeLabelIds. Non-Sorter labels are never
+    touched, and protected messages are still labeled (just correctly).
+    """
+
+    started = time.monotonic()
+    name_to_id = list_labels(service, args.retries, args.retry_sleep)
+    sorter_label_ids = {lid for name, lid in name_to_id.items() if name.startswith(f"{ROOT_LABEL}/")}
+
+    desired_categories = sorted({category for item in decisions for category in labelable_categories(item.categories)})
+    desired_names = [f"{ROOT_LABEL}/{category}" for category in desired_categories]
+    created = get_or_create_labels(service, desired_names, args.retries, args.retry_sleep)
+    name_to_id.update(created)
+
+    planned: list[tuple[Decision, set[str], set[str]]] = []
+    for item in decisions:
+        desired_name_to_id = {f"{ROOT_LABEL}/{category}": created[f"{ROOT_LABEL}/{category}"] for category in labelable_categories(item.categories)}
+        add_ids, remove_ids = compute_relabel_plan(item, sorter_label_ids, desired_name_to_id)
+        if add_ids or remove_ids:
+            planned.append((item, add_ids, remove_ids))
+
+    grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[Decision]] = {}
+    for item, add_ids, remove_ids in planned:
+        grouped.setdefault((tuple(sorted(add_ids)), tuple(sorted(remove_ids))), []).append(item)
+
+    batch_count = sum((len(items) + args.batch_size - 1) // args.batch_size for items in grouped.values())
+    print(
+        f"Relabel plan: {len(planned)} messages need label changes in {batch_count} batchModify calls; "
+        f"{len(desired_categories)} target Sorter labels.",
+        flush=True,
+    )
+
+    batch_index = 0
+    for (add_ids, remove_ids), items in grouped.items():
+        for start in range(0, len(items), args.batch_size):
+            batch_index += 1
+            chunk = items[start : start + args.batch_size]
+            body: dict[str, list[str]] = {"ids": [item.message_id for item in chunk]}
+            if add_ids:
+                body["addLabelIds"] = list(add_ids)
+            if remove_ids:
+                body["removeLabelIds"] = list(remove_ids)
+            execute_with_retries(service.users().messages().batchModify(userId="me", body=body), args.retries, args.retry_sleep)
+            for item in chunk:
+                item.action_done = "yes"
+                record_action_ledger(state_conn, args.stage, "relabel", item.message_id)
+            upsert_state_decisions(state_conn, chunk)
+            if batch_index == 1 or batch_index == batch_count or batch_index % args.apply_progress_every == 0:
+                print(f"Relabeled batch {batch_index}/{batch_count}...", flush=True)
+
+
+def prune_empty_sorter_labels(service: Any, retries: int, retry_sleep: float) -> list[str]:
+    """Delete Sorter/* labels that no longer have any messages."""
+
+    labels = execute_with_retries(service.users().labels().list(userId="me"), retries, retry_sleep).get("labels", [])
+    pruned: list[str] = []
+    for label in labels:
+        name = label.get("name", "")
+        if not name.startswith(f"{ROOT_LABEL}/"):
+            continue
+        if int(label.get("messagesTotal", 0) or 0) == 0:
+            try:
+                execute_with_retries(service.users().labels().delete(userId="me", id=label["id"]), retries, retry_sleep)
+                pruned.append(name)
+            except Exception as error:
+                print(f"Could not prune empty label {name}: {error}", file=sys.stderr)
+    return pruned
+
+
 def write_csv(path: Path, decisions: list[Decision]) -> None:
     """Write the flat report used for spreadsheet review."""
 
@@ -2484,6 +2622,9 @@ def write_dashboard(path: Path, decisions: list[Decision], args: argparse.Namesp
 <h2 class="section-title">Archive Review</h2>
 <p class="note">Messages planned for archive now require an independent bulk-mail signal (List-Unsubscribe, List-Id, bulk precedence, campaign header, Gmail Promotions, or a body unsubscribe link), not just a high ad score. The archive reason column shows the evidence used.</p>
 {render_table(archive_items, ["date", "ad_confidence", "primary_category", "sender_domain", "subject", "archive_reason", "planned_actions"], 100)}
+<h2 class="section-title">Relabel Review</h2>
+<p class="note">When run with --stage relabel, the sorter removes stale Sorter/* labels and re-applies the corrected set computed from the latest scan (use --scan full for body-aware relabeling). This preview shows the desired primary/category and the planned label actions per message; the exact before/after diff is written to manifests/relabel_manifest.json.</p>
+{render_table(decisions, ["date", "primary_category", "sender_domain", "subject", "categories", "planned_actions", "body_len"], 100)}
 <h2 class="section-title">Header Unsubscribe Domains</h2>
 <p class="note">Separate section for List-Unsubscribe headers, grouped by sender domain and prioritized by ad confidence, volume, and last-seen date.</p>
 {render_unsubscribe_priority(unsubscribe_items, 20)}
@@ -2541,7 +2682,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--archive-skip-unread", action="store_true", help="Never archive messages that are still unread.")
     parser.add_argument("--trash-threshold", type=int, default=90)
     parser.add_argument("--pre-2020-trash-threshold", type=int, default=75)
-    parser.add_argument("--stage", choices=["classify", "label", "archive", "trash"], default="classify")
+    parser.add_argument("--stage", choices=["classify", "label", "archive", "trash", "relabel"], default="classify")
     parser.add_argument("--workers", type=int, default=8, help="Parallel read/classification workers. Writes remain sequential.")
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--sleep", type=float, default=0.05)
@@ -2564,6 +2705,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-archive-per-domain", type=int, default=0, help="Cap planned archive actions per registered domain; 0 disables the cap.")
     parser.add_argument("--max-archive-total", type=int, default=0, help="Cap total planned archive actions; 0 disables the cap.")
     parser.add_argument("--archive-canary-limit", type=int, default=0, help="When applying archive, only keep the first N archive actions in the apply set.")
+    parser.add_argument("--prune-empty-labels", action="store_true", help="After a relabel apply, delete Sorter/* labels that no longer have any messages.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
     parser.add_argument("--scan", choices=["metadata", "full"], default="metadata", help="metadata = headers+snippet (fast); full = also read decoded body text for body-aware categorization. full costs more Gmail quota and is meant for a relabel/re-scan pass.")
     parser.add_argument("--use-sender-profiles", dest="use_sender_profiles", action="store_true", default=True, help="Use learned sender/domain category history to fix keyword misses (default on).")
@@ -2671,6 +2813,17 @@ def main() -> int:
         save_progress(progress_path, progress)
         upsert_state_decisions(state_conn, decisions)
 
+    if args.apply and args.stage == "relabel" and decisions:
+        print(f"Applying relabel to {len(decisions)} messages (reading current Sorter/* labels and re-applying the corrected set)...", flush=True)
+        apply_relabel(service, decisions, args, state_conn)
+        if args.prune_empty_labels:
+            pruned = prune_empty_sorter_labels(service, args.retries, args.retry_sleep)
+            print(f"Pruned {len(pruned)} empty Sorter labels." + (f" {', '.join(pruned)}" if pruned else ""))
+        for item in decisions:
+            progress[item.message_id] = item
+        save_progress(progress_path, progress)
+        upsert_state_decisions(state_conn, decisions)
+
     decisions.sort(key=lambda item: (item.ad_confidence, item.date, item.sender_domain), reverse=True)
     out_prefix = Path(args.out_prefix)
     write_csv(out_prefix.with_suffix(".csv"), decisions)
@@ -2679,6 +2832,8 @@ def main() -> int:
     write_storage_report(out_prefix.with_name(out_prefix.name + "_storage.csv"), decisions)
     write_unsubscribe_report(out_prefix.with_name(out_prefix.name + "_unsubscribe.csv"), decisions)
     write_action_manifests(Path(args.manifest_dir), decisions)
+    if args.stage == "relabel":
+        write_relabel_manifest(Path(args.manifest_dir) / "relabel_manifest.json", decisions, service, args)
     review_dir = Path(args.review_dir) if args.review_dir else Path(args.manifest_dir) / "review"
     write_review_workflow(review_dir, decisions)
     write_dashboard(out_prefix.with_suffix(".html"), decisions, args)
