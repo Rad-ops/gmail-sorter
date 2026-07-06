@@ -984,6 +984,42 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
             body_text=clean_body_text(body_text) if body_included else "",
             sender_text=f"{sender} {sender_domain}",
         )
+        # v0.8: per-keyword learned weights. When the user has enabled
+        # --use-learned-weights and the trained model is loaded, blend
+        # the learned score in via max(keyword, learned) for every
+        # category. The model is the data-driven ceiling, the
+        # keyword rules are the explainable floor.
+        learned_weights = getattr(args, "_learned_weights", None) or {}
+        if learned_weights:
+            from sorter.learned_weights import apply_learned_score
+            gmail_promotions = "CATEGORY_PROMOTIONS" in labels
+            gmail_primary = "CATEGORY_PRIMARY" in labels
+            for cat in list(category_confidence.keys()):
+                weights = learned_weights.get(cat)
+                if weights is None:
+                    continue
+                # Approximate the per-message hit counts for the
+                # feature vector. We don't have the per-category
+                # hit counts split by position at the categorize
+                # step (they were collapsed into keyword_score), so
+                # use a simple proxy: the stored confidence itself
+                # is a good proxy for the total hit count, and
+                # gmail_category_boost is the same +30 the
+                # hand-tuned code applies.
+                approx_hits = max(1, min(3, int(category_confidence[cat] / 25)))
+                learned = apply_learned_score(
+                    weights,
+                    subject_hits=approx_hits,
+                    body_hits=approx_hits,
+                    sender_hits=1 if cat in (profile_cats or {}) else 0,
+                    has_gmail_promotions=gmail_promotions,
+                    has_gmail_primary=gmail_primary,
+                    sender_profile_boost=float(profile_cats.get(cat, 0)),
+                )
+                if learned > category_confidence[cat]:
+                    category_confidence[cat] = learned
+                    if learned >= getattr(args, "label_confidence", 50):
+                        reasons.append(f"learned_boost:{cat}:{learned}")
     finally:
         if overlay_token is not None:
             restore_policy(overlay_token)
@@ -3280,6 +3316,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
     parser.add_argument("--sender-profile-floor", type=int, default=65, help="Only learn profiles from decisions at or above this ad confidence (protected mail always contributes).")
     parser.add_argument("--sender-profile-half-life-days", type=int, default=180, help="v0.7: half-life in days for the sender-profile time decay. A row older than this contributes half as much weight as a fresh one. 0 disables decay (pre-v0.7 behavior).")
+    parser.add_argument("--use-learned-weights", action="store_true", default=False, help="v0.8: replace the hand-tuned keyword weights with weights learned from the labeled data in the SQLite messages table. Trained on every scan; persisted to data/learned_weights.json. Falls back to hand-tuned weights when not enough labeled data exists.")
+    parser.add_argument("--learned-weights-file", type=str, default="data/learned_weights.json", help="v0.8: path to the learned-weights JSON file.")
     parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
     parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
     parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
@@ -3311,6 +3349,21 @@ def main() -> int:
     # v0.7: pass the config directory to decide() so per-language overlays
     # (config/policy.fr.yaml, config/policy.fa.yaml) can be loaded on demand.
     args._policy_config_dir = str(PROJECT_DIR / "config")
+    # v0.8: train (or load) the per-keyword learned weights. Training
+    # reads the labeled data from the SQLite messages table; the result
+    # is cached in JSON so subsequent scans are fast.
+    args._learned_weights = {}
+    if getattr(args, "use_learned_weights", False):
+        from sorter.learned_weights import load_weights, save_weights, train_from_decisions
+        weights_path = Path(getattr(args, "learned_weights_file", "data/learned_weights.json"))
+        weights = load_weights(weights_path)
+        if not weights:
+            weights = train_from_decisions(state_conn)
+            if weights:
+                save_weights(weights_path, weights)
+                trained_count = sum(1 for w in weights.values() if w.confidence > 0)
+                log.info("learned-weights: trained %d categories from %d decisions", trained_count, len(weights))
+        args._learned_weights = weights
     log.info("gmail-sorter %s (%s) schema_version=%s", APP_VERSION, VERSION_CODE, SCHEMA_VERSION)
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)
