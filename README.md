@@ -1,10 +1,28 @@
-# Gmail Sorter
+# 📬 Gmail Sorter
+
+<p align="center">
+  <img src="assets/gmail-sorter-hero.png" alt="Gmail sorter triage dashboard with AI review checkpoint" width="100%">
+</p>
+
+<p align="center">
+  <strong>Conservative Gmail cleanup with dashboards, manifests, rescue audits, and local AI review.</strong>
+</p>
 
 Dashboard-centered Gmail cleanup tool for older mail. It scans messages before December 30, 2025 by default, categorizes them, reports noisy senders and unsubscribable domains, and applies label/archive/trash stages only when explicitly requested.
 
-Current version: `0.3.1` (`20260705`).
+Current version: `0.3.2` (`20260705`).
 
-## Folder Layout
+## ✨ What It Does
+
+| Stage | Purpose | Safety posture |
+| --- | --- | --- |
+| 🏷️ Label | Mark and organize mail without moving it. | Lowest risk |
+| 📦 Archive | Move low-value bulk mail out of the inbox. | Reviewable |
+| 🗑️ Trash | Move only high-confidence promotional mail to Trash. | Explicit flags required |
+| 🧯 Rescue audit | Re-check Trash before permanent deletion. | Conservative |
+| 🧠 Local AI review | Qwen3.6 reviews bounded packets through local llama.cpp. | No Gmail credentials given to the model |
+
+## 📁 Folder Layout
 
 ```text
 sorter/
@@ -17,7 +35,7 @@ sorter/
   docs/                notes and future documentation
 ```
 
-## Setup
+## ⚙️ Setup
 
 ```bash
 cd /home/rzangeneh/codebase/sorter
@@ -32,7 +50,7 @@ secrets/credentials.json
 
 OAuth tokens are generated under `secrets/` and are intentionally ignored by Git.
 
-## First Scan
+## 🔎 First Scan
 
 ```bash
 python3 src/gmail_sorter.py --resume
@@ -57,7 +75,7 @@ Review the HTML dashboard first. The dashboard includes review queues, noisy sen
 
 The sorter also writes a SQLite state database to `data/gmail_sorter_state.sqlite` unless `--disable-state-db` is used. The database keeps the latest decision for each message plus an append-only action ledger for successful label/archive/trash changes.
 
-## Staged Apply
+## 🧪 Staged Apply
 
 Labels only:
 
@@ -119,7 +137,7 @@ python3 src/gmail_sorter.py \
   --max-trash-per-domain 500
 ```
 
-## Review Workflow
+## 🧭 Review Workflow
 
 `manifests/review/domain_review.csv` groups messages by registered domain, not noisy subdomains. It includes message counts, planned trash/archive counts, protected counts, real attachment counts, storage size, sample subjects, and a suggested action such as `approve_trash`, `unsubscribe_review`, or `protect_priority`.
 
@@ -127,7 +145,7 @@ Priority mail is labeled and protected when it matches immigration, studies, or 
 
 `reports/*_storage.csv` ranks registered domains by estimated Gmail storage usage. Use it to find the few senders that reclaim the most storage without digging through individual messages.
 
-## Maintenance Mode
+## 🛠️ Maintenance Mode
 
 After the historical cleanup, use maintenance scans for new mail only:
 
@@ -141,9 +159,19 @@ Or scan from an exact date:
 python3 src/gmail_sorter.py --since-date 2026-07-01 --resume
 ```
 
-## Trash Rescue Audit
+## 🧯 Trash Rescue Audit
 
 Before permanently emptying Gmail Trash, run a dry-run rescue audit against the messages that the all-years trash command planned to trash:
+
+```mermaid
+flowchart LR
+  A[Sorter trash plan] --> B[Re-fetch messages from Gmail Trash]
+  B --> C[Heuristic rescue audit]
+  C --> D[Local Qwen3.6 review]
+  D --> E{Both say 100% safe trash?}
+  E -->|yes| F[Verified permanent-delete manifest]
+  E -->|no| G[Rescue review / restore labels]
+```
 
 Recommended overnight local-Qwen run:
 
@@ -312,7 +340,14 @@ reports/trash_rescue_audit_local_qwen_missing_gmail_ids.txt
 
 Old progress files may contain message IDs that Gmail no longer has. The audit summarizes those 404 missing IDs and writes them to the missing-ID file instead of printing every API error.
 
-## Performance Controls
+## 🧼 Cleanup And Decision Records
+
+- [Project decision log](docs/DECISION-LOG.md)
+- [Cleanup log for 2026-07-05](docs/CLEANUP-LOG-2026-07-05.md)
+- [Overnight local Qwen3.6 runbook](docs/OVERNIGHT-LOCAL-QWEN-RUNBOOK.md)
+- [Workspace notes](docs/CODEBASE-WORKSPACE.md)
+
+## 📊 Performance Controls
 
 `--workers` controls parallel read/classification workers. Writes remain sequential and batched.
 

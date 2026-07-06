@@ -37,7 +37,7 @@ Local AI stack:
 
 - Keep under `/home/rzangeneh/ai`.
 - OpenAI-compatible endpoint: `http://127.0.0.1:8080/v1`.
-- Preferred profile for long Gmail review: `llm-switch coder-big`.
+- Preferred profile for long Gmail review: `llm-switch qwen36`.
 
 Safety priorities:
 

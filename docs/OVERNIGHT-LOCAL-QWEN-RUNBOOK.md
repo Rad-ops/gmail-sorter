@@ -2,6 +2,16 @@
 
 Use this before permanently emptying Gmail Trash.
 
+```mermaid
+flowchart TD
+  A[Run overnight wrapper] --> B[Prevent sleep with systemd-inhibit]
+  B --> C[Audit planned Trash messages]
+  C --> D[Local Qwen3.6 review]
+  D --> E[HTML / CSV / JSON reports]
+  D --> F[Verified delete manifest when enabled]
+  E --> G[Manual rescue review]
+```
+
 ## Recommended Command
 
 Audit only:

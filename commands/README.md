@@ -1,12 +1,12 @@
-# Commands
+# ⚙️ Commands
 
-Run the overnight local-Qwen safety review:
+Run the overnight Qwen3.6 safety review:
 
 ```bash
 commands/run-overnight-trash-rescue.sh
 ```
 
-Run the overnight local-Qwen safety review and permanently delete only messages that both reviewers classify as 100% safe trash:
+Run the overnight Qwen3.6 safety review and permanently delete only messages that both reviewers classify as 100% safe trash:
 
 ```bash
 commands/run-overnight-trash-rescue-and-delete-verified.sh

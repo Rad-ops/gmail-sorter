@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-llm", action="store_true", help="Send review packets to the local llama.cpp OpenAI-compatible server and merge decisions.")
     parser.add_argument("--local-llm-url", default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--local-llm-model", default="local")
-    parser.add_argument("--local-llm-profile", default="coder-big", help="Profile passed to llm-switch when --start-local-llm is used.")
+    parser.add_argument("--local-llm-profile", default="qwen36", help="Profile passed to llm-switch when --start-local-llm is used.")
     parser.add_argument("--start-local-llm", action="store_true", help="Run llm-switch before calling the local model.")
     parser.add_argument("--local-llm-all", action="store_true", help="Send every audited Trash row to the local model, not only rescue/borderline rows.")
     parser.add_argument("--local-llm-max", type=int, default=0, help="Maximum audit rows to send to the local model; 0 means all rescue/borderline rows.")

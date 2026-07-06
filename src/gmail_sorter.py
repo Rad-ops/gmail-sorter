@@ -33,7 +33,7 @@ MAIL_SCOPE = "https://mail.google.com/"
 DEFAULT_QUERY = "before:2025/12/30 -in:trash"
 ROOT_LABEL = "Sorter"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 VERSION_CODE = "20260705"
 
 AD_SUBJECT_KEYWORDS = [

@@ -16,3 +16,8 @@ data/*
 !data/.gitkeep
 *.csv
 *.html
+*.jsonl
+*.sqlite
+*.db
+*.log
+logs/

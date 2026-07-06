@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.2 - 2026-07-05
+
+### ✨ GitHub Makeover
+
+- Added a generated README hero image at `assets/gmail-sorter-hero.png`.
+- Added emoji section markers, a clearer stage table, and direct links to decision/cleanup docs.
+- Added `docs/DECISION-LOG.md` to explain the safety choices behind local AI review and staged deletion.
+- Added `docs/CLEANUP-LOG-2026-07-05.md` to record local cleanup after the mailbox cleanup finished.
+
+### 🧠 AI Stack Alignment
+
+- Updated local LLM defaults and docs from the removed `coder-big` profile to `qwen36`.
+- Updated `trash_rescue_audit.py` so `--start-local-llm` defaults to `qwen36`.
+- Documented that Qwen3.6 is used here for bounded mailbox review while Gemma 4 belongs to the planner/architect slot in the broader local AI stack.
+- Updated model-stack notes to match the Qwen3.6 primary, DeepSeek 32B reasoning fallback, and Gemma 4 planner stack.
+
+### 🧹 Deep Clean
+
+- Removed stale resume/tomorrow command notes from the repository.
+- Cleaned generated local outputs from `reports/`, `manifests/`, and `data/`, keeping only `.gitkeep` placeholders.
+- Cleaned Python bytecode/test caches from the local workspace.
+- Expanded `.gitignore` for logs, JSONL, SQLite databases, and generated output.
+
+### 🔒 Safety Rationale
+
+- Generated reports/manifests/data are not committed because they can contain private mailbox metadata.
+- Gmail OAuth credentials and tokens remain local only under `secrets/` and were not removed during cleanup.
+- Permanent delete remains gated behind explicit flags and a rescue-audit path.
+
 ## 0.3.1 - 2026-07-05
 
 - Added `--local-llm-all` to let Qwen review every audited Trash row, not only script-selected rescue-review candidates.
@@ -13,7 +42,7 @@
 - Added separate `trash_rescue_audit.py` dry-run tool to double-check messages planned for Trash before permanently emptying Gmail Trash.
 - Added rescue review reports, confidence-bucket labels, optional restore/apply flow, and optional OpenAI/web-assisted review for borderline candidates.
 - Added local-LLM JSONL export/import workflow for Qwen-style offline double checking without giving the local model Gmail access.
-- Added automated local llama.cpp review via `--local-llm`, with optional `llm-switch coder-big` startup and automatic result merge.
+- Added automated local llama.cpp review via `--local-llm`, with optional local profile startup and automatic result merge.
 - Added resumable audit/model checkpoints and a no-sleep unattended command for deleting only messages where both script and local Qwen agree with 100% trash confidence.
 - Reduced noisy Gmail 404 output during Trash rescue audits by summarizing stale/missing message IDs and writing them to a missing-ID file.
 - Added SQLite state storage for message decisions plus an append-only action ledger for successful label/archive/trash changes.
