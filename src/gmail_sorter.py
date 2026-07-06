@@ -1270,29 +1270,114 @@ def open_state_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def sender_profile_key(kind: str, value: str) -> str:
-    return f"{kind}:{value.lower()}"
+def sender_profile_key(kind: str, value: str, category: str = "") -> str:
+    """Return the row key for a (kind, value, category) tuple.
+
+    v0.7 — category is now part of the key. Pre-v0.7 the primary key was
+    ``kind:value``, which meant two decisions for the same sender in
+    different categories (e.g. a friend who sends both personal mail and
+    event invites) collided on the row and lost precision. v0.7 includes
+    the category in the key so the table supports the full one-row-per-
+    (sender, category) shape that the rest of the code already assumes.
+    """
+
+    base = f"{kind}:{value.lower()}"
+    if category:
+        return f"{base}:{category.lower()}"
+    return base
 
 
-def load_sender_profile_index(conn: sqlite3.Connection | None, min_hits: int = 3) -> dict[str, dict[str, int]]:
+def load_sender_profile_index(
+    conn: sqlite3.Connection | None,
+    min_hits: int = 3,
+    half_life_days: int = 180,
+    now: datetime | None = None,
+) -> dict[str, dict[str, int]]:
     """Precompute a sender/domain -> {category: weight} index for the scan.
 
     decide() runs in worker threads without DB access, so the index is built
     once before the scan and consulted via args.sender_profiles. Sender rows
     outweigh domain rows so a specific address beats a noisy domain.
+
+    v0.7 — time decay: a profile row older than ``half_life_days`` carries
+    less weight than a recent one. The decay is
+    ``weight = base_hits * exp(-Δdays / half_life_days)``, which is smooth
+    (no cliff) and well-behaved at the boundary. A half-life of 0 disables
+    decay, preserving the pre-v0.7 flat-weight behavior. The function
+    reads the v3 ``first_seen`` column; pre-v0.7 rows fall back to
+    ``last_seen`` so the migration is invisible to the caller.
     """
 
-    index: dict[str, dict[str, int]] = defaultdict(dict)
+    index: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     if conn is None:
         return {}
+    if half_life_days <= 0:
+        # Pre-v0.7 behavior: no decay.
+        for kind, weight in (("sender", 3), ("domain", 1)):
+            prefix = f"{kind}:%"
+            cur = conn.execute(
+                "SELECT key, category, hits FROM sender_profile WHERE key LIKE ? AND hits>=?",
+                (prefix, min_hits),
+            )
+            for key, category, hits in cur.fetchall():
+                index[key][category] += int(hits) * weight
+        return {key: {cat: int(weight) for cat, weight in cats.items()} for key, cats in index.items()}
+
+    now = now or datetime.now(timezone.utc)
     for kind, weight in (("sender", 3), ("domain", 1)):
+        # v0.7: keys are (kind, value, category). LIKE prefix selects every
+        # category the sender/domain has been labeled as.
+        prefix = f"{kind}:%"
         cur = conn.execute(
-            "SELECT key, category, hits FROM sender_profile WHERE kind=? AND hits>=?",
-            (kind, min_hits),
+            "SELECT key, category, hits, COALESCE(first_seen, last_seen) FROM sender_profile WHERE key LIKE ? AND hits>=?",
+            (prefix, min_hits),
         )
-        for key, category, hits in cur.fetchall():
-            index[key][category] += hits * weight
-    return {key: dict(cats) for key, cats in index.items()}
+        for key, category, hits, first_seen_raw in cur.fetchall():
+            try:
+                first_seen_dt = datetime.fromisoformat(first_seen_raw)
+            except (TypeError, ValueError):
+                index[key][category] += int(hits) * weight
+                continue
+            if first_seen_dt.tzinfo is None:
+                first_seen_dt = first_seen_dt.replace(tzinfo=timezone.utc)
+            delta_days = max(0.0, (now - first_seen_dt).total_seconds() / 86400.0)
+            decay = 2 ** (-delta_days / half_life_days)
+            index[key][category] += int(hits) * weight * decay
+    return {key: {cat: max(1, int(round(weight))) for cat, weight in cats.items()} for key, cats in index.items()}
+
+
+def load_sender_diversity(conn: sqlite3.Connection | None) -> dict[str, int]:
+    """Return a {sender_key: distinct_category_count} map for the dashboard.
+
+    A sender with diversity > 4 is considered "noisy" and shows up in the
+    dashboard's Noisy Senders section. v0.7: keys are
+    (kind, value, category); the dashboard wants the diversity grouped by
+    the (kind, value) parent. We strip the trailing ``:category`` segment
+    in Python so the SQL stays simple.
+    """
+
+    diversity: dict[str, int] = {}
+    if conn is None:
+        return diversity
+    try:
+        cur = conn.execute(
+            "SELECT key, category FROM sender_profile WHERE hits > 0"
+        )
+    except sqlite3.OperationalError:
+        return diversity
+    parent_cats: dict[str, set[str]] = {}
+    for key, category in cur.fetchall():
+        # Strip the trailing ``:category`` segment if present. Keys always
+        # have the form ``kind:value:category`` (lowercased) in v0.7; the
+        # pre-v0.7 shape ``kind:value`` is accepted by the conditional
+        # below so older data continues to work.
+        if ":" in key:
+            segments = key.rsplit(":", 1)
+            parent = segments[0]
+        else:
+            parent = key
+        parent_cats.setdefault(parent, set()).add(category)
+    return {key: len(cats) for key, cats in parent_cats.items()}
 
 
 def load_thread_dominant_categories(conn: sqlite3.Connection | None, progress: dict[str, Decision] | None = None) -> dict[str, str]:
@@ -1337,8 +1422,16 @@ def sender_profile_categories_from_index(index: dict[str, dict[str, int]], sende
     for kind, value in (("sender", sender_email), ("domain", registered_domain)):
         if not value:
             continue
-        for category, weight in index.get(sender_profile_key(kind, value), {}).items():
-            weighted[category] += weight
+        # v0.7: the precomputed index now groups per-category under the
+        # (kind, value) key, not under a single (kind, value) row. The
+        # look-up walks every (kind, value, *) entry in the index that
+        # matches the sender.
+        prefix = f"{kind}:{value.lower()}:"
+        for key, cats in index.items():
+            if not key.startswith(prefix):
+                continue
+            for category, weight in cats.items():
+                weighted[category] += weight
     return dict(weighted)
 
 
@@ -1565,6 +1658,12 @@ def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Deci
     borderline guesses do not poison the sender history. Protected messages
     still contribute their category (immigration/studies/etc.) because those
     are exactly the labels we want to remember for a sender.
+
+    v0.7 — diversity tracking: every write to a (key, category) pair
+    increments the sender's distinct-category count so the dashboard can
+    surface "noisy" senders (diversity > 4). first_seen is set on the
+    *first* write for a key so the time-decay in
+    :func:`load_sender_profile_index` has a stable anchor.
     """
 
     if conn is None or not decisions:
@@ -1580,9 +1679,12 @@ def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Deci
             for kind, value in (("sender", item.sender_email), ("domain", item.registered_domain or item.sender_domain)):
                 if not value:
                     continue
+                # v0.7: include the category in the key so a single sender
+                # can have one row per category, not one row total.
+                key = sender_profile_key(kind, value, category)
                 rows.append(
                     (
-                        sender_profile_key(kind, value),
+                        key,
                         kind,
                         category,
                         1,
@@ -1593,17 +1695,46 @@ def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Deci
                 )
     if not rows:
         return
+    # The UPSERT has to set first_seen to the *existing* value when there is
+    # one. SQLite does not let us reference the existing row from inside the
+    # INSERT statement (no SELECT in the VALUES clause), so we update
+    # first_seen in a follow-up pass that runs only for newly inserted rows.
+    # The primary key is ``key`` which is now (kind, value, category).
     conn.executemany(
         """
-        INSERT INTO sender_profile (key, kind, category, hits, protected_hits, last_seen, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sender_profile (key, kind, category, hits, protected_hits, last_seen, updated_at, first_seen, last_hits, category_diversity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         ON CONFLICT(key) DO UPDATE SET
             hits=sender_profile.hits+excluded.hits,
             protected_hits=sender_profile.protected_hits+excluded.protected_hits,
             last_seen=MAX(sender_profile.last_seen, excluded.last_seen),
-            updated_at=excluded.updated_at
+            updated_at=excluded.updated_at,
+            last_hits=excluded.last_hits
         """,
-        rows,
+        [(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[5], str(r[3])) for r in rows],
+    )
+    # First-seen backfill: any row that was just created gets first_seen set
+    # to last_seen (which is the date the message was received). Existing
+    # rows are untouched.
+    conn.execute(
+        """
+        UPDATE sender_profile
+        SET first_seen = last_seen
+        WHERE first_seen IS NULL OR first_seen = ''
+        """
+    )
+    # v0.7: refresh the per-sender distinct-category count. Done in a
+    # second pass so the diversity is computed against the freshly updated
+    # rows, not the pre-upsert state.
+    conn.execute(
+        """
+        UPDATE sender_profile
+        SET category_diversity = (
+            SELECT COUNT(DISTINCT category) FROM sender_profile sp2
+            WHERE sp2.key = sender_profile.key AND sp2.hits > 0
+        )
+        WHERE key IN (SELECT DISTINCT key FROM sender_profile WHERE hits > 0)
+        """
     )
     conn.commit()
 
@@ -1622,9 +1753,12 @@ def sender_profile_categories(conn: sqlite3.Connection | None, sender_email: str
     for kind, value, weight in (("sender", sender_email, 3), ("domain", registered_domain, 1)):
         if not value:
             continue
+        # v0.7: keys are now (kind, value, category). Use a LIKE prefix to
+        # match every category a sender/domain has been seen as.
+        prefix = f"{kind}:{value.lower()}:%"
         cur = conn.execute(
-            "SELECT category, hits FROM sender_profile WHERE key=? AND hits>=?",
-            (sender_profile_key(kind, value), min_hits),
+            "SELECT category, hits FROM sender_profile WHERE key LIKE ? AND hits>=?",
+            (prefix, min_hits),
         )
         for category, hits in cur.fetchall():
             weighted[category] += hits * weight
@@ -3129,6 +3263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-sender-profiles", dest="use_sender_profiles", action="store_false", help="Disable sender-profile-assisted categorization.")
     parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
     parser.add_argument("--sender-profile-floor", type=int, default=65, help="Only learn profiles from decisions at or above this ad confidence (protected mail always contributes).")
+    parser.add_argument("--sender-profile-half-life-days", type=int, default=180, help="v0.7: half-life in days for the sender-profile time decay. A row older than this contributes half as much weight as a fresh one. 0 disables decay (pre-v0.7 behavior).")
     parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
     parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
     parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
@@ -3205,7 +3340,10 @@ def main() -> int:
 
     progress_path = Path(args.progress_file)
     progress = load_progress(progress_path) if args.resume else {}
-    args.sender_profiles = load_sender_profile_index(state_conn) if getattr(args, "use_sender_profiles", True) else {}
+    args.sender_profiles = load_sender_profile_index(
+        state_conn,
+        half_life_days=getattr(args, "sender_profile_half_life_days", 180),
+    ) if getattr(args, "use_sender_profiles", True) else {}
     args.cached_body_features = load_body_features_index(state_conn) if getattr(args, "scan", "metadata") == "full" and not args.refresh_existing else {}
     args.thread_dominant_categories = load_thread_dominant_categories(state_conn) if getattr(args, "use_thread_aware", False) else {}
     # Embedding backend and centroids: optional semantic classification layer.

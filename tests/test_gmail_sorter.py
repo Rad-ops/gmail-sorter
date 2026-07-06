@@ -282,9 +282,10 @@ class WordBoundaryAndSenderProfileTests(unittest.TestCase):
         # before. This is the self-improvement path for a re-run. The fixture
         # sender deliberately avoids finance keywords so only the profile can
         # add the category.
+        # v0.7: the precomputed index uses (kind, value, category) keys.
         profile_index = {
-            "sender:updates@updates.testmail.co": {"Finance": 9},
-            "domain:testmail.co": {"Finance": 3},
+            "sender:updates@updates.testmail.co:finance": {"Finance": 9},
+            "domain:testmail.co:finance": {"Finance": 3},
         }
         args_profile = args()
         args_profile.use_sender_profiles = True
@@ -305,7 +306,7 @@ class WordBoundaryAndSenderProfileTests(unittest.TestCase):
         self.assertTrue(any(r.startswith("sender_profile:Finance") for r in item.reasons))
 
     def test_sender_profile_does_not_duplicate_existing_category(self):
-        profile_index = {"sender:registrar@school.testmail.co": {"Priority Studies": 9}}
+        profile_index = {"sender:registrar@school.testmail.co:priority studies": {"Priority Studies": 9}}
         args_profile = args()
         args_profile.use_sender_profiles = True
         args_profile.sender_profiles = profile_index
@@ -324,7 +325,7 @@ class WordBoundaryAndSenderProfileTests(unittest.TestCase):
         self.assertEqual(item.categories.count("Priority Studies"), 1)
 
     def test_no_sender_profiles_flag_disables_assist(self):
-        profile_index = {"sender:updates@updates.testmail.co": {"Finance": 9}}
+        profile_index = {"sender:updates@updates.testmail.co:finance": {"Finance": 9}}
         args_profile = args()
         args_profile.use_sender_profiles = False
         args_profile.sender_profiles = profile_index

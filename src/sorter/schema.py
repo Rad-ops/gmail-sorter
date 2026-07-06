@@ -83,13 +83,19 @@ def _migrate_to_2(conn: sqlite3.Connection) -> None:
 
 @_register(3)
 def _migrate_to_3(conn: sqlite3.Connection) -> None:
-    """v3: sender profile time-decay and distinct-categories.
+    """v3: sender profile time-decay, distinct-categories, and key shape.
 
-    Adds ``first_seen``, ``last_hits``, and a derived ``category_diversity``
-    column so the v0.7 sender profile work can apply a half-life decay and
-    surface noisy senders in the dashboard. ``category_diversity`` is a
-    computed column managed by the application; the schema reserves the slot
-    but does not enforce it.
+    Two changes the loader and the rest of the code expect:
+
+    1. Add ``first_seen``, ``last_hits``, and a derived ``category_diversity``
+       column so v0.7's time decay and dashboard noisy-sender list work.
+    2. The pre-v0.7 row key was ``kind:value``. v0.7 includes ``:category``
+       so a sender with multiple distinct categories gets a row per category
+       instead of colliding on the old (kind, value) primary key.
+
+    The migration preserves existing rows. It also back-fills
+    ``first_seen`` from ``last_seen`` so the new decay math has a stable
+    anchor for pre-v0.7 data.
     """
 
     for column, ddl_type in (
@@ -103,6 +109,56 @@ def _migrate_to_3(conn: sqlite3.Connection) -> None:
         if column not in names:
             conn.execute(f"ALTER TABLE sender_profile ADD COLUMN {column} {ddl_type}")
             log.info("schema v3: added sender_profile.%s", column)
+
+    # v0.7: rewrite the keys so the table actually supports one row per
+    # (kind, value, category). Pre-v0.7 keys were ``kind:value`` only; the
+    # same key got reused for every category the sender was seen as, which
+    # collapsed diversity and made per-category weights meaningless. We
+    # rewrite the keys and the existing data carries over because the
+    # ``category`` column already carried the lost information.
+    rows = conn.execute("SELECT key, kind, category FROM sender_profile").fetchall()
+    rewrites: list[tuple[str, str]] = []
+    for key, kind, category in rows:
+        if not category:
+            continue
+        # Strip the trailing category segment if the key already has it
+        # (re-running this migration).
+        expected_suffix = f":{category.lower()}"
+        if key.endswith(expected_suffix):
+            continue
+        # The pre-v0.7 key shape was ``kind:value``. The category is in the
+        # ``category`` column, so we can rebuild the canonical key.
+        prefix = f"{kind}:"
+        if key.startswith(prefix):
+            value = key[len(prefix):]
+        else:
+            value = key
+        new_key = f"{prefix}{value.lower()}:{category.lower()}"
+        if new_key != key:
+            rewrites.append((new_key, key))
+    for new_key, old_key in rewrites:
+        # ``category`` is not part of any UNIQUE/PRIMARY KEY in the v1
+        # schema, so the rewrite is safe: we are simply renaming a column
+        # value, not changing the row identity.
+        conn.execute("UPDATE sender_profile SET key=? WHERE key=?", (new_key, old_key))
+
+    # Backfill first_seen from last_seen for pre-v0.7 rows.
+    conn.execute(
+        "UPDATE sender_profile SET first_seen = last_seen WHERE first_seen IS NULL OR first_seen = ''"
+    )
+
+    # Recompute category_diversity for the freshly rewritten keys.
+    conn.execute(
+        """
+        UPDATE sender_profile
+        SET category_diversity = (
+            SELECT COUNT(DISTINCT sp2.category) FROM sender_profile sp2
+            WHERE sp2.key LIKE (sender_profile.key || ':%') AND sp2.hits > 0
+        )
+        WHERE hits > 0
+        """
+    )
+    log.info("schema v3: rewrote %d sender_profile keys for per-category uniqueness", len(rewrites))
 
 
 def _ensure_migrations_table(conn: sqlite3.Connection) -> set[int]:
