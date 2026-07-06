@@ -488,8 +488,65 @@ def parse_date(raw_date: str, internal_date: str | None) -> str:
 
 
 def contains_any(text: str, keywords: list[str]) -> list[str]:
+    """Substring keyword match (legacy).
+
+    Kept for the few places where a literal substring is genuinely intended
+    (e.g. unsubscribe URL detection is handled separately). Classification and
+    ad scoring use keyword_hits() instead, which applies word boundaries so a
+    domain like "example.com" no longer matches the studies keyword "exam".
+    """
+
     lowered = text.lower()
     return [keyword for keyword in keywords if keyword in lowered]
+
+
+_WORDLIKE_RE = re.compile(r"^[a-z0-9]+(?:[\s'][a-z0-9]+)*[a-z0-9]$|^[a-z0-9]$")
+_KEYWORD_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
+
+
+def _keyword_to_pattern(keyword: str) -> str:
+    """One keyword -> a regex alternation piece with boundary when word-like."""
+
+    if _WORDLIKE_RE.match(keyword):
+        return rf"\b{re.escape(keyword)}\b"
+    return re.escape(keyword)
+
+
+def compile_keywords(keywords: list[str]) -> re.Pattern[str]:
+    """Compile a keyword list into one fast alternation regex with boundaries.
+
+    Word-like keywords (letters/digits/spaces/apostrophes) get \\b boundaries so
+    "exam" does not match "example.com" and "class" does not match
+    "classification". Keywords containing punctuation (e.g. "% off", "2fa")
+    are matched as escaped substrings since \\b does not behave around
+    non-word characters.
+    """
+
+    key = tuple(sorted(keywords))
+    cached = _KEYWORD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    pieces = [_keyword_to_pattern(kw) for kw in key if kw]
+    pattern = re.compile("|".join(pieces) or "(?!)", re.IGNORECASE)
+    _KEYWORD_CACHE[key] = pattern
+    return pattern
+
+
+def keyword_hits(text: str, keywords: list[str]) -> list[str]:
+    """Return the keywords present in text using word-boundary matching.
+
+    Word-like keywords (letters/digits/spaces/apostrophes) get \\b boundaries so
+    "exam" does not match "example.com" and "class" does not match
+    "classification". Keywords containing punctuation (e.g. "% off") are
+    matched as escaped substrings since \\b does not behave around non-word
+    characters. Each keyword is reported once, in input order, so callers can
+    build readable reason strings from the hits.
+    """
+
+    if not text or not keywords:
+        return []
+    lowered = text.lower()
+    return [keyword for keyword in keywords if re.search(_keyword_to_pattern(keyword), lowered)]
 
 
 def regex_hits(text: str, patterns: list[str]) -> list[str]:
@@ -764,9 +821,9 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
         reasons.append("campaign_header")
 
     for prefix, hits, weight, cap in [
-        ("sender", contains_any(sender, AD_SENDER_KEYWORDS), 8, 25),
-        ("subject", contains_any(subject, AD_SUBJECT_KEYWORDS), 10, 35),
-        ("snippet", contains_any(snippet, AD_BODY_KEYWORDS), 12, 30),
+        ("sender", keyword_hits(sender, AD_SENDER_KEYWORDS), 8, 25),
+        ("subject", keyword_hits(subject, AD_SUBJECT_KEYWORDS), 10, 35),
+        ("snippet", keyword_hits(snippet, AD_BODY_KEYWORDS), 12, 30),
     ]:
         if hits:
             score += min(cap, weight * len(hits))
@@ -784,7 +841,7 @@ def score_ad(headers: dict[str, str], labels: list[str], sender: str, sender_dom
 
     # Transactional words pull the score down. A receipt or account alert from a
     # promotional sender is still a durable record.
-    negative_hits = contains_any(searchable, TRANSACTIONAL_KEYWORDS)
+    negative_hits = keyword_hits(searchable, TRANSACTIONAL_KEYWORDS)
     if negative_hits:
         score -= min(70, 18 * len(negative_hits))
         negative_reasons.extend(f"transactional:{hit}" for hit in negative_hits)
@@ -827,9 +884,9 @@ def is_perfect_ad_match(
         ]
     )
     promo_content_signals = (
-        len(contains_any(subject, AD_SUBJECT_KEYWORDS))
+        len(keyword_hits(subject, AD_SUBJECT_KEYWORDS))
         + len(regex_hits(subject, STRONG_PROMO_SUBJECT_PATTERNS))
-        + len(contains_any(snippet, AD_BODY_KEYWORDS))
+        + len(keyword_hits(snippet, AD_BODY_KEYWORDS))
     )
     disqualifiers = {
         "allowlisted_sender_or_domain",
@@ -864,7 +921,7 @@ def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[s
         # Only add category if:
         # 1. Any keyword is found
         # 2. No exclusion pattern is present
-        if contains_any(searchable, keywords) and not contains_any(searchable, exclusions):
+        if keyword_hits(searchable, keywords) and not keyword_hits(searchable, exclusions):
             categories.append(name)
     if "CATEGORY_SOCIAL" in labels:
         categories.append("Social")
@@ -943,6 +1000,22 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         ad_confidence = min(100, ad_confidence + age_boost)
         reasons.append(f"older_mail_boost:{age_boost}")
     categories = categorize(searchable, labels, ad_confidence)
+    # Sender history: if this address/domain was consistently labeled a category
+    # before, surface it even when the subject keywords missed. This makes a
+    # re-run on an already-labeled mailbox self-improve: the first pass teaches
+    # the profile, and the second pass uses it to fix keyword misses.
+    if getattr(args, "use_sender_profiles", True):
+        profile_index = getattr(args, "sender_profiles", {}) or {}
+        profile_cats = sender_profile_categories_from_index(profile_index, sender_email, registered_domain)
+        if profile_cats:
+            keyword_categories = set(categories)
+            min_profile_weight = getattr(args, "sender_profile_min_weight", 6)
+            for category, weight in sorted(profile_cats.items(), key=lambda kv: kv[1], reverse=True):
+                if category in NON_LABEL_CATEGORIES or category in keyword_categories:
+                    continue
+                if weight >= min_profile_weight:
+                    categories.append(category)
+                    reasons.append(f"sender_profile:{category}:{weight}")
     has_attachment = payload_has_attachment(payload)
     real_attachment_count, inline_attachment_count = attachment_counts(payload)
     has_real_attachment = real_attachment_count > 0
@@ -1200,8 +1273,134 @@ def open_state_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sender_profile (
+            key TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            category TEXT NOT NULL,
+            hits INTEGER NOT NULL DEFAULT 0,
+            protected_hits INTEGER NOT NULL DEFAULT 0,
+            last_seen TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sender_profile_kind ON sender_profile(kind, category)"
+    )
     conn.commit()
     return conn
+
+
+def sender_profile_key(kind: str, value: str) -> str:
+    return f"{kind}:{value.lower()}"
+
+
+def load_sender_profile_index(conn: sqlite3.Connection | None, min_hits: int = 3) -> dict[str, dict[str, int]]:
+    """Precompute a sender/domain -> {category: weight} index for the scan.
+
+    decide() runs in worker threads without DB access, so the index is built
+    once before the scan and consulted via args.sender_profiles. Sender rows
+    outweigh domain rows so a specific address beats a noisy domain.
+    """
+
+    index: dict[str, dict[str, int]] = defaultdict(dict)
+    if conn is None:
+        return {}
+    for kind, weight in (("sender", 3), ("domain", 1)):
+        cur = conn.execute(
+            "SELECT key, category, hits FROM sender_profile WHERE kind=? AND hits>=?",
+            (kind, min_hits),
+        )
+        for key, category, hits in cur.fetchall():
+            index[key][category] += hits * weight
+    return {key: dict(cats) for key, cats in index.items()}
+
+
+def sender_profile_categories_from_index(index: dict[str, dict[str, int]], sender_email: str, registered_domain: str) -> dict[str, int]:
+    """Look up learned categories for a sender/domain from the precomputed index."""
+
+    weighted: dict[str, int] = defaultdict(int)
+    for kind, value in (("sender", sender_email), ("domain", registered_domain)):
+        if not value:
+            continue
+        for category, weight in index.get(sender_profile_key(kind, value), {}).items():
+            weighted[category] += weight
+    return dict(weighted)
+
+
+def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Decision], confidence_floor: int = 65) -> None:
+    """Accumulate high-confidence category decisions per sender/domain.
+
+    Profiles are learned only from decisions at or above confidence_floor so
+    borderline guesses do not poison the sender history. Protected messages
+    still contribute their category (immigration/studies/etc.) because those
+    are exactly the labels we want to remember for a sender.
+    """
+
+    if conn is None or not decisions:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for item in decisions:
+        if not item.categories or item.ad_confidence < confidence_floor and not item.protected:
+            continue
+        for category in item.categories:
+            if category in NON_LABEL_CATEGORIES:
+                continue
+            for kind, value in (("sender", item.sender_email), ("domain", item.registered_domain or item.sender_domain)):
+                if not value:
+                    continue
+                rows.append(
+                    (
+                        sender_profile_key(kind, value),
+                        kind,
+                        category,
+                        1,
+                        1 if item.protected else 0,
+                        item.date or now[:10],
+                        now,
+                    )
+                )
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO sender_profile (key, kind, category, hits, protected_hits, last_seen, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            hits=sender_profile.hits+excluded.hits,
+            protected_hits=sender_profile.protected_hits+excluded.protected_hits,
+            last_seen=MAX(sender_profile.last_seen, excluded.last_seen),
+            updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def sender_profile_categories(conn: sqlite3.Connection | None, sender_email: str, registered_domain: str, min_hits: int = 3) -> dict[str, int]:
+    """Return {category: weight} a sender/domain has been labeled as before.
+
+    Sender-level hits outweigh domain-level hits so a single noisy domain does
+    not override a specific address. Returns an empty dict when there is no
+    usable history, so callers can fall back to keyword classification.
+    """
+
+    if conn is None:
+        return {}
+    weighted: dict[str, int] = defaultdict(int)
+    for kind, value, weight in (("sender", sender_email, 3), ("domain", registered_domain, 1)):
+        if not value:
+            continue
+        cur = conn.execute(
+            "SELECT category, hits FROM sender_profile WHERE key=? AND hits>=?",
+            (sender_profile_key(kind, value), min_hits),
+        )
+        for category, hits in cur.fetchall():
+            weighted[category] += hits * weight
+    return dict(weighted)
 
 
 def upsert_state_decisions(conn: sqlite3.Connection | None, decisions: list[Decision]) -> None:
@@ -2264,6 +2463,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-archive-total", type=int, default=0, help="Cap total planned archive actions; 0 disables the cap.")
     parser.add_argument("--archive-canary-limit", type=int, default=0, help="When applying archive, only keep the first N archive actions in the apply set.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
+    parser.add_argument("--use-sender-profiles", dest="use_sender_profiles", action="store_true", default=True, help="Use learned sender/domain category history to fix keyword misses (default on).")
+    parser.add_argument("--no-sender-profiles", dest="use_sender_profiles", action="store_false", help="Disable sender-profile-assisted categorization.")
+    parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
+    parser.add_argument("--sender-profile-floor", type=int, default=65, help="Only learn profiles from decisions at or above this ad confidence (protected mail always contributes).")
     parser.add_argument("--apply", action="store_true", help="Actually modify Gmail for the selected stage.")
     parser.add_argument("--trash-obvious-ads", action="store_true", help="Allow trash actions during --stage trash.")
     parser.add_argument("--i-understand-trash", action="store_true", help="Required with --apply --stage trash --trash-obvious-ads.")
@@ -2317,12 +2520,16 @@ def main() -> int:
 
     progress_path = Path(args.progress_file)
     progress = load_progress(progress_path) if args.resume else {}
-    print(f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}")
+    args.sender_profiles = load_sender_profile_index(state_conn) if getattr(args, "use_sender_profiles", True) else {}
+    profile_count = len(args.sender_profiles)
+    print(f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}" + (f"; sender profiles loaded={profile_count}" if profile_count else ""))
     progress = scan_messages(message_ids, progress, creds, build, args, config)
     save_progress(progress_path, progress)
 
     decisions = decisions_for_current_query(progress, message_ids)
     upsert_state_decisions(state_conn, decisions)
+    if getattr(args, "use_sender_profiles", True):
+        update_sender_profiles(state_conn, decisions, confidence_floor=args.sender_profile_floor)
     stale_progress_count = len(progress) - len(decisions)
     if stale_progress_count > 0:
         print(f"Ignoring {stale_progress_count} cached decisions outside the current query/report set.")

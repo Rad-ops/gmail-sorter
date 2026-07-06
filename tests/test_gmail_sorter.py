@@ -230,5 +230,89 @@ class ArchiveAndLabelPolicyTests(unittest.TestCase):
         self.assertTrue(any("archive_total_cap:3" in d.negative_reasons for d in decisions))
 
 
+class WordBoundaryAndSenderProfileTests(unittest.TestCase):
+    """Regression tests for word-boundary keyword matching and sender profiles."""
+
+    def test_wordlike_keywords_use_boundaries(self):
+        # "exam" must not match inside "example.com"; "class" must not match
+        # "classification". This is the substring bug that mislabeled mail.
+        self.assertEqual(gmail_sorter.keyword_hits("news@example.com", ["exam"]), [])
+        self.assertEqual(gmail_sorter.keyword_hits("classification report", ["class"]), [])
+        self.assertEqual(gmail_sorter.keyword_hits("salon reminder", ["sale"]), [])
+        # Genuine standalone matches still work, including multi-word phrases.
+        self.assertEqual(gmail_sorter.keyword_hits("your exam results", ["exam"]), ["exam"])
+        self.assertEqual(gmail_sorter.keyword_hits("limited time offer", ["limited time"]), ["limited time"])
+
+    def test_punctuation_keywords_match_as_substrings(self):
+        # "% off" starts with a non-word char so it is matched as an escaped
+        # substring rather than with \b, which would not behave around %.
+        self.assertEqual(gmail_sorter.keyword_hits("save 50% off today", ["% off"]), ["% off"])
+
+    def test_sender_profile_adds_missed_category(self):
+        # A statement whose subject lacks finance keywords should still be
+        # labeled Finance when the sender was consistently labeled Finance
+        # before. This is the self-improvement path for a re-run. The fixture
+        # sender deliberately avoids finance keywords so only the profile can
+        # add the category.
+        profile_index = {
+            "sender:updates@updates.testmail.co": {"Finance": 9},
+            "domain:testmail.co": {"Finance": 3},
+        }
+        args_profile = args()
+        args_profile.use_sender_profiles = True
+        args_profile.sender_profiles = profile_index
+        args_profile.sender_profile_min_weight = 6
+        msg = message(
+            payload(
+                {
+                    "From": "Updates <updates@updates.testmail.co>",
+                    "Subject": "Your monthly update",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="please review your account",
+        )
+        item = gmail_sorter.decide(msg, args_profile, gmail_sorter.Config())
+        self.assertIn("Finance", item.categories)
+        self.assertTrue(any(r.startswith("sender_profile:Finance") for r in item.reasons))
+
+    def test_sender_profile_does_not_duplicate_existing_category(self):
+        profile_index = {"sender:registrar@school.testmail.co": {"Priority Studies": 9}}
+        args_profile = args()
+        args_profile.use_sender_profiles = True
+        args_profile.sender_profiles = profile_index
+        args_profile.sender_profile_min_weight = 6
+        msg = message(
+            payload(
+                {
+                    "From": "School <registrar@school.testmail.co>",
+                    "Subject": "Transcript and exam schedule",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="university registrar",
+        )
+        item = gmail_sorter.decide(msg, args_profile, gmail_sorter.Config())
+        self.assertEqual(item.categories.count("Priority Studies"), 1)
+
+    def test_no_sender_profiles_flag_disables_assist(self):
+        profile_index = {"sender:updates@updates.testmail.co": {"Finance": 9}}
+        args_profile = args()
+        args_profile.use_sender_profiles = False
+        args_profile.sender_profiles = profile_index
+        msg = message(
+            payload(
+                {
+                    "From": "Updates <updates@updates.testmail.co>",
+                    "Subject": "Your monthly update",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="please review your account",
+        )
+        item = gmail_sorter.decide(msg, args_profile, gmail_sorter.Config())
+        self.assertNotIn("Finance", item.categories)
+
+
 if __name__ == "__main__":
     unittest.main()
