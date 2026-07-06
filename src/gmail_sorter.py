@@ -749,7 +749,7 @@ def is_perfect_ad_match(
     )
 
 
-def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence: int, sender_profile_cats: dict[str, int] | None = None) -> dict[str, int]:
+def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence: int, sender_profile_cats: dict[str, int] | None = None, subject: str = "", body_text: str = "") -> dict[str, int]:
     """Return {category: confidence 0-100} from evidence.
 
     Confidence is the policy input that lets the relabel/label stages apply only
@@ -759,9 +759,11 @@ def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence
     keywords plus a sender profile scores high and is kept.
 
     Scoring model (intentionally simple and explainable):
-      - each keyword hit on a rule adds 25, capped at 75 for the keyword family
-      - a Gmail CATEGORY_* label for the bucket adds 30 (the mail transport's
-        own classification is strong independent evidence)
+      - subject keyword hits: 30 each (strong signal — the sender chose these words)
+      - body keyword hits: 20 each (weaker — body text is longer and noisier)
+      - sender/domain keyword hits: 15 each (sender metadata)
+      - keyword family capped at 75
+      - a Gmail CATEGORY_* label for the bucket adds 30
       - a sender-profile hit adds the learned weight (capped at 25)
       - Ads Promotions / Newsletters Bulk derive their confidence from the ad
         confidence / promotions label directly
@@ -773,15 +775,29 @@ def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence
     elif "CATEGORY_PROMOTIONS" in labels:
         categories["Newsletters Bulk"] = 60
 
+    # Map Gmail CATEGORY_* labels to sorter categories for a confidence boost.
+    gmail_category_boost = {
+        "CATEGORY_UPDATES": {"Account Security", "Finance", "Receipts Orders", "Utilities", "Subscriptions"},
+        "CATEGORY_SOCIAL": {"Social"},
+        "CATEGORY_FORUMS": {"Forums"},
+    }
+
     profile_cats = sender_profile_cats or {}
     for name, keywords, exclusions in CATEGORY_RULES:
         if exclusions and keyword_hits(searchable, exclusions):
             continue
-        hits = keyword_hits(searchable, keywords)
-        if not hits:
+        # Split scoring: subject hits are worth more than body/sender hits.
+        subject_hits = keyword_hits(subject, keywords) if subject else keyword_hits(searchable, keywords)
+        all_hits = keyword_hits(searchable, keywords)
+        if not all_hits:
             continue
-        keyword_score = min(75, 25 * len(hits))
-        category_label_score = 30 if name == "Social" and "CATEGORY_SOCIAL" in labels else 0
+        body_only_hits = [h for h in all_hits if h not in subject_hits]
+        keyword_score = min(75, 30 * len(subject_hits) + 20 * len(body_only_hits) + 15 * max(0, len(all_hits) - len(subject_hits) - len(body_only_hits)))
+        category_label_score = 0
+        for gmail_label, buckets in gmail_category_boost.items():
+            if gmail_label in labels and name in buckets:
+                category_label_score = 30
+                break
         profile_score = min(25, profile_cats.get(name, 0))
         categories[name] = min(100, keyword_score + category_label_score + profile_score)
 
@@ -792,7 +808,7 @@ def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence
     if "CATEGORY_UPDATES" in labels and not categories:
         categories["Updates"] = 50
     if not categories:
-        categories["Review"] = 40
+        categories["Review"] = 30
     return categories
 
 
@@ -882,7 +898,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     if getattr(args, "use_sender_profiles", True):
         profile_index = getattr(args, "sender_profiles", {}) or {}
         profile_cats = sender_profile_categories_from_index(profile_index, sender_email, registered_domain)
-    category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats)
+    category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats, subject=subject, body_text=body_text)
     # Merge body-derived category hits from a previous full scan when this run
     # used the cache (metadata-only fetch). Cached hits let categorization stay
     # body-aware without re-fetching the body.
@@ -2199,6 +2215,128 @@ def load_manifest_ids(path: Path) -> set[str]:
     return set(data.get("message_ids", []))
 
 
+# --- AI label review packet export/merge -------------------------------------
+#
+# The code classifies with keyword rules + sender profiles + confidence scoring.
+# That is fast and explainable, but it cannot understand context, intent, or
+# nuance the way a language model can. So low-confidence decisions are exported
+# as bounded review packets for an AI (local Qwen, Opencode, or any model) to
+# inspect, suggest corrections, and write back. The script then merges both
+# opinions before applying.
+#
+# Privacy: packets contain sender, subject, snippet, a bounded body excerpt
+# (max 1200 chars, quotes/footers stripped), and the code's decision + reasons.
+# They do NOT contain OAuth tokens, full body text, or attachment bytes.
+# Packets are written to data/ which is gitignored.
+
+AI_REVIEW_BODY_EXCERPT_CHARS = 1200
+
+
+def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: int, body_excerpt_chars: int = AI_REVIEW_BODY_EXCERPT_CHARS) -> int:
+    """Export low-confidence decisions as JSONL for AI label review.
+
+    A message is exported when its highest category confidence is below the
+    threshold, OR it landed in a catch-all bucket (Review/Updates), OR it has
+    conflicting non-protected categories. Messages at 100% confidence are
+    skipped — the code is sure, no AI review needed.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    packets: list[dict[str, Any]] = []
+    for item in decisions:
+        max_conf = max(item.category_confidence.values()) if item.category_confidence else 0
+        is_catchall = bool(NON_LABEL_CATEGORIES.intersection(item.categories))
+        has_conflict = len([c for c in item.categories if c not in NON_LABEL_CATEGORIES]) > 2
+        if max_conf >= 100 and not is_catchall:
+            continue
+        if max_conf >= threshold and not is_catchall and not has_conflict:
+            continue
+        # Build a bounded body excerpt from snippet + any cached body hits.
+        body_excerpt = item.snippet or ""
+        if item.body_category_hits:
+            body_excerpt += f"\n[body keywords: {', '.join(item.body_category_hits)}]"
+        body_excerpt = body_excerpt[:body_excerpt_chars]
+        packets.append({
+            "message_id": item.message_id,
+            "thread_id": item.thread_id,
+            "date": item.date,
+            "sender": item.sender,
+            "sender_email": item.sender_email,
+            "sender_domain": item.sender_domain,
+            "registered_domain": item.registered_domain,
+            "subject": item.subject,
+            "body_excerpt": body_excerpt,
+            "code_categories": item.categories,
+            "code_primary_category": item.primary_category,
+            "code_confidence": item.category_confidence,
+            "code_reasons": item.reasons,
+            "code_negative_reasons": item.negative_reasons,
+            "protected": item.protected,
+            "has_attachment": item.has_attachment,
+            "has_real_attachment": item.has_real_attachment,
+            "list_unsubscribe": item.list_unsubscribe[:200] if item.list_unsubscribe else "",
+            "ai_label": "",
+            "ai_confidence": 0,
+            "ai_reason": "",
+            "ai_reviewed": False,
+        })
+    with path.open("w", encoding="utf-8") as file:
+        for packet in packets:
+            file.write(json.dumps(packet, ensure_ascii=False) + "\n")
+    return len(packets)
+
+
+def merge_ai_labels(decisions: list[Decision], path: Path, min_ai_confidence: float = 0.7) -> tuple[int, int]:
+    """Merge AI-reviewed labels back into decisions.
+
+    Reads the reviewed JSONL and adjusts a decision when the AI suggests a
+    different label with confidence >= min_ai_confidence (0-1). Protected
+    status is never removed — the AI can add a protected category but cannot
+    take one away. Returns (agreed, overridden) counts.
+    """
+
+    if not path.exists():
+        return 0, 0
+    ai_map: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            packet = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if packet.get("ai_reviewed") and packet.get("ai_label"):
+            ai_map[packet["message_id"]] = packet
+    agreed = 0
+    overridden = 0
+    for item in decisions:
+        packet = ai_map.get(item.message_id)
+        if not packet:
+            continue
+        ai_label = packet["ai_label"]
+        ai_conf = float(packet.get("ai_confidence", 0))
+        if ai_label in item.categories:
+            agreed += 1
+            continue
+        if ai_conf < min_ai_confidence:
+            continue
+        # AI suggests a different label. Apply it with a reason, but never
+        # remove a protected category the code already assigned.
+        if ai_label not in NON_LABEL_CATEGORIES and ai_label not in item.categories:
+            item.categories.append(ai_label)
+            item.categories = sorted(set(item.categories))
+            item.category_confidence[ai_label] = int(ai_conf * 100)
+            item.reasons.append(f"ai_override:{ai_label}:{ai_conf:.2f}")
+            # Re-pick primary if the AI's label is higher precedence.
+            new_primary = pick_primary_category(item.categories)
+            if new_primary != item.primary_category:
+                item.primary_category = new_primary
+            item.planned_actions = [f"label:{c}" for c in labelable_categories(item.categories)]
+            overridden += 1
+    return agreed, overridden
+
+
 def esc(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
@@ -2716,6 +2854,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relabel-label", default="", help="Restrict a relabel stage to messages that currently carry this Sorter label (with or without the 'Sorter/' prefix).")
     parser.add_argument("--undo-relabel", default="", help="Reverse a previous relabel run by its run_id (printed at the end of an apply). Use with --apply to actually undo; otherwise dry-run.")
     parser.add_argument("--relabel-run-id", default="", help="Reuse a relabel run_id to resume an interrupted apply (skips messages already recorded in the ledger for that run).")
+    parser.add_argument("--export-ai-review", action="store_true", help="After scan, export low-confidence decisions as JSONL review packets for an AI model to inspect and suggest labels.")
+    parser.add_argument("--ai-review-threshold", type=int, default=75, help="Export decisions whose top category confidence is below this for AI review; 100-confidence messages are always skipped.")
+    parser.add_argument("--ai-review-file", default=str(PROJECT_DIR / "data" / "label_review_packets.jsonl"), help="Path to the AI review JSONL file (export and merge both use this path).")
+    parser.add_argument("--merge-ai-labels", action="store_true", help="Before apply, merge AI-reviewed labels from the review file back into decisions. The AI can add a label the code missed; protected status is never removed.")
+    parser.add_argument("--ai-merge-min-confidence", type=float, default=0.7, help="Minimum AI confidence (0-1) required to override the code's label with the AI's suggestion.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
     parser.add_argument("--scan", choices=["metadata", "full"], default="metadata", help="metadata = headers+snippet (fast); full = also read decoded body text for body-aware categorization. full costs more Gmail quota and is meant for a relabel/re-scan pass.")
     parser.add_argument("--use-sender-profiles", dest="use_sender_profiles", action="store_true", default=True, help="Use learned sender/domain category history to fix keyword misses (default on).")
@@ -2852,6 +2995,14 @@ def main() -> int:
         apply_archive_policy_caps(decisions, args)
         upsert_state_decisions(state_conn, decisions)
 
+    # Merge AI-reviewed labels before apply. The AI file is filled by a model
+    # between the export step and this run; see HANDOVER.md for the workflow.
+    if getattr(args, "merge_ai_labels", False):
+        ai_path = Path(getattr(args, "ai_review_file", ""))
+        agreed, overridden = merge_ai_labels(decisions, ai_path, min_ai_confidence=args.ai_merge_min_confidence)
+        print(f"AI label merge: {agreed} agreed, {overridden} overridden by AI suggestions.", flush=True)
+        upsert_state_decisions(state_conn, decisions)
+
     if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
         action_count = sum(
             1
@@ -2890,6 +3041,11 @@ def main() -> int:
     write_action_manifests(Path(args.manifest_dir), decisions)
     if args.stage == "relabel":
         write_relabel_manifest(Path(args.manifest_dir) / "relabel_manifest.json", decisions, service, args)
+    if getattr(args, "export_ai_review", False):
+        ai_path = Path(getattr(args, "ai_review_file", ""))
+        packet_count = export_ai_review_packets(ai_path, decisions, args.ai_review_threshold)
+        print(f"Exported {packet_count} low-confidence decisions for AI review to {ai_path}", flush=True)
+        print("Fill ai_label/ai_confidence/ai_reason/ai_reviewed in that file, then re-run with --merge-ai-labels.", flush=True)
     review_dir = Path(args.review_dir) if args.review_dir else Path(args.manifest_dir) / "review"
     write_review_workflow(review_dir, decisions)
     write_dashboard(out_prefix.with_suffix(".html"), decisions, args)

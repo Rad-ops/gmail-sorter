@@ -698,5 +698,95 @@ class BodyFeatureCacheTests(unittest.TestCase):
         self.assertTrue(any(r.startswith("cached_body:") for r in item.reasons))
 
 
+class AIReviewPacketTests(unittest.TestCase):
+    """Tests for AI label review packet export and merge."""
+
+    def _decision(self, mid, categories, confidence, primary="", protected=False):
+        return gmail_sorter.Decision(
+            message_id=mid,
+            thread_id="t",
+            date="2024-01-01",
+            sender="S <s@x.testmail.co>",
+            sender_email="s@x.testmail.co",
+            sender_domain="x.testmail.co",
+            registered_domain="testmail.co",
+            subject="sub",
+            snippet="",
+            categories=categories,
+            primary_category=primary or categories[0] if categories else "Review",
+            category_confidence=confidence,
+            protected=protected,
+        )
+
+    def test_export_skips_100_confidence(self):
+        import tempfile
+        decisions = [
+            self._decision("m1", ["Finance"], {"Finance": 100}, primary="Finance"),
+            self._decision("m2", ["Review"], {"Review": 40}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "packets.jsonl"
+            count = gmail_sorter.export_ai_review_packets(path, decisions, threshold=75)
+            self.assertEqual(count, 1)
+            lines = path.read_text(encoding="utf-8").strip().splitlines()
+            packet = json.loads(lines[0])
+            self.assertEqual(packet["message_id"], "m2")
+            self.assertFalse(packet["ai_reviewed"])
+            self.assertEqual(packet["ai_label"], "")
+
+    def test_merge_applies_ai_label_when_confident(self):
+        import tempfile
+        decisions = [self._decision("m1", ["Shopping"], {"Shopping": 40}, primary="Shopping")]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "packets.jsonl"
+            packet = {
+                "message_id": "m1",
+                "ai_label": "Finance",
+                "ai_confidence": 0.9,
+                "ai_reason": "This is a bank statement about a payment",
+                "ai_reviewed": True,
+            }
+            path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
+            agreed, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            self.assertEqual(overridden, 1)
+            self.assertIn("Finance", decisions[0].categories)
+            self.assertTrue(any(r.startswith("ai_override:Finance") for r in decisions[0].reasons))
+
+    def test_merge_skips_low_confidence_ai(self):
+        import tempfile
+        decisions = [self._decision("m1", ["Shopping"], {"Shopping": 40}, primary="Shopping")]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "packets.jsonl"
+            packet = {
+                "message_id": "m1",
+                "ai_label": "Finance",
+                "ai_confidence": 0.3,
+                "ai_reason": "maybe finance",
+                "ai_reviewed": True,
+            }
+            path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
+            agreed, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            self.assertEqual(overridden, 0)
+            self.assertNotIn("Finance", decisions[0].categories)
+
+    def test_merge_never_removes_protected_category(self):
+        import tempfile
+        decisions = [self._decision("m1", ["Priority Immigration", "Ads Promotions"], {"Priority Immigration": 100, "Ads Promotions": 70}, primary="Priority Immigration", protected=True)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "packets.jsonl"
+            packet = {
+                "message_id": "m1",
+                "ai_label": "Shopping",
+                "ai_confidence": 0.95,
+                "ai_reason": "looks like shopping",
+                "ai_reviewed": True,
+            }
+            path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
+            _, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            # AI can add Shopping but Priority Immigration must stay.
+            self.assertIn("Priority Immigration", decisions[0].categories)
+            self.assertTrue(decisions[0].protected)
+
+
 if __name__ == "__main__":
     unittest.main()
