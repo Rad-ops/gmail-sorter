@@ -155,6 +155,7 @@ PROTECTED_CATEGORIES = {
     "Priority Studies",
     "Receipts Orders",
     "Utilities",
+    "Work School"  # Added
 }
 
 IMMIGRATION_KEYWORDS = [
@@ -209,24 +210,24 @@ STUDIES_KEYWORDS = [
 ]
 
 CATEGORY_RULES = [
-    ("Priority Immigration", IMMIGRATION_KEYWORDS),
-    ("Priority Studies", STUDIES_KEYWORDS),
-    ("Finance", ["bank", "credit card", "debit", "statement", "payment", "payroll", "invoice", "tax", "cra", "irs", "etransfer", "e-transfer"]),
-    ("Receipts Orders", ["receipt", "order", "purchase", "shipment", "shipped", "delivered", "delivery", "tracking", "refund", "return"]),
-    ("Account Security", ["password", "reset", "verification", "verify", "security alert", "new login", "sign-in", "2fa", "mfa", "authentication", "code"]),
-    ("Travel", ["flight", "airline", "hotel", "reservation", "booking", "boarding", "itinerary", "rental car", "airbnb", "uber", "lyft"]),
-    ("Health", ["appointment", "clinic", "doctor", "dentist", "pharmacy", "prescription", "medical", "health"]),
-    ("Government Legal", ["government", "court", "legal", "visa", "immigration", "passport", "license", "notice"]),
-    ("Work School", ["meeting", "calendar", "deadline", "project", "assignment", "university", "college", "school", "course", "class"]),
-    ("Social", ["facebook", "instagram", "linkedin", "twitter", "x.com", "reddit", "discord", "snapchat", "tiktok"]),
-    ("Subscriptions", ["subscription", "renewal", "membership", "plan", "trial", "billing cycle"]),
-    ("Shopping", ["cart", "wishlist", "store", "shop", "retailer", "coupon", "discount"]),
-    ("Job Search", ["application", "resume", "interview", "recruiter", "job alert", "candidate", "position"]),
-    ("Housing", ["rent", "lease", "landlord", "tenant", "mortgage", "property", "apartment", "condo"]),
-    ("Utilities", ["utility", "hydro", "internet", "mobile", "phone bill", "electricity", "gas bill"]),
-    ("Insurance", ["insurance", "policy", "claim", "premium", "coverage"]),
-    ("Crypto Finance Risk", ["crypto", "bitcoin", "ethereum", "wallet", "exchange", "trading"]),
-    ("Old Account Evidence", ["welcome to", "confirm your account", "activate your account", "account created", "username", "registered"]),
+    ("Priority Immigration", IMMIGRATION_KEYWORDS, []),
+    ("Priority Studies", STUDIES_KEYWORDS, []),
+    ("Finance", ["bank", "credit card", "debit", "statement", "payment", "payroll", "invoice", "tax", "cra", "irs", "etransfer", "e-transfer"], []),
+    ("Receipts Orders", ["receipt", "order", "purchase", "shipment", "shipped", "delivered", "delivery", "tracking", "refund", "return"], []),
+    ("Account Security", ["password", "reset", "verification", "verify", "security alert", "new login", "sign-in", "2fa", "mfa", "authentication", "code"], []),
+    ("Travel", ["flight", "airline", "hotel", "reservation", "booking", "boarding", "itinerary", "rental car", "airbnb", "uber", "lyft"], []),
+    ("Health", ["appointment", "clinic", "doctor", "dentist", "pharmacy", "prescription", "medical", "health", "uhn", "myuhn", "hospital", "specialist"], []),
+    ("Government Legal", ["government", "court", "legal", "visa", "immigration", "passport", "license", "notice"], []),
+    ("Work School", ["meeting", "calendar", "deadline", "project", "assignment", "university", "college", "school", "course", "class"], []),
+    ("Social", ["facebook", "instagram", "linkedin", "twitter", "x.com", "reddit", "discord", "snapchat", "tiktok"], []),
+    ("Subscriptions", ["subscription", "renewal", "membership", "plan", "trial", "billing cycle"], []),
+    ("Shopping", ["cart", "wishlist", "store", "shop", "retailer", "coupon", "discount"], []),
+    ("Job Search", ["application", "resume", "interview", "recruiter", "job alert", "candidate", "position"], []),
+    ("Housing", ["rent", "lease", "landlord", "tenant", "mortgage", "property", "apartment", "condo"], ["hospital", "clinic", "health network"]),
+    ("Utilities", ["utility", "hydro", "internet", "mobile", "phone bill", "electricity", "gas bill"], []),
+    ("Insurance", ["insurance", "policy", "claim", "premium", "coverage"], []),
+    ("Crypto Finance Risk", ["crypto", "bitcoin", "ethereum", "wallet", "exchange", "trading"], []),
+    ("Old Account Evidence", ["welcome to", "confirm your account", "activate your account", "account created", "username", "registered"], []),
 ]
 
 
@@ -832,8 +833,15 @@ def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[s
         categories.append("Ads Promotions")
     elif "CATEGORY_PROMOTIONS" in labels:
         categories.append("Newsletters Bulk")
-    for name, keywords in CATEGORY_RULES:
-        if contains_any(searchable, keywords):
+    for rule in CATEGORY_RULES:
+        name = rule[0]
+        keywords = rule[1]
+        exclusions = rule[2] if len(rule) > 2 else []
+        
+        # Only add category if:
+        # 1. Any keyword is found
+        # 2. No exclusion pattern is present
+        if contains_any(searchable, keywords) and not contains_any(searchable, exclusions):
             categories.append(name)
     if "CATEGORY_SOCIAL" in labels:
         categories.append("Social")
