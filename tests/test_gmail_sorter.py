@@ -1,4 +1,6 @@
 import argparse
+import json
+import sqlite3
 import sys
 import unittest
 from pathlib import Path
@@ -25,6 +27,13 @@ def args(**overrides):
         "use_sender_profiles": True,
         "sender_profiles": {},
         "sender_profile_min_weight": 6,
+        "label_confidence": 50,
+        "max_labels_per_message": 3,
+        "cached_body_features": {},
+        "relabel_run_id": "",
+        "undo_relabel": "",
+        "relabel_since_date": "",
+        "relabel_label": "",
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -522,6 +531,171 @@ class RelabelStageTests(unittest.TestCase):
         pruned = gmail_sorter.prune_empty_sorter_labels(service, retries=1, retry_sleep=0)
         self.assertEqual(pruned, ["Sorter/Finance"])
         self.assertEqual(len(service.delete_calls), 1)
+
+
+class ConfidenceAndBodyCleaningTests(unittest.TestCase):
+    """Tests for per-category confidence, label caps, and body cleaning."""
+
+    def test_low_confidence_category_is_dropped(self):
+        # A message that only weakly matches one keyword for a non-protected
+        # category should be dropped when below --label-confidence.
+        msg = message(
+            payload(
+                {
+                    "From": "Shop <shop@retail.testmail.co>",
+                    "Subject": "cart reminder",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="your cart is waiting",
+        )
+        item = gmail_sorter.decide(msg, args(label_confidence=80), gmail_sorter.Config())
+        self.assertNotIn("Shopping", item.categories)
+
+    def test_high_confidence_category_is_kept(self):
+        # Multiple finance keywords + a bank domain should keep Finance.
+        msg = message(
+            payload(
+                {
+                    "From": "Bank <statements@bank.testmail.co>",
+                    "Subject": "Your statement and invoice for payment",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="payroll receipt tax",
+        )
+        item = gmail_sorter.decide(msg, args(label_confidence=50), gmail_sorter.Config())
+        self.assertIn("Finance", item.categories)
+        self.assertGreater(item.category_confidence.get("Finance", 0), 50)
+
+    def test_max_labels_per_message_caps_optional_labels(self):
+        # A message matching several optional categories but no protected ones
+        # should be capped at --max-labels-per-message.
+        msg = message(
+            payload(
+                {
+                    "From": "Shop <shop@retail.testmail.co>",
+                    "Subject": "cart wishlist store coupon discount",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+            snippet="store shop retailer coupon",
+        )
+        item = gmail_sorter.decide(msg, args(max_labels_per_message=1, label_confidence=0), gmail_sorter.Config())
+        labelable = gmail_sorter.labelable_categories(item.categories)
+        self.assertLessEqual(len(labelable), 1)
+
+    def test_clean_body_strips_quotes_and_footer(self):
+        raw = (
+            "Hi, your IRCC work permit is ready.\n"
+            "> On Monday the promo shop wrote:\n"
+            "> 50% off sale ends tonight shop now\n"
+            "Regards,\n"
+            "Unsubscribe here: https://example.com/u\n"
+            "Sent from my iPhone\n"
+        )
+        cleaned = gmail_sorter.clean_body_text(raw)
+        self.assertIn("IRCC", cleaned)
+        self.assertNotIn("50% off", cleaned)
+        self.assertNotIn("Unsubscribe", cleaned)
+        self.assertNotIn("Sent from my iPhone", cleaned)
+
+
+class RelabelUndoAndResumeTests(unittest.TestCase):
+    """Tests for undo relabel and resume-via-ledger (items 9 and 13)."""
+
+    def _decision(self, mid, existing_sorter_ids, categories):
+        return gmail_sorter.Decision(
+            message_id=mid,
+            thread_id="t",
+            date="2024-01-01",
+            sender="S <s@x.testmail.co>",
+            sender_email="s@x.testmail.co",
+            sender_domain="x.testmail.co",
+            registered_domain="testmail.co",
+            subject="sub",
+            snippet="",
+            existing_labels=list(existing_sorter_ids),
+            categories=categories,
+        )
+
+    def _service_with_labels(self, labels):
+        return FakeGmailService(labels=labels)
+
+    def test_undo_relabel_reverses_adds_and_removes(self):
+        service = self._service_with_labels(
+            [FakeLabel("Sorter/Finance", "sl-fin"), FakeLabel("Sorter/Ads Promotions", "sl-ads")]
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE action_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, stage TEXT, action TEXT, message_id TEXT, status TEXT, detail TEXT)"
+        )
+        run_id = "20260706T120000"
+        # Simulate a prior relabel that removed sl-fin and added sl-ads.
+        detail = json.dumps({"run_id": run_id, "removed": ["sl-fin"], "added": ["sl-ads"], "previous_labels": ["Sorter/Finance"]})
+        conn.execute("INSERT INTO action_ledger (created_at, stage, action, message_id, status, detail) VALUES (?, 'relabel', 'relabel', 'm1', 'success', ?)", ("2026-07-06T12:00:00", detail))
+        conn.commit()
+        ns = argparse.Namespace(retries=1, retry_sleep=0, batch_size=10, apply_progress_every=1, apply=True)
+        code = gmail_sorter.undo_relabel(service, run_id, ns, state_conn=conn)
+        self.assertEqual(code, 0)
+        # Undo should add sl-fin back and remove sl-ads.
+        self.assertEqual(len(service.batch_modify_calls), 1)
+        call = service.batch_modify_calls[0]
+        self.assertIn("sl-fin", call.get("addLabelIds", []))
+        self.assertIn("sl-ads", call.get("removeLabelIds", []))
+        conn.close()
+
+    def test_resume_skips_already_applied_messages(self):
+        service = self._service_with_labels(
+            [FakeLabel("Sorter/Finance", "sl-fin"), FakeLabel("Sorter/Ads Promotions", "sl-ads")]
+        )
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = gmail_sorter.open_state_db(Path(tmp) / "state.sqlite")
+            run_id = "20260706T120000"
+            detail = json.dumps({"run_id": run_id, "removed": [], "added": ["sl-ads"], "previous_labels": []})
+            conn.execute("INSERT INTO action_ledger (created_at, stage, action, message_id, status, detail) VALUES (?, 'relabel', 'relabel', 'm1', 'success', ?)", ("2026-07-06T12:00:00", detail))
+            conn.commit()
+            ns = argparse.Namespace(
+                retries=1, retry_sleep=0, batch_size=10, apply_progress_every=1, stage="relabel", relabel_run_id=run_id
+            )
+            decisions = [
+                self._decision("m1", ["sl-fin"], ["Ads Promotions"]),  # already applied
+                self._decision("m2", ["sl-fin"], ["Ads Promotions"]),  # needs apply
+            ]
+            gmail_sorter.apply_relabel(service, decisions, ns, state_conn=conn)
+            conn.close()
+        # Only m2 should have been sent to Gmail.
+        self.assertEqual(len(service.batch_modify_calls), 1)
+        self.assertIn("m2", service.batch_modify_calls[0]["ids"])
+
+
+class BodyFeatureCacheTests(unittest.TestCase):
+    """Tests for cached body-feature reuse (item 12)."""
+
+    def test_cached_body_hits_apply_without_fresh_body(self):
+        # A metadata-only message (no body data) whose body features are cached
+        # should still get the cached body category applied.
+        cached = {
+            "msg-1": {
+                "body_len": 500,
+                "body_category_hits": ["Priority Immigration"],
+                "body_unsubscribe_count": 1,
+            }
+        }
+        ns = args(scan="full", cached_body_features=cached)
+        msg = message(
+            payload(
+                {
+                    "From": "Counsel <counsel@legal.testmail.co>",
+                    "Subject": "File update",
+                    "Date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                }
+            ),
+        )
+        item = gmail_sorter.decide(msg, ns, gmail_sorter.Config())
+        self.assertIn("Priority Immigration", item.categories)
+        self.assertTrue(any(r.startswith("cached_body:") for r in item.reasons))
 
 
 if __name__ == "__main__":

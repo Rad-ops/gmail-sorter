@@ -104,6 +104,7 @@ class Decision:
     existing_labels: list[str] = field(default_factory=list)
     categories: list[str] = field(default_factory=list)
     primary_category: str = ""
+    category_confidence: dict[str, int] = field(default_factory=dict)
     ad_confidence: int = 0
     reasons: list[str] = field(default_factory=list)
     negative_reasons: list[str] = field(default_factory=list)
@@ -364,6 +365,70 @@ def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000) -> str:
     return "\n".join(chunks)[:max_chars]
 
 
+# Footer/signature markers that carry no classification signal. A line matching
+# these starts a footer block that is dropped before category matching so a
+# promotional footer under a real reply does not flip the message into Ads.
+FOOTER_MARKERS = [
+    "unsubscribe",
+    "manage preferences",
+    "email preferences",
+    "you are receiving this",
+    "sent from my iphone",
+    "sent from my ipad",
+    "sent from my android",
+    "sent from my blackberry",
+    "get outlook for android",
+    "get outlook for ios",
+    "this email and any attachments",
+    "confidentiality notice",
+    "disclaimer:",
+    "regards,",
+    "-- ",
+    "_",
+]
+
+# A quoted-reply line in plain text starts with one or more '>'. A top forwarded
+# block usually starts with "----- Original Message -----" or "On ... wrote:".
+_QUOTED_LINE_RE = re.compile(r"^\s*>+")
+_FORWARD_HEADER_RE = re.compile(r"^\s*-{2,}\s*(Original Message|Forwarded message)\s*-{2,}", re.IGNORECASE)
+_ON_WROTE_RE = re.compile(r"^\s*on .+wrote:\s*$", re.IGNORECASE)
+
+
+def clean_body_text(body_text: str, keep_chars: int = 8000) -> str:
+    """Strip quoted reply chains, forwarded blocks, and footer signatures.
+
+    The cleaned text is what the category rules see, so a reply that quotes a
+    promotional email is not misclassified as promo, and a long unsubscribe
+    footer under a real message does not dominate the body. Unsubscribe link
+    extraction still uses the raw body, so footer URLs are not lost.
+    """
+
+    if not body_text:
+        return ""
+    lines = body_text.splitlines()
+    kept: list[str] = []
+    in_forward_block = False
+    for line in lines:
+        if _FORWARD_HEADER_RE.match(line):
+            in_forward_block = True
+            continue
+        if in_forward_block:
+            # A forwarded block ends at the first blank line after headers, but
+            # to be safe we drop until we leave the quoted region entirely.
+            if _QUOTED_LINE_RE.match(line) or _ON_WROTE_RE.match(line):
+                continue
+            in_forward_block = False
+        if _QUOTED_LINE_RE.match(line) or _ON_WROTE_RE.match(line):
+            continue
+        # Once we hit a footer marker, drop the rest of this block.
+        lowered = line.strip().lower()
+        if any(lowered.startswith(marker) or lowered == marker for marker in FOOTER_MARKERS):
+            break
+        kept.append(line)
+    cleaned = "\n".join(kept).strip()
+    return cleaned[:keep_chars]
+
+
 def find_unsubscribe_links_in_text(body_text: str, limit: int = 20) -> list[str]:
     """Scrub unsubscribe/preference URLs out of already-decoded body text.
 
@@ -481,6 +546,15 @@ def is_before_year(message_date: str, year: int) -> bool:
     try:
         return int(message_date[:4]) < year
     except ValueError:
+        return False
+
+
+def _date_le(message_date: str, cutoff_iso: str) -> bool:
+    """Return True when message_date (YYYY-MM-DD) is on or before cutoff."""
+
+    try:
+        return message_date[:10] <= cutoff_iso[:10]
+    except Exception:
         return False
 
 
@@ -675,33 +749,61 @@ def is_perfect_ad_match(
     )
 
 
-def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[str]:
-    """Assign dashboard labels from evidence; this does not apply Gmail labels."""
+def categorize_with_confidence(searchable: str, labels: list[str], ad_confidence: int, sender_profile_cats: dict[str, int] | None = None) -> dict[str, int]:
+    """Return {category: confidence 0-100} from evidence.
 
-    categories: list[str] = []
+    Confidence is the policy input that lets the relabel/label stages apply only
+    meaningful categories instead of every keyword that happened to hit. A
+    category that matches only one weak keyword scores low and can be dropped by
+    a --label-confidence floor, while a protected bucket that matches several
+    keywords plus a sender profile scores high and is kept.
+
+    Scoring model (intentionally simple and explainable):
+      - each keyword hit on a rule adds 25, capped at 75 for the keyword family
+      - a Gmail CATEGORY_* label for the bucket adds 30 (the mail transport's
+        own classification is strong independent evidence)
+      - a sender-profile hit adds the learned weight (capped at 25)
+      - Ads Promotions / Newsletters Bulk derive their confidence from the ad
+        confidence / promotions label directly
+    """
+
+    categories: dict[str, int] = {}
     if ad_confidence >= 65:
-        categories.append("Ads Promotions")
+        categories["Ads Promotions"] = ad_confidence
     elif "CATEGORY_PROMOTIONS" in labels:
-        categories.append("Newsletters Bulk")
-    for rule in CATEGORY_RULES:
-        name = rule[0]
-        keywords = rule[1]
-        exclusions = rule[2] if len(rule) > 2 else []
+        categories["Newsletters Bulk"] = 60
 
-        # Only add category if:
-        # 1. Any keyword is found
-        # 2. No exclusion pattern is present
-        if keyword_hits(searchable, keywords) and not keyword_hits(searchable, exclusions):
-            categories.append(name)
-    if "CATEGORY_SOCIAL" in labels:
-        categories.append("Social")
-    if "CATEGORY_UPDATES" in labels and not categories:
-        categories.append("Updates")
+    profile_cats = sender_profile_cats or {}
+    for name, keywords, exclusions in CATEGORY_RULES:
+        if exclusions and keyword_hits(searchable, exclusions):
+            continue
+        hits = keyword_hits(searchable, keywords)
+        if not hits:
+            continue
+        keyword_score = min(75, 25 * len(hits))
+        category_label_score = 30 if name == "Social" and "CATEGORY_SOCIAL" in labels else 0
+        profile_score = min(25, profile_cats.get(name, 0))
+        categories[name] = min(100, keyword_score + category_label_score + profile_score)
+
+    if "CATEGORY_SOCIAL" in labels and "Social" not in categories:
+        categories["Social"] = 60
     if "CATEGORY_FORUMS" in labels:
-        categories.append("Forums")
+        categories["Forums"] = max(categories.get("Forums", 0), 60)
+    if "CATEGORY_UPDATES" in labels and not categories:
+        categories["Updates"] = 50
     if not categories:
-        categories.append("Review")
-    return sorted(set(categories))
+        categories["Review"] = 40
+    return categories
+
+
+def categorize(searchable: str, labels: list[str], ad_confidence: int) -> list[str]:
+    """Assign dashboard labels from evidence; this does not apply Gmail labels.
+
+    Kept as a thin wrapper over :func:`categorize_with_confidence` for callers
+    that only want the category names.
+    """
+
+    return sorted(categorize_with_confidence(searchable, labels, ad_confidence).keys())
 
 
 # Precedence used to choose a single primary category is imported from
@@ -747,38 +849,86 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     body_len = len(body_text)
     category_searchable = searchable
     body_included = bool(body_len) and getattr(args, "scan", "metadata") == "full"
+    cached_body: dict[str, Any] = {}
+    if not body_included and getattr(args, "scan", "metadata") == "full":
+        # No fresh body in this payload (metadata-only fetch used the cache).
+        # Reuse the cached body category hits so categorization is still
+        # body-aware without a re-fetch.
+        cached_index = getattr(args, "cached_body_features", {}) or {}
+        cached_body = cached_index.get(message.get("id", ""), {})
+        if cached_body:
+            body_len = cached_body.get("body_len", 0)
+            body_included = True
     ad_confidence, reasons, negative_reasons = score_ad(headers, labels, sender, sender_domain, subject, snippet, config)
     if body_included:
-        category_searchable = f"{searchable}\n{body_text[:8000]}"
-        reasons.append(f"body_included:{body_len}")
-    body_hit_categories = sorted(body_category_hits(body_text).keys()) if body_included else []
+        # Use the cleaned body (quotes/footers stripped) for categorization so a
+        # reply that quotes a promo email is not misclassified. Unsubscribe link
+        # extraction below still uses the raw body_text so footer URLs survive.
+        if body_text:
+            category_searchable = f"{searchable}\n{clean_body_text(body_text)}"
+            reasons.append(f"body_included:{body_len}")
+        elif cached_body:
+            for hit_cat in cached_body.get("body_category_hits", []):
+                reasons.append(f"cached_body:{hit_cat}")
+    body_hit_categories = sorted(body_category_hits(body_text).keys()) if body_included and body_text else (cached_body.get("body_category_hits", []) if cached_body else [])
     age_boost = age_score_boost(message_date)
     if age_boost and ad_confidence >= args.ad_threshold:
         ad_confidence = min(100, ad_confidence + age_boost)
         reasons.append(f"older_mail_boost:{age_boost}")
-    categories = categorize(category_searchable, labels, ad_confidence)
-    # Sender history: if this address/domain was consistently labeled a category
-    # before, surface it even when the subject keywords missed. This makes a
-    # re-run on an already-labeled mailbox self-improve: the first pass teaches
-    # the profile, and the second pass uses it to fix keyword misses.
+    # Sender history feeds both categorization confidence (a learned weight
+    # boosts a matched category) and a fallback that surfaces a category the
+    # subject keywords missed entirely.
+    profile_cats: dict[str, int] = {}
     if getattr(args, "use_sender_profiles", True):
         profile_index = getattr(args, "sender_profiles", {}) or {}
         profile_cats = sender_profile_categories_from_index(profile_index, sender_email, registered_domain)
-        if profile_cats:
-            keyword_categories = set(categories)
-            min_profile_weight = getattr(args, "sender_profile_min_weight", 6)
-            for category, weight in sorted(profile_cats.items(), key=lambda kv: kv[1], reverse=True):
-                if category in NON_LABEL_CATEGORIES or category in keyword_categories:
-                    continue
-                if weight >= min_profile_weight:
-                    categories.append(category)
-                    reasons.append(f"sender_profile:{category}:{weight}")
+    category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats)
+    # Merge body-derived category hits from a previous full scan when this run
+    # used the cache (metadata-only fetch). Cached hits let categorization stay
+    # body-aware without re-fetching the body.
+    if body_hit_categories and cached_body:
+        for hit_cat in body_hit_categories:
+            if hit_cat in NON_LABEL_CATEGORIES:
+                continue
+            category_confidence[hit_cat] = max(category_confidence.get(hit_cat, 0), 60)
+    # Merge sender-profile-only categories that the keyword rules missed.
+    min_profile_weight = getattr(args, "sender_profile_min_weight", 6)
+    for category, weight in profile_cats.items():
+        if category in NON_LABEL_CATEGORIES or category in category_confidence:
+            continue
+        if weight >= min_profile_weight:
+            category_confidence[category] = min(100, weight)
+            reasons.append(f"sender_profile:{category}:{weight}")
     has_attachment = payload_has_attachment(payload)
     real_attachment_count, inline_attachment_count = attachment_counts(payload)
     has_real_attachment = real_attachment_count > 0
     if has_real_attachment:
-        categories.append("Priority Attachments")
-        categories = sorted(set(categories))
+        category_confidence["Priority Attachments"] = 100
+    # Apply the confidence floor and per-message cap. Protected/priority buckets
+    # are always kept (safety first), and the primary category is always kept so
+    # the dashboard's single-label view never loses its anchor.
+    label_confidence = getattr(args, "label_confidence", 0)
+    max_labels = getattr(args, "max_labels_per_message", 0)
+    always_keep = PROTECTED_CATEGORIES | {"Ads Promotions", "Newsletters Bulk"}
+    kept: list[tuple[str, int]] = []
+    dropped: list[str] = []
+    for name, conf in sorted(category_confidence.items(), key=lambda kv: kv[1], reverse=True):
+        if name in NON_LABEL_CATEGORIES or name in always_keep or conf >= label_confidence:
+            kept.append((name, conf))
+        else:
+            dropped.append(f"{name}:{conf}")
+    if max_labels and len(kept) > max_labels:
+        protected_kept = [(n, c) for n, c in kept if n in always_keep]
+        optional = [(n, c) for n, c in kept if n not in always_keep]
+        optional.sort(key=lambda kv: kv[1], reverse=True)
+        allowed_optional = optional[: max(0, max_labels - len(protected_kept))]
+        for name, conf in optional[len(allowed_optional):]:
+            dropped.append(f"{name}:cap")
+        kept = protected_kept + allowed_optional
+    if dropped:
+        negative_reasons.append(f"low_confidence_labels:{','.join(dropped)}")
+    categories = sorted(name for name, _ in kept)
+    category_confidence_kept = {name: conf for name, conf in kept}
     body_unsubscribe_links = find_unsubscribe_links_in_text(body_text) if body_included else extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
     # This is the main safety gate. A protected message can still be reported
@@ -890,6 +1040,7 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         existing_labels=labels,
         categories=categories,
         primary_category=primary_category,
+        category_confidence=category_confidence_kept,
         ad_confidence=ad_confidence,
         reasons=reasons,
         negative_reasons=negative_reasons,
@@ -956,6 +1107,7 @@ def decision_from_dict(data: dict[str, Any]) -> Decision:
     data.setdefault("message_size_estimate", 0)
     data.setdefault("body_len", 0)
     data.setdefault("body_category_hits", [])
+    data.setdefault("category_confidence", {})
     data.setdefault("schema_version", 0)
     if "primary_category" not in data:
         data["primary_category"] = pick_primary_category(data.get("categories", []) or [])
@@ -1161,6 +1313,34 @@ def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Dec
         rows,
     )
     conn.commit()
+
+
+def load_body_features_index(conn: sqlite3.Connection | None) -> dict[str, dict[str, Any]]:
+    """Precompute a message_id -> body-features index for cache-skip scans.
+
+    When --scan full is used without --refresh-existing, the worker can fetch
+    metadata-only for messages whose body features are already cached, saving
+    Gmail quota. decide() then consults this index to apply the cached body
+    category hits so categorization is still body-aware without re-fetching.
+    """
+
+    index: dict[str, dict[str, Any]] = {}
+    if conn is None:
+        return index
+    cur = conn.execute(
+        "SELECT message_id, body_len, body_category_hits_json, body_unsubscribe_count FROM message_features WHERE scan_mode='full'"
+    )
+    for message_id, body_len, hits_json, unsub_count in cur.fetchall():
+        try:
+            hits = json.loads(hits_json or "[]")
+        except json.JSONDecodeError:
+            hits = []
+        index[message_id] = {
+            "body_len": int(body_len or 0),
+            "body_category_hits": list(hits),
+            "body_unsubscribe_count": int(unsub_count or 0),
+        }
+    return index
 
 
 def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Decision], confidence_floor: int = 65) -> None:
@@ -1441,13 +1621,20 @@ def scan_messages(
 
     def worker(message_id: str) -> tuple[str, Decision | None, str | None]:
         try:
+            cached_index = getattr(args, "cached_body_features", {}) or {}
+            # When a previous full scan cached this message's body features and
+            # the user did not ask for a full refresh, fetch metadata-only and
+            # let decide() reapply the cached body category hits. This avoids a
+            # costly format=full fetch per message on re-runs.
+            full_fetch = args.attachment_details or getattr(args, "scan", "metadata") == "full"
+            use_cache = full_fetch and message_id in cached_index and not getattr(args, "refresh_existing", False)
             message = get_message_metadata(
                 service_for_thread(),
                 message_id,
                 args.retries,
                 args.retry_sleep,
                 throttle,
-                args.attachment_details or getattr(args, "scan", "metadata") == "full",
+                full_fetch and not use_cache,
             )
             return message_id, decide(message, args, config), None
         except Exception as error:
@@ -1653,7 +1840,14 @@ def apply_relabel(service: Any, decisions: list[Decision], args: argparse.Namesp
     name_to_id.update(created)
 
     planned: list[tuple[Decision, set[str], set[str]]] = []
+    run_id = getattr(args, "relabel_run_id", "") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    already_applied = load_relabel_run_applied(state_conn, run_id)
+    skipped = 0
     for item in decisions:
+        if item.message_id in already_applied:
+            skipped += 1
+            item.action_done = "yes"
+            continue
         desired_name_to_id = {f"{ROOT_LABEL}/{category}": created[f"{ROOT_LABEL}/{category}"] for category in labelable_categories(item.categories)}
         add_ids, remove_ids = compute_relabel_plan(item, sorter_label_ids, desired_name_to_id)
         if add_ids or remove_ids:
@@ -1671,6 +1865,9 @@ def apply_relabel(service: Any, decisions: list[Decision], args: argparse.Namesp
     )
 
     batch_index = 0
+    id_to_name = {lid: name for name, lid in name_to_id.items()}
+    if skipped:
+        print(f"Relabel resume: skipping {skipped} messages already applied in run_id={run_id}.", flush=True)
     for (add_ids, remove_ids), items in grouped.items():
         for start in range(0, len(items), args.batch_size):
             batch_index += 1
@@ -1683,10 +1880,86 @@ def apply_relabel(service: Any, decisions: list[Decision], args: argparse.Namesp
             execute_with_retries(service.users().messages().batchModify(userId="me", body=body), args.retries, args.retry_sleep)
             for item in chunk:
                 item.action_done = "yes"
-                record_action_ledger(state_conn, args.stage, "relabel", item.message_id)
+                previous = sorted(id_to_name.get(lid, lid) for lid in item.existing_labels if lid in sorter_label_ids)
+                detail = json.dumps({"run_id": run_id, "removed": sorted(remove_ids), "added": sorted(add_ids), "previous_labels": previous}, ensure_ascii=False)
+                record_action_ledger(state_conn, args.stage, "relabel", item.message_id, status="success", detail=detail)
             upsert_state_decisions(state_conn, chunk)
             if batch_index == 1 or batch_index == batch_count or batch_index % args.apply_progress_every == 0:
                 print(f"Relabeled batch {batch_index}/{batch_count}...", flush=True)
+    print(f"Relabel run_id={run_id}. Undo with --undo-relabel {run_id}.", flush=True)
+
+
+def load_relabel_run_applied(conn: sqlite3.Connection | None, run_id: str) -> set[str]:
+    """Return message IDs already applied in a relabel run (for resume)."""
+
+    if conn is None or not run_id:
+        return set()
+    rows = conn.execute(
+        "SELECT message_id FROM action_ledger WHERE stage='relabel' AND action='relabel' AND detail LIKE ?",
+        (f'%"run_id": "{run_id}"%',),
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def undo_relabel(service: Any, run_id: str, args: argparse.Namespace, state_conn: sqlite3.Connection | None = None) -> int:
+    """Reverse a relabel run by swapping the recorded adds/removes back.
+
+    Reads the action_ledger rows for ``run_id``, restores each message's
+    previous Sorter labels (re-adding what was removed and removing what was
+    added), and records an ``undo_relabel`` ledger entry. Non-Sorter labels are
+    never touched. Requires --apply to change Gmail; otherwise prints a dry-run
+    preview.
+    """
+
+    if state_conn is None:
+        print("Undo requires the SQLite state database (not --disable-state-db).", file=sys.stderr)
+        return 2
+    rows = state_conn.execute(
+        "SELECT message_id, detail FROM action_ledger WHERE stage='relabel' AND action='relabel' AND detail LIKE ? ORDER BY id",
+        (f'%"run_id": "{run_id}"%',),
+    ).fetchall()
+    if not rows:
+        print(f"No relabel ledger rows found for run_id={run_id}.", file=sys.stderr)
+        return 1
+    name_to_id = list_labels(service, args.retries, args.retry_sleep)
+    id_to_name = {lid: name for name, lid in name_to_id.items()}
+    planned = 0
+    grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[str]] = {}
+    for message_id, detail_json in rows:
+        try:
+            detail = json.loads(detail_json or "{}")
+        except json.JSONDecodeError:
+            continue
+        # Reverse: undo adds by removing them, undo removes by re-adding them.
+        remove_ids = {lid for lid in detail.get("added", []) if lid in name_to_id.values()}
+        add_ids = {lid for lid in detail.get("removed", []) if lid in name_to_id.values()}
+        if not add_ids and not remove_ids:
+            continue
+        planned += 1
+        grouped.setdefault((tuple(sorted(add_ids)), tuple(sorted(remove_ids))), []).append(message_id)
+
+    batch_count = sum((len(ids) + args.batch_size - 1) // args.batch_size for ids in grouped.values())
+    print(f"Undo relabel run_id={run_id}: {planned} messages, {batch_count} batchModify calls.", flush=True)
+    if not args.apply:
+        print("DRY RUN: no Gmail changes. Re-run with --apply to undo.", flush=True)
+        return 0
+    batch_index = 0
+    for (add_ids, remove_ids), message_ids in grouped.items():
+        for start in range(0, len(message_ids), args.batch_size):
+            batch_index += 1
+            chunk = message_ids[start : start + args.batch_size]
+            body: dict[str, list[str]] = {"ids": chunk}
+            if add_ids:
+                body["addLabelIds"] = list(add_ids)
+            if remove_ids:
+                body["removeLabelIds"] = list(remove_ids)
+            execute_with_retries(service.users().messages().batchModify(userId="me", body=body), args.retries, args.retry_sleep)
+            for message_id in chunk:
+                record_action_ledger(state_conn, "relabel", "undo_relabel", message_id, status="success", detail=json.dumps({"undo_run_id": run_id}))
+            if batch_index == 1 or batch_index == batch_count or batch_index % args.apply_progress_every == 0:
+                print(f"Undo batch {batch_index}/{batch_count}...", flush=True)
+    print(f"Undone relabel run_id={run_id}.", flush=True)
+    return 0
 
 
 def prune_empty_sorter_labels(service: Any, retries: int, retry_sleep: float) -> list[str]:
@@ -2409,6 +2682,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--ad-threshold", type=int, default=65)
     parser.add_argument("--archive-threshold", type=int, default=65, help="Minimum ad confidence required to archive; archive also requires an independent bulk-mail signal.")
+    parser.add_argument("--label-confidence", type=int, default=50, help="Minimum per-category confidence to apply a label; categories below this are dropped unless protected/priority. 0 disables the floor.")
+    parser.add_argument("--max-labels-per-message", type=int, default=3, help="Cap applied Sorter labels per message; protected/priority buckets are always kept. 0 disables the cap.")
     parser.add_argument("--archive-min-age-days", type=int, default=0, help="Do not archive messages newer than this many days; 0 disables the recency guard.")
     parser.add_argument("--archive-skip-unread", action="store_true", help="Never archive messages that are still unread.")
     parser.add_argument("--trash-threshold", type=int, default=90)
@@ -2437,6 +2712,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-archive-total", type=int, default=0, help="Cap total planned archive actions; 0 disables the cap.")
     parser.add_argument("--archive-canary-limit", type=int, default=0, help="When applying archive, only keep the first N archive actions in the apply set.")
     parser.add_argument("--prune-empty-labels", action="store_true", help="After a relabel apply, delete Sorter/* labels that no longer have any messages.")
+    parser.add_argument("--relabel-since-date", default="", help="Restrict a relabel stage to messages on or before this YYYY-MM-DD date.")
+    parser.add_argument("--relabel-label", default="", help="Restrict a relabel stage to messages that currently carry this Sorter label (with or without the 'Sorter/' prefix).")
+    parser.add_argument("--undo-relabel", default="", help="Reverse a previous relabel run by its run_id (printed at the end of an apply). Use with --apply to actually undo; otherwise dry-run.")
+    parser.add_argument("--relabel-run-id", default="", help="Reuse a relabel run_id to resume an interrupted apply (skips messages already recorded in the ledger for that run).")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
     parser.add_argument("--scan", choices=["metadata", "full"], default="metadata", help="metadata = headers+snippet (fast); full = also read decoded body text for body-aware categorization. full costs more Gmail quota and is meant for a relabel/re-scan pass.")
     parser.add_argument("--use-sender-profiles", dest="use_sender_profiles", action="store_true", default=True, help="Use learned sender/domain category history to fix keyword misses (default on).")
@@ -2511,8 +2790,14 @@ def main() -> int:
     progress_path = Path(args.progress_file)
     progress = load_progress(progress_path) if args.resume else {}
     args.sender_profiles = load_sender_profile_index(state_conn) if getattr(args, "use_sender_profiles", True) else {}
+    args.cached_body_features = load_body_features_index(state_conn) if getattr(args, "scan", "metadata") == "full" and not args.refresh_existing else {}
     profile_count = len(args.sender_profiles)
-    print(f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}" + (f"; sender profiles loaded={profile_count}" if profile_count else ""))
+    cache_count = len(args.cached_body_features)
+    print(
+        f"Scanning {len(message_ids)} messages matching query: {args.query} with workers={max(1, args.workers)}"
+        + (f"; sender profiles loaded={profile_count}" if profile_count else "")
+        + (f"; cached body features={cache_count} (will fetch metadata-only for these)" if cache_count else "")
+    )
     progress = scan_messages(message_ids, progress, creds, build, args, config)
     save_progress(progress_path, progress)
 
@@ -2525,6 +2810,13 @@ def main() -> int:
     stale_progress_count = len(progress) - len(decisions)
     if stale_progress_count > 0:
         print(f"Ignoring {stale_progress_count} cached decisions outside the current query/report set.")
+
+    if getattr(args, "undo_relabel", ""):
+        code = undo_relabel(service, args.undo_relabel, args, state_conn)
+        if state_conn is not None:
+            state_conn.close()
+        return code
+
     if args.stage == "trash":
         protect_mixed_threads(service, decisions, args.retries, args.retry_sleep, args.thread_check_limit)
 
@@ -2532,6 +2824,25 @@ def main() -> int:
         manifest_ids = load_manifest_ids(Path(args.manifest))
         decisions = [item for item in decisions if item.message_id in manifest_ids]
         print(f"Restricted apply/report set to {len(decisions)} messages from manifest: {args.manifest}")
+
+    if args.stage == "relabel":
+        before_filter = len(decisions)
+        if getattr(args, "relabel_since_date", ""):
+            try:
+                cutoff = datetime.fromisoformat(args.relabel_since_date).date()
+                decisions = [item for item in decisions if item.date and _date_le(item.date, cutoff.isoformat())]
+                print(f"Relabel filter --relabel-since-date {args.relabel_since_date}: {len(decisions)}/{before_filter} messages kept.")
+            except ValueError:
+                print(f"--relabel-since-date must be YYYY-MM-DD; got {args.relabel_since_date}", file=sys.stderr)
+                return 2
+        if getattr(args, "relabel_label", ""):
+            label_map = list_labels(service, args.retries, args.retry_sleep)
+            target_ids = {lid for name, lid in label_map.items() if name == args.relabel_label or name == f"{ROOT_LABEL}/{args.relabel_label}"}
+            if not target_ids:
+                print(f"--relabel-label '{args.relabel_label}' did not match any Gmail label.", file=sys.stderr)
+                return 2
+            decisions = [item for item in decisions if target_ids.intersection(item.existing_labels)]
+            print(f"Relabel filter --relabel-label '{args.relabel_label}': {len(decisions)}/{before_filter} messages kept.")
 
     if args.stage == "trash":
         apply_trash_policy_caps(decisions, args)
