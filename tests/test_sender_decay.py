@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from tests.test_helpers import tracked, make_test_args
 
 import gmail_sorter
 from sorter import policy
@@ -199,7 +200,7 @@ class SenderProfileEndToEndTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "state.sqlite"
-            conn = gmail_sorter.open_state_db(db_path)
+            conn = tracked(self, gmail_sorter.open_state_db(db_path))
             # Seed an old profile for the sender so the decay matters.
             old = make_decision(date=(datetime.now(timezone.utc) - timedelta(days=720)).date().isoformat())
             gmail_sorter.update_sender_profiles(conn, [old], confidence_floor=65)

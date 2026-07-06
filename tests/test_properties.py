@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from tests.test_helpers import tracked, make_test_args
 
 import gmail_sorter
 from sorter import config_loader, policy
@@ -204,7 +205,7 @@ class SchemaPropertyTests(unittest.TestCase):
                 conn.close()
 
     def _seed_v1(self, path):
-        conn = sqlite3.connect(str(path))
+        conn = tracked(self, sqlite3.connect(str(path)))
         conn.execute(
             """
             CREATE TABLE messages (
@@ -365,7 +366,7 @@ class DecayMonotonicityTests(unittest.TestCase):
 
     def test_older_is_lighter(self):
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             # Three senders, all carrying 5 hits, but at different ages.
             self._seed(conn, days_ago=0)
             conn.execute("UPDATE sender_profile SET key='sender:recent@x.com' WHERE key='sender:noreply@bank.com:finance'")

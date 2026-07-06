@@ -5,7 +5,7 @@ long-unmanaged mailboxes. It scans, classifies, and reports before any change
 is made, then applies label, archive, trash, and relabel stages only when
 explicitly requested.
 
-**Version:** `0.7.0` · **Schema version:** 3
+**Version:** `0.7.1` · **Schema version:** 3
 
 Companion local-AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack)
 

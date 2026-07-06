@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.1 - 2026-07-06
+
+### 🐛 Bug Fixes
+
+- **Test args() helper missing v0.8 flags.** The local `args()` factory in `tests/test_gmail_sorter.py` was missing `use_learned_weights`, `learned_weights_file`, and `since_history_id`. v0.7.1 adds them and moves the canonical defaults into a new `tests/test_helpers.py` module so the factory and every test file share a single source of truth. v0.8 tests no longer need to override these fields on every call.
+
+- **Stale default query.** `sorter/policy.py` had `DEFAULT_QUERY = "before:2025/12/30 -in:trash"`. The date is in the past (we are in 2026) so a fresh install would have scanned an empty mailbox. v0.7.1 switches to `in:anywhere -in:trash` so a fresh install sees the whole mailbox. Operators who relied on the date can pass `--query` explicitly.
+
+- **SQLite connection leaks in tests.** Pre-v0.7.1 tests leaked up to 6 sqlite3 connections per run, which surfaced as `ResourceWarning: unclosed database` and failed CI under `-W error::ResourceWarning`. v0.7.1 adds a `tracked(self, conn)` helper in `tests/test_helpers.py` that registers every connection for `addCleanup` so the test runner closes it at teardown. All 32 connection sites across the test suite now use it.
+
+### 🧪 Tests
+
+207 tests passing (was 199 in v0.7.0; +8 for the v0.7.1 fixes).
+
 ## 0.7.0 - 2026-07-06
 
 ### 🧠 Real body in category centroids (the headline fix)

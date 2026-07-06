@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from tests.test_helpers import tracked, make_test_args
 
 import gmail_sorter
 
@@ -82,7 +83,7 @@ class V07CentroidFixTests(unittest.TestCase):
 
     def test_centroid_uses_body_text(self):
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             backend = CapturingBackend()
             decisions = [
                 make_decision(
@@ -107,7 +108,7 @@ class V07CentroidFixTests(unittest.TestCase):
         # a centroid that uses the body_category_hits fallback so the
         # in-flight centroid refresh doesn't lose precision.
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             backend = CapturingBackend()
             decisions = [
                 make_decision(
@@ -299,7 +300,7 @@ class V07AILearningTests(unittest.TestCase):
             "ai_reviewed": True,
         }]
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             report = apply_ai_learning(conn, [decision], packets, embedding_backend=None)
             self.assertEqual(report["considered"], 1)
             self.assertGreaterEqual(report["profile_bumps"], 1)
@@ -323,7 +324,7 @@ class V07AILearningTests(unittest.TestCase):
             "ai_reviewed": True,
         }]
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             backend = CapturingBackend()
             report = apply_ai_learning(conn, [decision], packets, embedding_backend=backend)
             self.assertEqual(report["centroid_contributions"], 1)
@@ -345,7 +346,7 @@ class V07AILearningTests(unittest.TestCase):
             "ai_reviewed": False,
         }]
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             report = apply_ai_learning(conn, [decision], packets, embedding_backend=None)
             self.assertEqual(report["considered"], 0)
             conn.close()
@@ -357,7 +358,7 @@ class V07SenderProfileTests(unittest.TestCase):
     def test_old_profile_decays(self):
         # A 720-day-old profile carries far less weight than a fresh one.
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             old = make_decision(message_id="old", date=(datetime.now(timezone.utc) - timedelta(days=720)).date().isoformat())
             fresh = make_decision(
                 message_id="fresh", sender_email="noreply@insurer.com",
@@ -376,7 +377,7 @@ class V07SenderProfileTests(unittest.TestCase):
         # A sender with two distinct categories gets two rows, not one
         # collision (the pre-v0.7 bug).
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             d1 = make_decision(message_id="m1", primary="Finance", categories=["Finance"])
             d2 = make_decision(message_id="m2", primary="Receipts Orders", categories=["Receipts Orders"])
             gmail_sorter.update_sender_profiles(conn, [d1, d2], confidence_floor=65)
@@ -391,7 +392,7 @@ class V07SenderProfileTests(unittest.TestCase):
 
     def test_diversity_counts_distinct_categories(self):
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             for i, primary in enumerate(["Finance", "Receipts Orders", "Account Security", "Health", "Travel"]):
                 d = make_decision(
                     message_id=f"m{i}", categories=[primary], primary=primary,
@@ -432,7 +433,7 @@ class V07BodyExcerptTests(unittest.TestCase):
         )
         decision = gmail_sorter.decide(msg, a, gmail_sorter.Config())
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             gmail_sorter.upsert_message_features(conn, [decision], scan_mode="full")
             row = conn.execute(
                 "SELECT body_text_excerpt FROM message_features WHERE message_id=?",
@@ -447,7 +448,7 @@ class V07SchemaMigrationTests(unittest.TestCase):
 
     def test_fresh_db_lands_at_v3(self):
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertEqual(row[0], 3)
             conn.close()
@@ -455,7 +456,7 @@ class V07SchemaMigrationTests(unittest.TestCase):
     def test_v1_state_db_migrates_to_v3(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "s.sqlite"
-            seed = sqlite3.connect(str(path))
+            seed = tracked(self, sqlite3.connect(str(path)))
             seed.execute(
                 """
                 CREATE TABLE messages (
@@ -514,7 +515,7 @@ class V07SchemaMigrationTests(unittest.TestCase):
             seed.commit()
             seed.close()
             # Open with the sorter; the migration must bring the DB to v3.
-            conn = gmail_sorter.open_state_db(path)
+            conn = tracked(self, gmail_sorter.open_state_db(path))
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertEqual(row[0], 3)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(sender_profile)").fetchall()}

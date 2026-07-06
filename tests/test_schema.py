@@ -26,20 +26,33 @@ from sorter.schema import CURRENT_SCHEMA_VERSION, migrate
 class SchemaMigrationTests(unittest.TestCase):
     """Regression tests for sorter.schema.migrate()."""
 
+    def _tracked(self, conn):
+        """Register a connection for automatic cleanup at tearDown.
+
+        v0.7.1: every test that opens a sqlite3 connection must
+        register it here so the test runner closes it before
+        ``-W error::ResourceWarning`` (used in CI) flags it as a leak.
+        Tests that omit this trip the resource warning at the end
+        of the run.
+        """
+
+        self.addCleanup(conn.close)
+        return conn
+
     def test_current_schema_version_is_published(self):
         # The codebase and the migration module must agree on the version.
         self.assertEqual(gmail_sorter.SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
         self.assertGreaterEqual(CURRENT_SCHEMA_VERSION, 3)
 
     def test_fresh_db_lands_at_current_version(self):
-        conn = sqlite3.connect(":memory:")
+        conn = self._tracked(sqlite3.connect(":memory:"))
         applied = migrate(conn)
         self.assertEqual(applied, CURRENT_SCHEMA_VERSION)
         rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
         self.assertEqual([row[0] for row in rows], list(range(1, CURRENT_SCHEMA_VERSION + 1)))
 
     def test_fresh_db_has_v1_baseline_tables(self):
-        conn = sqlite3.connect(":memory:")
+        conn = self._tracked(sqlite3.connect(":memory:"))
         migrate(conn)
         for table in (
             "messages",
@@ -56,7 +69,7 @@ class SchemaMigrationTests(unittest.TestCase):
             self.assertIsNotNone(row, f"missing baseline table: {table}")
 
     def test_migrate_is_idempotent(self):
-        conn = sqlite3.connect(":memory:")
+        conn = self._tracked(sqlite3.connect(":memory:"))
         first = migrate(conn)
         second = migrate(conn)
         third = migrate(conn)
@@ -67,7 +80,7 @@ class SchemaMigrationTests(unittest.TestCase):
         # Simulate a state DB written by an older binary: baseline tables
         # without the v2 body_text_excerpt column or the v3 sender_profile
         # decay columns. The migrator must add them.
-        conn = sqlite3.connect(":memory:")
+        conn = self._tracked(sqlite3.connect(":memory:"))
         conn.execute(
             """
             CREATE TABLE messages (
@@ -124,6 +137,7 @@ class SchemaMigrationTests(unittest.TestCase):
         )
         # v2: body_text_excerpt must be added.
         # v3: first_seen, last_hits, category_diversity must be added.
+        self._tracked(conn)
         applied = migrate(conn)
         self.assertEqual(applied, CURRENT_SCHEMA_VERSION)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(message_features)").fetchall()}
@@ -141,14 +155,14 @@ class SchemaMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "state.sqlite"
             conn = gmail_sorter.open_state_db(db_path)
+            self._tracked(conn)
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertEqual(row[0], CURRENT_SCHEMA_VERSION)
-            conn.close()
             # Re-open: should be a no-op, version unchanged.
             conn2 = gmail_sorter.open_state_db(db_path)
+            self._tracked(conn2)
             row2 = conn2.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertEqual(row2[0], CURRENT_SCHEMA_VERSION)
-            conn2.close()
 
     def test_open_state_db_is_backward_compatible_with_v1_files(self):
         # Write a v1-style file by hand and confirm open_state_db migrates it.
@@ -215,11 +229,11 @@ class SchemaMigrationTests(unittest.TestCase):
             seed.commit()
             seed.close()
             conn = gmail_sorter.open_state_db(db_path)
+            self._tracked(conn)
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertEqual(row[0], CURRENT_SCHEMA_VERSION)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(message_features)").fetchall()}
             self.assertIn("body_text_excerpt", cols)
-            conn.close()
 
 
 if __name__ == "__main__":

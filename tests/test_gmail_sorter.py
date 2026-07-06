@@ -7,80 +7,22 @@ from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from tests.test_helpers import tracked, make_test_args
 
 import gmail_sorter
 
 
 def args(**overrides):
-    """Build a minimal argparse-like object for policy tests."""
+    """Build a minimal argparse-like object for policy tests.
 
-    defaults = {
-        "ad_threshold": 65,
-        "archive_threshold": 65,
-        "archive_min_age_days": 0,
-        "archive_skip_unread": False,
-        "trash_threshold": 90,
-        "pre_2020_trash_threshold": 75,
-        "stage": "classify",
-        "trash_obvious_ads": False,
-        "i_understand_trash": False,
-        "scan": "metadata",
-        "use_sender_profiles": True,
-        "sender_profiles": {},
-        "sender_profile_min_weight": 6,
-        "sender_profile_floor": 65,
-        "sender_profile_half_life_days": 180,
-        "label_confidence": 50,
-        "max_labels_per_message": 3,
-        "cached_body_features": {},
-        "relabel_run_id": "",
-        "undo_relabel": "",
-        "relabel_since_date": "",
-        "relabel_label": "",
-        "use_thread_aware": False,
-        "thread_dominant_categories": {},
-        "_embedding_backend": None,
-        "category_centroids": {},
-        # Apply path needs:
-        "retries": 5,
-        "retry_sleep": 5.0,
-        "batch_size": 100,
-        "apply_progress_every": 100,
-        "max_trash_total": 0,
-        "max_trash_per_domain": 0,
-        "canary_limit": 0,
-        "max_archive_total": 0,
-        "max_archive_per_domain": 0,
-        "archive_canary_limit": 0,
-        "prune_empty_labels": False,
-        # AI merge:
-        "ai_merge_min_confidence": 0.7,
-        "ai_merge_min_removal_confidence": 0.85,
-        "no_ai_learning": False,
-        # v0.7
-        "embedding_endpoint": "http://127.0.0.1:8080/v1/embeddings",
-        "embedding_model": "local",
-        "embedding_st_model": "",
-        "embedding_confidence_floor": 70,
-        "ai_review_threshold": 75,
-        "ai_review_file": "data/label_review_packets.jsonl",
-        "merge_ai_labels": False,
-        "export_ai_review": False,
-        "ai_review_only": False,
-        "refresh_existing": False,
-        "refresh_after_days": 7,
-        "save_every": 250,
-        "apply": False,
-        "http_timeout": 120.0,
-        "workers": 8,
-        "sleep": 0.05,
-        "disable_state_db": False,
-        "use_html_body": True,
-        # Yearly dashboard:
-        "query": "before:2025/12/30 -in:trash",
-    }
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
+    v0.7.1: the canonical defaults live in :mod:`tests.test_helpers`
+    so the same shape is shared across every test file. This thin
+    wrapper is kept here for backwards compatibility with tests
+    that import ``args`` from this module.
+    """
+
+    from tests.test_helpers import make_test_args
+    return make_test_args(**overrides)
 
 
 def message(payload, labels=None, snippet="", size=0):
@@ -671,7 +613,7 @@ class RelabelUndoAndResumeTests(unittest.TestCase):
         service = self._service_with_labels(
             [FakeLabel("Sorter/Finance", "sl-fin"), FakeLabel("Sorter/Ads Promotions", "sl-ads")]
         )
-        conn = sqlite3.connect(":memory:")
+        conn = tracked(self, sqlite3.connect(":memory:"))
         conn.execute(
             "CREATE TABLE action_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, stage TEXT, action TEXT, message_id TEXT, status TEXT, detail TEXT)"
         )
@@ -696,7 +638,7 @@ class RelabelUndoAndResumeTests(unittest.TestCase):
         )
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "state.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "state.sqlite"))
             run_id = "20260706T120000"
             detail = json.dumps({"run_id": run_id, "removed": [], "added": ["sl-ads"], "previous_labels": []})
             conn.execute("INSERT INTO action_ledger (created_at, stage, action, message_id, status, detail) VALUES (?, 'relabel', 'relabel', 'm1', 'success', ?)", ("2026-07-06T12:00:00", detail))

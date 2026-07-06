@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from tests.test_helpers import tracked, make_test_args
 
 import gmail_sorter
 from sorter import policy
@@ -234,7 +235,7 @@ class ActionLedgerTests(unittest.TestCase):
         ]
         a = args(stage="label", apply=True)
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             gmail_sorter.apply_decisions(s, decisions, a, conn)
             rows = conn.execute("SELECT stage, action, message_id FROM action_ledger").fetchall()
             self.assertGreater(len(rows), 0)

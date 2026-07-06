@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from tests.test_helpers import tracked, make_test_args
 
 import gmail_sorter
 
@@ -195,7 +196,7 @@ class ApplyPipelineTests(unittest.TestCase):
         ]
         a = args(stage="label", apply=True)
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             gmail_sorter.apply_decisions(service, decisions, a, conn)
             rows = conn.execute("SELECT stage, action, message_id, status FROM action_ledger").fetchall()
             self.assertGreater(len(rows), 0)
@@ -220,7 +221,7 @@ class ApplyPipelineTests(unittest.TestCase):
         ]
         a = args(stage="archive", apply=True)
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             gmail_sorter.apply_decisions(service, decisions, a, conn)
             # The fake service records every call; we should have a
             # batchModify or a modify for the INBOX removal.
@@ -250,7 +251,7 @@ class ApplyPipelineTests(unittest.TestCase):
         ]
         a = args(stage="trash", apply=True, trash_obvious_ads=True, i_understand_trash=True)
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             gmail_sorter.apply_decisions(service, decisions, a, conn)
             self.assertIn("m1", service.trashed)
             conn.close()
@@ -275,7 +276,7 @@ class ApplyPipelineTests(unittest.TestCase):
         ]
         a = args(stage="trash", apply=True, trash_obvious_ads=True, i_understand_trash=True)
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             gmail_sorter.apply_decisions(service, decisions, a, conn)
             # Protected: the trash call must not happen.
             self.assertNotIn("m1", service.trashed)
@@ -380,13 +381,12 @@ class AIReviewEndToEndTests(unittest.TestCase):
             decisions[0].planned_actions = ["label:Finance"]
             decisions[1].planned_actions = ["label:Health"]
             apply_a = args(stage="label", apply=True)
-            state_db = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            state_db = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             gmail_sorter.apply_decisions(service, decisions, apply_a, state_db)
             # The fake service recorded at least one batchModify for the
             # two labels.
             call_names = [c[0] for c in service.calls]
             self.assertIn("messages.batchModify", call_names)
-            state_db.close()
 
 
 class BodyExcerptEndToEndTests(unittest.TestCase):
@@ -408,12 +408,11 @@ class BodyExcerptEndToEndTests(unittest.TestCase):
         self.assertIn("statement", decision.body_text_excerpt.lower())
 
         with tempfile.TemporaryDirectory() as tmp:
-            db = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+            db = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             gmail_sorter.upsert_message_features(db, [decision], scan_mode="full")
             index = gmail_sorter.load_body_features_index(db)
             self.assertIn(decision.message_id, index)
             self.assertEqual(index[decision.message_id]["body_text_excerpt"], decision.body_text_excerpt)
-            db.close()
 
 
 class EmbeddingEndToEndTests(unittest.TestCase):
@@ -460,7 +459,7 @@ class SenderProfileTimeDecayEndToEndTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "s.sqlite"
-            conn = gmail_sorter.open_state_db(db_path)
+            conn = tracked(self, gmail_sorter.open_state_db(db_path))
             # Seed an old profile: 720 days ago, multiple hits.
             old = gmail_sorter.Decision(
                 message_id="old", thread_id="t", date=(datetime.now(timezone.utc) - timedelta(days=720)).date().isoformat(),
@@ -483,7 +482,7 @@ class SenderProfileTimeDecayEndToEndTests(unittest.TestCase):
             conn.close()
 
             # Half-life of 30 days: the 720-day profile gets 2^(-720/30) ~= 0 weight.
-            conn = gmail_sorter.open_state_db(db_path)
+            conn = tracked(self, gmail_sorter.open_state_db(db_path))
             index = gmail_sorter.load_sender_profile_index(conn, half_life_days=30, min_hits=1)
             fresh_weight = index.get("sender:noreply@insurer.com:insurance", {}).get("Insurance", 0)
             old_weight = index.get("sender:noreply@bank.com:finance", {}).get("Finance", 0)
