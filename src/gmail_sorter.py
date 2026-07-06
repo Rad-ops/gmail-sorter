@@ -72,6 +72,16 @@ SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 log = logging.getLogger("sorter")
 
 
+# v0.6: AI review packet body excerpt cap (smaller than the centroid text
+# cap so a single AI packet is small enough to ship in a bounded prompt).
+AI_REVIEW_BODY_EXCERPT_CHARS = 1200
+# v0.7: privacy-bounded cleaned body excerpt persisted to
+# message_features.body_text_excerpt. Used by update_category_centroids as
+# the embed text for centroid learning. The cap keeps the local cache from
+# growing unbounded on a multi-year mailbox.
+BODY_EXCERPT_FOR_FEATURES = 4000
+
+
 
 
 
@@ -1425,15 +1435,26 @@ def update_category_centroids(
     backend: Any,
     confidence_floor: int = 70,
     max_messages_per_category: int = 500,
+    body_cap: int = BODY_EXCERPT_FOR_FEATURES,
 ) -> int:
     """Recompute per-category centroid embeddings from high-confidence decisions.
 
     For each category, collects messages with that category at confidence >=
-    floor, embeds their subject + body excerpt, averages the vectors, and stores
-    the centroid in SQLite. Returns the number of centroids updated.
+    floor, embeds their subject + snippet + the cleaned body excerpt persisted
+    in v0.7 (``body_text_excerpt``), averages the vectors, and stores the
+    centroid in SQLite. Returns the number of centroids updated.
 
     Only categories with at least 3 high-confidence messages get a centroid, so
     a new category doesn't get a noisy centroid from one message.
+
+    The text built for each message is ``subject + snippet + body_excerpt``,
+    truncated to ``body_cap`` characters. Pre-v0.7, the text was built from
+    ``subject + snippet + body_category_hits`` (the *names* of categories that
+    hit, not the body text itself). That was a real weakness: the centroids
+    never learned what a Finance message *sounds like* from real finance mail,
+    only from the subject + the literal string "Finance". With v0.7 the body
+    excerpt is persisted (see :data:`BODY_EXCERPT_FOR_FEATURES`) and the
+    centroids now embed the real body semantics.
     """
 
     if conn is None or backend is None:
@@ -1446,11 +1467,25 @@ def update_category_centroids(
         for cat, conf in item.category_confidence.items():
             if cat in NON_LABEL_CATEGORIES:
                 continue
-            if conf >= confidence_floor:
-                text = f"{item.subject} {item.snippet}"
-                if item.body_category_hits:
-                    text += f" {' '.join(item.body_category_hits)}"
-                cat_messages[cat].append(text[:2000])
+            if conf < confidence_floor:
+                continue
+            # v0.7: include the cleaned body excerpt (if any) before falling
+            # back to the legacy body_category_hits names. A message with no
+            # excerpt is rare outside of metadata-only scans; we still keep
+            # the hits fallback so the function stays correct for older
+            # decision rows.
+            text = f"{item.subject} {item.snippet}"
+            excerpt = (item.body_text_excerpt or "").strip()
+            if excerpt:
+                text = f"{text} {excerpt}"
+            elif item.body_category_hits:
+                # Legacy fallback: a pre-v0.7 decision whose body excerpt is
+                # empty but which carries category-hit names. Older centroids
+                # were learned this way; we keep the same text shape so
+                # re-scoring against them remains consistent until enough v0.7
+                # excerpts land to fully refresh the centroids.
+                text = f"{text} {' '.join(item.body_category_hits)}"
+            cat_messages[cat].append(text[:body_cap])
 
     now = datetime.now(timezone.utc).isoformat()
     updated = 0
@@ -2357,16 +2392,7 @@ def load_manifest_ids(path: Path) -> set[str]:
 # They do NOT contain OAuth tokens, full body text, or attachment bytes.
 # Packets are written to data/ which is gitignored.
 
-AI_REVIEW_BODY_EXCERPT_CHARS = 1200
-# Cleaned-body excerpt persisted to message_features.body_text_excerpt. The
-# centroid learner in update_category_centroids embeds this text (plus
-# subject+snippet) instead of just the body_category_hits names, so the
-# embeddings learn from real message semantics. The excerpt goes through the
-# same quote/footer stripping that categorization uses, so a reply quoting a
-# promo email does not leak the promo body into the cached text. The bound
-# keeps the local SQLite cache from growing unboundedly on a multi-year
-# mailbox.
-BODY_EXCERPT_FOR_FEATURES = 4000
+
 
 
 def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: int, body_excerpt_chars: int = AI_REVIEW_BODY_EXCERPT_CHARS, sender_profiles: dict[str, dict[str, int]] | None = None, thread_dominant: dict[str, str] | None = None) -> int:
