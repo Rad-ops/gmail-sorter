@@ -5,7 +5,7 @@ long-unmanaged mailboxes. It scans, classifies, and reports before any change
 is made, then applies label, archive, trash, and relabel stages only when
 explicitly requested.
 
-**Version:** `0.6.0` · **Schema version:** 1
+**Version:** `0.7.0` · **Schema version:** 3
 
 Companion local-AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack)
 
@@ -141,6 +141,9 @@ The merge step adjusts decisions where the AI suggests a different label above `
 - **Sender → category profiles.** High-confidence decisions are accumulated per sender/domain in SQLite. On a re-run, a profile can surface a category the subject keywords missed — the mailbox self-improves pass over pass.
 - **Body-aware scanning.** `--scan full` feeds a bounded, cleaned slice of the decoded body (quotes and footers stripped) to the classifier. Ad confidence is still scored on headers + subject + snippet so a long promotional body does not inflate trash scores. Body features are cached in SQLite so re-runs skip the expensive fetch.
 - **Embedding pre-classifier.** `--use-embeddings` computes a dense embedding for each message and compares it to per-category centroid vectors learned from past high-confidence decisions. The final confidence is `max(keyword_score, embedding_similarity * 100)` — the keyword rules provide the explainable floor, the embedding provides the semantic ceiling. This catches semantic matches the lexical rules miss (e.g. a bank statement with no "bank" keyword). Uses the local LLM server's `/v1/embeddings` endpoint or sentence-transformers; falls back to keyword-only when unavailable.
+- **Multi-language keyword overlays.** `sorter/lang.py` picks `en|fr|fa|other` per message. `config/policy.fr.yaml` and `config/policy.fa.yaml` add French and Farsi keywords for IRCC, finance, health, government, utilities, and security. The detector is *only* used to pick the keyword overlay; it never blocks or moves mail.
+- **AI active learning + AI removal.** `--merge-ai-labels` returns `(agreed, overridden, removed)`. Removal requires `--ai-merge-min-removal-confidence` (default 0.85). After every merge, the AI's verified decisions are pushed back into `sender_profile` and, when an embedding backend is on, the category centroids so the next scan benefits automatically.
+- **Sender profile time-decay + diversity.** New `--sender-profile-half-life-days` (default 180). The `sender_profile` key now includes the category so a single sender can have one row per category. `category_diversity` is refreshed on every write so the dashboard can surface noisy senders.
 - **Catch-all labels.** `Review` and `Updates` appear on the dashboard but are never applied as Gmail labels.
 - **Primary category.** Each message gets one `primary_category` chosen by a protected/priority-first precedence.
 
@@ -170,6 +173,8 @@ thresholds:
   pre_2020_trash_threshold: 75
 ```
 
+Per-language overlays live next to `policy.yaml` as `policy.fr.yaml` and `policy.fa.yaml`. The English overlay is the regular `policy.yaml`; the FR/FA overlays are picked automatically when the language detector returns `fr` or `fa` on a message. The overlays are additive by default; a category can be replaced with `replace: true` on a per-category basis (opt-in).
+
 PyYAML is optional; built-in defaults are used when the file or library is absent. Allow/block lists live in `config/allowlist.txt` and `config/blocklist.txt`.
 
 ## CLI reference
@@ -197,6 +202,7 @@ PyYAML is optional; built-in defaults are used when the file or library is absen
 | `--use-embeddings` | Enable embedding-based semantic classification (hybrid with keywords) |
 | `--embedding-endpoint URL` | OpenAI-compatible /v1/embeddings endpoint |
 | `--embedding-st-model NAME` | sentence-transformers model (offline, if installed) |
+| `--sender-profile-half-life-days N` | v0.7: half-life in days for sender-profile time decay. 0 disables. |
 
 ### Archive
 
@@ -237,7 +243,9 @@ PyYAML is optional; built-in defaults are used when the file or library is absen
 | `--ai-review-threshold 75` | Export decisions below this top confidence |
 | `--ai-review-file PATH` | Path to the review JSONL |
 | `--merge-ai-labels` | Merge AI-reviewed labels before apply |
-| `--ai-merge-min-confidence 0.7` | Minimum AI confidence to override |
+| `--ai-merge-min-confidence 0.7` | Minimum AI confidence to add a label |
+| `--ai-merge-min-removal-confidence 0.85` | v0.7: minimum AI confidence to REMOVE a non-protected label the code assigned |
+| `--no-ai-learning` | v0.7: disable the active-learning pass that pushes AI-verified decisions into sender_profile and category centroids |
 
 ## Project structure
 
@@ -269,7 +277,7 @@ Folders marked *local only* are gitignored because they can contain message IDs,
 .venv/bin/python -m unittest discover -s tests
 ```
 
-51 tests cover the classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, the relabel label diff, undo, resume, AI review export/merge, confidence/cap behavior, body cleaning, thread-aware labeling, and embedding-based semantic classification.
+125 tests cover the classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, the relabel label diff, undo, resume, AI review export/merge, AI active learning, confidence/cap behavior, body cleaning, thread-aware labeling, embedding-based semantic classification, language detection, per-language keyword overlays, sender profile time decay, and schema migrations.
 
 ## Documentation
 

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.7.0 - 2026-07-06
+
+### 🧠 Real body in category centroids (the headline fix)
+
+The v0.6 embedding pre-classifier learned category centroids from `subject + snippet + body_category_hits` (the *names* of categories that hit, not the body text itself). That was a real weakness: the centroids never learned what a Finance message *sounds like* from real finance mail, only from the subject + the literal string "Finance". v0.7 persists a privacy-bounded cleaned body excerpt to `message_features.body_text_excerpt` and embeds the real text on the next scan, so the centroids learn from real message semantics.
+
+- New `Decision.body_text_excerpt` field, populated from `clean_body_text(body_text, keep_chars=4000)`.
+- New `message_features.body_text_excerpt TEXT` column (schema v2 migration).
+- `update_category_centroids` now prefers the body excerpt over the legacy `body_category_hits` names when building the embed text. A pre-v0.7 decision row still works via the fallback so the in-flight centroid refresh stays consistent.
+- 19 new tests covering the constant, the field, the upsert/load round-trip, metadata-only exclusion, the decide() excerpt rules, and the centroid text shape.
+
+### 🌍 Multi-language keyword overlays (EN + FR + FA)
+
+- New `sorter/lang.py` with `detect(text) → en|fr|fa|other`. Two backends: `langdetect` if installed, pure-Python stopword-frequency fallback otherwise. The detector is *only* used to pick the keyword overlay; it never blocks or moves mail.
+- New `config/policy.fr.yaml` with French IRCC, finance, health, government, utilities, security, and studies keywords.
+- New `config/policy.fa.yaml` with Farsi equivalents for the same categories, including the personal contacts (Marolia, Tiffani, Ronen, Jemma, Jonalyn, Oskoii) used in the English protected list.
+- `sorter/config_loader.py` gains `load_language_overlay()`, `activate_language_overlay()`, and `restore_policy()`. The overlay is applied per-message and restored before the next message, so the policy module never carries forward stale FR/FA keywords when the next message is in English.
+- `decide()` records `Decision.detected_language` so the dashboard / future reviews can show the language context.
+- 26 new tests across detection, decide() integration, the cache-only scan path, the additive and replace overlay modes, the context manager, and the missing-file fallback.
+
+### 🔁 AI active learning + AI removal (closes the AI review loop)
+
+The AI review pipeline was the most expensive reviewer in the loop but never taught the rest of the system anything. v0.7 closes the loop:
+
+- `merge_ai_labels` now returns `(agreed, overridden, removed)`. Removal requires `--ai-merge-min-removal-confidence` (default 0.85, stricter than the 0.7 addition threshold). Removal never touches a protected category and never removes a primary.
+- New `sorter/ai_learning.py` with `apply_ai_learning()`. After every merge, the AI's verified decisions are pushed into the local SQLite state: a sender_profile bump for the AI's chosen category, and—when an embedding backend is on—a centroid contribution weighted by AI confidence.
+- Two new CLI flags: `--ai-merge-min-removal-confidence` and `--no-ai-learning`.
+- 12 new tests covering removal, removal-confidence threshold, protected category preservation, agreed path, sender/domain profile bumps, centroid contribution, low-confidence centroid skip, unreviewed packet skip, missing-DB no-op, and catchall label exclusion.
+
+### ⏳ Sender profile time-decay + diversity (and a real bug fix)
+
+- `sender_profile` key now `(kind, value, category)`. Pre-v0.7 the key was `(kind, value)` which collided on the row when a sender was seen in multiple categories. v0.7 fixes the row-level collision and lets the rest of the code treat `sender_profile` as a one-row-per-(sender, category) table.
+- v3 migration rewrites existing `(kind, value)` keys to `(kind, value, :category)` and back-fills `first_seen` from `last_seen`.
+- `load_sender_profile_index` now applies a half-life decay: `weight = base_hits * 2^(-Δdays / half_life_days)`. New `--sender-profile-half-life-days` parameter (default 180). 0 disables decay (pre-v0.7 behavior).
+- `update_sender_profiles` writes `first_seen` on the first observation and refreshes `category_diversity` on every write.
+- New `load_sender_diversity()` for the dashboard's Noisy Senders section.
+- 10 new tests across decay math, fallback, min_hits filter, distinct-category counting, pre-v0.7 DB compatibility, and end-to-end decide() with a decayed profile.
+
+### 🗄️ Schema migrations
+
+- New `sorter/schema.py` with `CURRENT_SCHEMA_VERSION = 3`, idempotent `migrate()`.
+- New `schema_migrations` ledger table records applied versions.
+- `open_state_db` calls `migrate()` instead of inlining CREATE TABLE statements.
+- v1: original baseline (no-op, recorded).
+- v2: `message_features.body_text_excerpt`.
+- v3: `sender_profile.first_seen` + `last_hits` + `category_diversity`, plus key rewrite.
+- 7 new tests covering fresh DB, idempotency, v1 backward compatibility, and the open_state_db end-to-end path.
+
+### 🧪 Tests
+
+- 125 tests passing (was 51). +74 tests across schema, body excerpts, centroids, language detection, language overlays, AI active learning, sender profile decay.
+
 ## 0.6.0 - 2026-07-06
 
 ### 🧠 Embedding Pre-Classifier (Hybrid Keyword + Semantic)
