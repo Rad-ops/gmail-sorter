@@ -5,7 +5,7 @@ long-unmanaged mailboxes. It scans, classifies, and reports before any change
 is made, then applies label, archive, trash, and relabel stages only when
 explicitly requested.
 
-**Version:** `0.8.1` · **Schema version:** 4
+**Version:** `0.8.2` · **Schema version:** 4
 
 Companion local-AI stack: [`Rad-ops/local-ai-coding-stack`](https://github.com/Rad-ops/local-ai-coding-stack)
 
@@ -287,7 +287,7 @@ Folders marked *local only* are gitignored because they can contain message IDs,
 .venv/bin/python -m unittest discover -s tests
 ```
 
-328 tests cover the classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, the relabel label diff, undo, resume, AI review export/merge, AI active learning, confidence/cap behavior, body cleaning, thread-aware labeling, embedding-based semantic classification, language detection, per-language keyword overlays, sender profile time decay, schema migrations, per-keyword learned weights, thread-level conversation modeling, sender reputation, Gmail History API incremental scan, HTML body extraction, the v0.7.1 patch fixes, and the v0.8.1 schema v4 migration.
+333 tests cover the classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, the relabel label diff, undo, resume, AI review export/merge, AI active learning, confidence/cap behavior, body cleaning, thread-aware labeling, embedding-based semantic classification, language detection, per-language keyword overlays, sender profile time decay, schema migrations, per-keyword learned weights, thread-level conversation modeling, sender reputation, Gmail History API incremental scan, HTML body extraction, the v0.7.1 patch fixes, and the v0.8.1 schema v4 migration.
 
 ## Documentation
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.8.2 - 2026-07-06
+
+### 🐛 Bug Fixes
+
+- **`BODY_EXCERPT_FOR_FEATURES` dead code path in `ai_learning.py`.** The constant was defined in `gmail_sorter.py` but referenced as `policy.BODY_EXCERPT_FOR_FEATURES` in `ai_learning.py`. The `hasattr(policy, ...)` fallback saved it at runtime, but the first branch was never taken. Moved the constant to `sorter/policy.py` so both modules reference the same source of truth.
+
+- **Duplicate `header_map()` and `payload_headers()` functions.** Both extracted headers from a Gmail payload dict with identical one-liners (lines 302 and 519). `payload_headers` now delegates to `header_map`.
+
+### 🚀 Incremental Scan (Phase 2)
+
+- **Wired the actual History API incremental fetch.** When `--since-history-id auto` (or `explicit:<id>`) is provided with a valid numeric history ID, `main()` now calls `fetch_all_history()` instead of the full `list_message_ids()` re-list. The incremental path:
+  - Fetches all pages of history (follows `nextPageToken`) via the new `fetch_all_history()` function
+  - Parses events with `parse_history_response()` and collects changed message IDs
+  - Applies label events to `action_ledger` and removes deleted messages from the local DB
+  - Persists the mailbox's latest `historyId` for the next incremental run
+  - Falls back to a full re-scan on stale history ID (404) or empty records
+  - After `--since-history-id reset`, gets the current history ID from `users.getProfile` and persists it
+- New `get_current_history_id()` helper in `sorter/incremental.py` wraps `users.getProfile`. 
+- New `fetch_all_history()` handles pagination with `nextPageToken` and returns the combined records plus the latest `historyId`.
+
+### 🧪 Tests
+
+- **333 tests passing** (was 328; +5 for `fetch_all_history` and `get_current_history_id` coverage). New tests cover single-page fetch, multi-page (nextPageToken), error handling, and profile history ID retrieval.
+
 ## 0.8.1 - 2026-07-06
 
 ### 🐛 Bug Fixes

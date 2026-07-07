@@ -6,7 +6,7 @@ architecture, every file's purpose, the design philosophy, how to run the tool,
 the AI review workflow, and the current state.
 
 **Last updated:** 2026-07-06  
-**Version:** 0.8.1  
+**Version:** 0.8.2  
 **Repository:** https://github.com/Rad-ops/gmail-sorter  
 **Schema version:** 4  
 
