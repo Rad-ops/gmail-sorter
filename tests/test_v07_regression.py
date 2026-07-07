@@ -447,11 +447,13 @@ class V07SchemaMigrationTests(unittest.TestCase):
     """v0.7.0: schema migrations work for fresh and v1-state databases."""
 
     def test_fresh_db_lands_at_v3(self):
+        # v0.7 regression: a fresh DB lands at v3.
+        # v0.8.1 adds v4 which also lands; this test pins the v3
+        # floor, not the v3 ceiling.
         with tempfile.TemporaryDirectory() as tmp:
             conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-            self.assertEqual(row[0], 3)
-            conn.close()
+            self.assertGreaterEqual(row[0], 3)
 
     def test_v1_state_db_migrates_to_v3(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -514,15 +516,16 @@ class V07SchemaMigrationTests(unittest.TestCase):
             )
             seed.commit()
             seed.close()
-            # Open with the sorter; the migration must bring the DB to v3.
+            # Open with the sorter; the migration must bring the DB to at
+            # least v3 (v0.8.1 adds v4, but the v3 floor is what the
+            # v0.7 regression test pins).
             conn = tracked(self, gmail_sorter.open_state_db(path))
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-            self.assertEqual(row[0], 3)
+            self.assertGreaterEqual(row[0], 3)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(sender_profile)").fetchall()}
             self.assertIn("first_seen", cols)
             self.assertIn("category_diversity", cols)
             self.assertIn("body_text_excerpt", {r[1] for r in conn.execute("PRAGMA table_info(message_features)").fetchall()})
-            conn.close()
 
 
 if __name__ == "__main__":

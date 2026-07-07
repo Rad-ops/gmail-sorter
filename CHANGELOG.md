@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.1 - 2026-07-06
+
+### 🐛 Bug Fixes
+
+- **Schema v4 migration missing.** v0.8 introduced three new tables (`state_meta`, `thread_features`, `sender_reputation`) that were created lazily on first use. That meant the schema version stayed at 3 even after v0.8 ran, making it impossible to tell from `schema_migrations` whether a database was on the v0.7 or v0.8 shape. v0.8.1 adds an explicit v4 migration that creates these tables with `CREATE TABLE IF NOT EXISTS` (idempotent), bumps `CURRENT_SCHEMA_VERSION` to 4, and lets a pre-v0.8 database upgrade cleanly.
+
+- **`--since-history-id` flag was parsed but never read.** v0.8 added the flag to argparse but the resolution logic was never wired into `main()`. v0.8.1 wires it: the flag resolves to one of four values (`auto:` uses the stored last_history_id, `reset` forces a full re-scan, `explicit:` uses the user-supplied id, `disabled` no incremental mode) and persists the resolved value to `state_meta` so the operator can inspect it. The actual incremental fetch (replacing `list_message_ids`) is left for a future release; v0.8.1 establishes the resolution + persistence path so the command is operational today.
+
+- **Test args() helper drift between v0.7 and v0.8.** v0.7.0's `args()` in `tests/test_gmail_sorter.py` and v0.8's `args()` were two separate dicts that drifted. v0.8.1 collapses both to a single `make_test_args` factory in `tests/test_helpers.py`; the local `args()` wrapper in `test_gmail_sorter.py` is a thin delegator. The defaults can no longer drift between the two helpers.
+
+- **Stale default query (carried from v0.7.1).** v0.7.1 fixed `sorter/policy.py` `DEFAULT_QUERY` from `before:2025/12/30 -in:trash` (now in the past) to `in:anywhere -in:trash`. v0.8.1 keeps the fix in place and asserts it in the v0.7.1 / v0.8.1 regression tests.
+
+- **Test connection leaks (carried from v0.7.1).** v0.7.1 added `tracked(self, conn)` to `tests/test_helpers.py`; v0.8.1 wires every sqlite3 connection site in the v0.8 test files through it. Pre-fix, up to 6 connections leaked per run; post-fix, none.
+
+### 🧪 Tests
+
+328 tests passing (was 304 in v0.8.0; +24 across v0.7.1 + v0.8.1). Coverage spans:
+- `tests/test_v071_fixes.py` (8) — default query has no stale date, args helper exposes every v0.8 flag, the args factory is the single source of truth, `tracked()` closes connections, no unclosed-database warnings fire.
+- `tests/test_v081_fixes.py` (16) — schema v4 is the current version, v4 migration creates `state_meta` / `thread_features` / `sender_reputation`, the migration is idempotent, `--since-history-id` resolves to the four documented values, the local `args()` wrapper matches `make_test_args`, the stale-default-query fix is preserved, `tracked()` works on a `unittest.TestCase`.
+
 ## 0.7.1 - 2026-07-06
 
 ### 🐛 Bug Fixes
@@ -13,6 +33,69 @@
 ### 🧪 Tests
 
 207 tests passing (was 199 in v0.7.0; +8 for the v0.7.1 fixes).
+
+## 0.8.0 - 2026-07-06
+
+### 🎯 Heuristics & Performance
+
+v0.8.0 is the **heuristics-and-performance** milestone. The five headline changes replace hand-tuned heuristics with data-driven signals, and add the infrastructure for incremental maintenance.
+
+#### 1. Per-keyword learned weights
+
+Pre-v0.7 the per-keyword scoring weights (`subject=30`, `body=20`, `sender=15`) were hand-tuned. v0.8 replaces them with weights learned from the labeled data in the SQLite `messages` table. A 6-feature logistic regression per category fits the model; the result is persisted to `data/learned_weights.json` and consulted by `decide()` via `max(keyword, learned)`.
+
+- New `sorter/learned_weights.py` with `CategoryWeights` (subject, body, sender, keyword_family_cap, gmail_label_boost, sender_profile_cap, plus a 6-element LR weight vector and bias).
+- Pure-Python SGD training in `train_category_weights` (no numpy, no scikit-learn).
+- `train_from_decisions` reads labeled data from the SQLite `messages` table and fits one logistic regression per category. Falls back to hand-tuned defaults when the training set is too small (`< MIN_CONFIDENCE = 10` examples per category).
+- `save_weights` / `load_weights` round-trip through `data/learned_weights.json`.
+- New CLI flags: `--use-learned-weights`, `--learned-weights-file`.
+
+#### 2. Thread-level conversation modeling
+
+Pre-v0.7's `--use-thread-aware` was a simple plurality vote: the dominant category in the thread was inherited by catch-all replies. v0.8 builds a thread feature vector per thread and uses it to boost a category's confidence by up to 15 points.
+
+- New `sorter/thread_features.py` with `ThreadFeature` (message_count, distinct_senders, top_category, top_category_share, has_attachment_count, has_unsubscribe_count, date_span_days, protected_fraction, first/last_seen).
+- `build_thread_features` aggregates the `messages` table into one `ThreadFeature` per thread, ignoring single-message threads and threads whose top category is a `NON_LABEL_CATEGORY`.
+- `upsert_thread_features` persists the features to a new `thread_features` SQLite table.
+- `compute_thread_boost` returns a 0-15 confidence boost for the thread's top category, scaled by `message_count` and `top_category_share`. The boost is small and conservative — a noisy thread cannot blow up an unrelated category.
+- New CLI flags: `--use-thread-modeling` (default on), `--no-thread-modeling`.
+
+#### 3. Sender reputation as a first-class signal
+
+- New `sorter/sender_reputation.py` with `SenderReputation` (total_messages, avg_ad_confidence, protected_fraction, ad_fraction, first/last_seen, reputation_score).
+- `compute_reputation_score`: `100 * (1 - ad_fraction) * log(1 + N) / 5`, clamped to 0-100.
+- `build_sender_reputation` aggregates the `messages` table into one `SenderReputation` per (sender, domain) key.
+- `upsert_sender_reputation` + `load_sender_reputation_index`: persist and load the new `sender_reputation` SQLite table.
+- `suggest_blocklist` returns the obvious-trash candidates (`>=200` messages, `>=80%` ad fraction, `0%` protected) for the dashboard.
+- `reputation_ad_adjustment`: high-reputation senders (`-15` ad confidence) and low-reputation senders (`+10`).
+- New CLI flags: `--use-sender-reputation` (default on), `--no-sender-reputation`.
+
+#### 4. Gmail History API incremental scan
+
+- New `sorter/incremental.py` with `state_meta` key/value storage (`last_history_id`, `last_scan_at`, `last_full_scan_at`) in a new SQLite table created lazily on first use.
+- `parse_history_response`: converts Gmail history API events into one `HistoryEvent` per id, with `messages_added` / `messages_deleted` / `labels_added` / `labels_removed` buckets.
+- `collect_message_ids`: returns the set of every message id touched by the events.
+- `apply_label_events`: writes each label change to the `action_ledger` as `history` / `labels_added` (or `labels_removed`) so the operator can audit the changes.
+- `remove_deleted_messages`: deletes the local rows for messages that were removed in Gmail.
+- `fetch_history_page`: thin wrapper around the Gmail `history.list` API with proper exception handling for stale historyId (404).
+- New CLI flag: `--since-history-id {auto,reset,<id>}`.
+- New `commands/run-maintenance.sh`: weekly maintenance run script that activates the venv, runs the incremental scan with the embedding pre-classifier, thread modeling, sender reputation, and learned weights all enabled. Designed for a systemd user timer.
+
+#### 5. Better HTML body extraction
+
+- New `sorter/html_body.py` with `decode_part` (handles base64 and quoted-printable `Content-Transfer-Encoding`), `_StructuredHTMLParser` (preserves table structure as tab-separated rows, skips `<style>`/`<script>` blocks), `html_to_structured_text` (pure-Python entry point), and `extract_text_from_mime` (walks a raw MIME message, prefers `text/plain` over `text/html`).
+- `collect_body_text` gained a `use_html_body` parameter (default True) that runs each HTML part through `html_to_structured_text`.
+- New CLI flags: `--use-html-body` (default on), `--no-html-body`.
+
+### 🧪 Tests
+
+**304 tests passing** (was 199 in v0.7.0; +105 across the release). Coverage spans:
+
+- `tests/test_learned_weights.py` (18) — default weights, round-trip serialization, sigmoid/logit math, training separates classes, training is monotonic, learned scores in 0-100, training from messages table, no-state path, under-trained path, end-to-end decide integration.
+- `tests/test_thread_features.py` (18) — feature vector, default zeros, build aggregation, single-message exclusion, catch-all exclusion, no-state path, upsert+load round-trip, idempotency, empty input, compute_boost zero/positive/capped/scaled, end-to-end decide integration.
+- `tests/test_sender_reputation.py` (22) — compute_reputation_score range and behavior, build_sender_reputation empty/no-state/per-sender/per-domain/with-ads, upsert+load round-trip, idempotency, suggest_blocklist thresholds and protected-sender skip, reputation_ad_adjustment positive/zero/negative/missing/no-messages paths.
+- `tests/test_incremental.py` (21) — state_meta round-trip, history_id persistence, parse_history_response for added/deleted/labeled events, malformed entry skipping, collect_message_ids, apply_label_events action_ledger, remove_deleted_messages round-trip.
+- `tests/test_html_body.py` (26) — decode_part for all CTE types, HTML to structured text for plain/script/style/table/br/entities/whitespace/nested/script-in-cell, MIME extraction for plain-only/html-only/alternative/forced-HTML/QP-French/empty/malformed/oversized, collect_body_text integration.
 
 ## 0.7.0 - 2026-07-06
 

@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import gmail_sorter
 from sorter.schema import CURRENT_SCHEMA_VERSION, migrate
+from tests.test_helpers import tracked
 
 
 class SchemaMigrationTests(unittest.TestCase):
@@ -45,14 +46,14 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertGreaterEqual(CURRENT_SCHEMA_VERSION, 3)
 
     def test_fresh_db_lands_at_current_version(self):
-        conn = self._tracked(sqlite3.connect(":memory:"))
+        conn = tracked(self, sqlite3.connect(":memory:"))
         applied = migrate(conn)
         self.assertEqual(applied, CURRENT_SCHEMA_VERSION)
         rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
         self.assertEqual([row[0] for row in rows], list(range(1, CURRENT_SCHEMA_VERSION + 1)))
 
     def test_fresh_db_has_v1_baseline_tables(self):
-        conn = self._tracked(sqlite3.connect(":memory:"))
+        conn = tracked(self, sqlite3.connect(":memory:"))
         migrate(conn)
         for table in (
             "messages",
@@ -69,7 +70,7 @@ class SchemaMigrationTests(unittest.TestCase):
             self.assertIsNotNone(row, f"missing baseline table: {table}")
 
     def test_migrate_is_idempotent(self):
-        conn = self._tracked(sqlite3.connect(":memory:"))
+        conn = tracked(self, sqlite3.connect(":memory:"))
         first = migrate(conn)
         second = migrate(conn)
         third = migrate(conn)
@@ -80,7 +81,7 @@ class SchemaMigrationTests(unittest.TestCase):
         # Simulate a state DB written by an older binary: baseline tables
         # without the v2 body_text_excerpt column or the v3 sender_profile
         # decay columns. The migrator must add them.
-        conn = self._tracked(sqlite3.connect(":memory:"))
+        conn = tracked(self, sqlite3.connect(":memory:"))
         conn.execute(
             """
             CREATE TABLE messages (
@@ -154,13 +155,11 @@ class SchemaMigrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "state.sqlite"
-            conn = gmail_sorter.open_state_db(db_path)
-            self._tracked(conn)
+            conn = tracked(self, gmail_sorter.open_state_db(db_path))
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertEqual(row[0], CURRENT_SCHEMA_VERSION)
             # Re-open: should be a no-op, version unchanged.
-            conn2 = gmail_sorter.open_state_db(db_path)
-            self._tracked(conn2)
+            conn2 = tracked(self, gmail_sorter.open_state_db(db_path))
             row2 = conn2.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertEqual(row2[0], CURRENT_SCHEMA_VERSION)
 
@@ -228,8 +227,7 @@ class SchemaMigrationTests(unittest.TestCase):
             )
             seed.commit()
             seed.close()
-            conn = gmail_sorter.open_state_db(db_path)
-            self._tracked(conn)
+            conn = tracked(self, gmail_sorter.open_state_db(db_path))
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             self.assertEqual(row[0], CURRENT_SCHEMA_VERSION)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(message_features)").fetchall()}

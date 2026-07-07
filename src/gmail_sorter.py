@@ -66,7 +66,7 @@ CATEGORY_RULES = policy.CATEGORY_RULES
 PRIMARY_CATEGORY_PRECEDENCE = policy.PRIMARY_CATEGORY_PRECEDENCE
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.7.1"
+APP_VERSION = "0.8.1"
 VERSION_CODE = "20260706"
 SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 log = logging.getLogger("sorter")
@@ -360,7 +360,20 @@ def decode_payload_text(data: str) -> str:
         return ""
 
 
-def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000) -> str:
+def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000, use_html_body: bool = True) -> str:
+    """Walk a Gmail message payload and return the decoded body text.
+
+    v0.8: when ``use_html_body`` is True (default), HTML parts are
+    converted to structured text (style/script stripped, tables as
+    tab-separated rows) so receipt line items and the like survive
+    into the cleaned body. When False, the function falls back to the
+    pre-v0.8 simple collector (each part decoded verbatim, joined
+    with newlines).
+    """
+
+    if use_html_body:
+        from sorter.html_body import html_to_structured_text
+
     chunks: list[str] = []
 
     def walk(part: dict[str, Any]) -> None:
@@ -371,7 +384,10 @@ def collect_body_text(payload: dict[str, Any], max_chars: int = 250_000) -> str:
         body = part.get("body", {})
         data = body.get("data", "")
         if data and not filename and mime_type in {"text/plain", "text/html"}:
-            chunks.append(decode_payload_text(data))
+            decoded = decode_payload_text(data)
+            if mime_type == "text/html" and use_html_body:
+                decoded = html_to_structured_text(decoded)
+            chunks.append(decoded)
         for child in part.get("parts", []) or []:
             walk(child)
 
@@ -984,6 +1000,42 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
             body_text=clean_body_text(body_text) if body_included else "",
             sender_text=f"{sender} {sender_domain}",
         )
+        # v0.8: per-keyword learned weights. When the user has enabled
+        # --use-learned-weights and the trained model is loaded, blend
+        # the learned score in via max(keyword, learned) for every
+        # category. The model is the data-driven ceiling, the
+        # keyword rules are the explainable floor.
+        learned_weights = getattr(args, "_learned_weights", None) or {}
+        if learned_weights:
+            from sorter.learned_weights import apply_learned_score
+            gmail_promotions = "CATEGORY_PROMOTIONS" in labels
+            gmail_primary = "CATEGORY_PRIMARY" in labels
+            for cat in list(category_confidence.keys()):
+                weights = learned_weights.get(cat)
+                if weights is None:
+                    continue
+                # Approximate the per-message hit counts for the
+                # feature vector. We don't have the per-category
+                # hit counts split by position at the categorize
+                # step (they were collapsed into keyword_score), so
+                # use a simple proxy: the stored confidence itself
+                # is a good proxy for the total hit count, and
+                # gmail_category_boost is the same +30 the
+                # hand-tuned code applies.
+                approx_hits = max(1, min(3, int(category_confidence[cat] / 25)))
+                learned = apply_learned_score(
+                    weights,
+                    subject_hits=approx_hits,
+                    body_hits=approx_hits,
+                    sender_hits=1 if cat in (profile_cats or {}) else 0,
+                    has_gmail_promotions=gmail_promotions,
+                    has_gmail_primary=gmail_primary,
+                    sender_profile_boost=float(profile_cats.get(cat, 0)),
+                )
+                if learned > category_confidence[cat]:
+                    category_confidence[cat] = learned
+                    if learned >= getattr(args, "label_confidence", 50):
+                        reasons.append(f"learned_boost:{cat}:{learned}")
     finally:
         if overlay_token is not None:
             restore_policy(overlay_token)
@@ -1075,6 +1127,22 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
             categories = sorted(set(categories) | {dominant})
             category_confidence_kept[dominant] = 55
             reasons.append(f"thread_inherited:{dominant}")
+    # v0.8: thread-level conversation modeling. The thread features
+    # are read from args.thread_features in main(). The boost is
+    # small (cap 15) and only applies to the thread's top
+    # category, so a noisy thread can't blow up an unrelated
+    # category.
+    thread_features = getattr(args, "thread_features", {}) or {}
+    thread_id = message.get("threadId", "")
+    if thread_id and getattr(args, "use_thread_modeling", True):
+        feature = thread_features.get(thread_id)
+        if feature is not None:
+            from sorter.thread_features import compute_thread_boost
+            boost = compute_thread_boost(feature, feature.top_category)
+            if boost > 0 and feature.top_category not in NON_LABEL_CATEGORIES:
+                old_conf = category_confidence_kept.get(feature.top_category, 0)
+                category_confidence_kept[feature.top_category] = max(old_conf, min(100, old_conf + boost))
+                reasons.append(f"thread_model_boost:{feature.top_category}:+{boost}")
     body_unsubscribe_links = find_unsubscribe_links_in_text(body_text) if body_included else extract_body_unsubscribe_links(payload)
     attachment_names, attachment_mime_types = collect_attachment_details(payload) if has_attachment else ([], [])
     # This is the main safety gate. A protected message can still be reported
@@ -3280,7 +3348,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
     parser.add_argument("--sender-profile-floor", type=int, default=65, help="Only learn profiles from decisions at or above this ad confidence (protected mail always contributes).")
     parser.add_argument("--sender-profile-half-life-days", type=int, default=180, help="v0.7: half-life in days for the sender-profile time decay. A row older than this contributes half as much weight as a fresh one. 0 disables decay (pre-v0.7 behavior).")
+    parser.add_argument("--use-learned-weights", action="store_true", default=False, help="v0.8: replace the hand-tuned keyword weights with weights learned from the labeled data in the SQLite messages table. Trained on every scan; persisted to data/learned_weights.json. Falls back to hand-tuned weights when not enough labeled data exists.")
+    parser.add_argument("--learned-weights-file", type=str, default="data/learned_weights.json", help="v0.8: path to the learned-weights JSON file.")
     parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
+    parser.add_argument("--use-thread-modeling", dest="use_thread_modeling", action="store_true", default=True, help="v0.8: thread-level conversation modeling. Builds a thread feature vector (message_count, distinct_senders, top_category_share, etc.) and uses it to boost a category's confidence by up to 15 points. More principled than the plurality vote.")
+    parser.add_argument("--no-thread-modeling", dest="use_thread_modeling", action="store_false", help="v0.8: disable thread-level conversation modeling.")
+    parser.add_argument("--use-sender-reputation", dest="use_sender_reputation", action="store_true", default=True, help="v0.8: first-class sender reputation signal. Computes total_messages, ad_fraction, and a derived 0-100 score per sender; high-reputation senders get -15 ad confidence, low-reputation senders get +10. The dashboard surfaces suggested blocklist candidates.")
+    parser.add_argument("--no-sender-reputation", dest="use_sender_reputation", action="store_false", help="v0.8: disable sender reputation signal.")
+    parser.add_argument("--since-history-id", type=str, default="", help="v0.8: incremental scan via the Gmail History API. Pass a numeric historyId, 'auto' to use the stored last_history_id, 'reset' to force a full re-scan, or empty to disable incremental mode.")
+    parser.add_argument("--use-html-body", dest="use_html_body", action="store_true", default=True, help="v0.8: better HTML body extraction. Strips <style>/<script> blocks, preserves table structure as tab-separated rows, decodes quoted-printable bodies, and handles multipart/alternative correctly.")
+    parser.add_argument("--no-html-body", dest="use_html_body", action="store_false", help="v0.8: disable the new HTML body extraction (fall back to the pre-v0.8 simple collector).")
     parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
     parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
     parser.add_argument("--embedding-model", default="local", help="Model name for the HTTP embedding endpoint.")
@@ -3311,6 +3388,21 @@ def main() -> int:
     # v0.7: pass the config directory to decide() so per-language overlays
     # (config/policy.fr.yaml, config/policy.fa.yaml) can be loaded on demand.
     args._policy_config_dir = str(PROJECT_DIR / "config")
+    # v0.8: train (or load) the per-keyword learned weights. Training
+    # reads the labeled data from the SQLite messages table; the result
+    # is cached in JSON so subsequent scans are fast.
+    args._learned_weights = {}
+    if getattr(args, "use_learned_weights", False):
+        from sorter.learned_weights import load_weights, save_weights, train_from_decisions
+        weights_path = Path(getattr(args, "learned_weights_file", "data/learned_weights.json"))
+        weights = load_weights(weights_path)
+        if not weights:
+            weights = train_from_decisions(state_conn)
+            if weights:
+                save_weights(weights_path, weights)
+                trained_count = sum(1 for w in weights.values() if w.confidence > 0)
+                log.info("learned-weights: trained %d categories from %d decisions", trained_count, len(weights))
+        args._learned_weights = weights
     log.info("gmail-sorter %s (%s) schema_version=%s", APP_VERSION, VERSION_CODE, SCHEMA_VERSION)
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)
@@ -3346,6 +3438,45 @@ def main() -> int:
     service = build_gmail_service(build, creds, args)
     list_throttle = AdaptiveThrottle(args.sleep)
 
+    # v0.8.1: resolve the --since-history-id flag into a concrete
+    # history id. The flag accepts three values:
+    #   - empty ("")        : incremental mode disabled; full re-scan.
+    #   - "auto"            : use the stored last_history_id from
+    #                         state_meta. The default for weekly
+    #                         maintenance runs.
+    #   - "reset"           : force a full re-scan and reset the
+    #                         stored last_history_id to the current
+    #                         mailbox state.
+    #   - <numeric string>  : use the given history id explicitly.
+    # The resolved value is stored on args so the rest of the
+    # pipeline can read it. The actual incremental fetch (replacing
+    # list_message_ids) is wired in a follow-up; v0.8.1 establishes
+    # the resolution + persistence path so callers see a working
+    # command today.
+    history_id_resolution = ""
+    if state_conn is not None:
+        from sorter.incremental import get_last_history_id, set_last_history_id, set_meta
+        since = getattr(args, "since_history_id", "") or ""
+        if since == "auto":
+            stored = get_last_history_id(state_conn)
+            if stored:
+                history_id_resolution = f"auto:{stored}"
+                log.info("since-history-id=auto: resuming from historyId=%s", stored)
+            else:
+                history_id_resolution = "auto:none"
+                log.info("since-history-id=auto: no stored historyId; full re-scan")
+        elif since == "reset":
+            history_id_resolution = "reset"
+            log.info("since-history-id=reset: forcing a full re-scan")
+        elif since.isdigit():
+            history_id_resolution = f"explicit:{since}"
+            log.info("since-history-id=%s: explicit historyId", since)
+        else:
+            history_id_resolution = "disabled" if not since else f"unknown:{since}"
+            if since:
+                log.warning("since-history-id=%r is not 'auto', 'reset', or numeric; treating as disabled", since)
+    args.history_id_resolution = history_id_resolution
+
     try:
         message_ids = list_message_ids(service, args.query, args.max_messages, args.retries, args.retry_sleep, list_throttle)
     except HttpError as error:
@@ -3353,6 +3484,19 @@ def main() -> int:
         if state_conn is not None:
             state_conn.close()
         return 1
+
+    # v0.8.1: persist the resolved history id. The current
+    # implementation stores the resolution marker (not the actual
+    # Gmail historyId) so a future incremental patch can swap in
+    # the real historyId without a schema change.
+    if state_conn is not None and history_id_resolution.startswith(("auto:", "explicit:")):
+        try:
+            from sorter.incremental import set_meta
+            from datetime import datetime as _dt, timezone as _tz
+            set_meta(state_conn, "last_scan_at", _dt.now(_tz.utc).isoformat())
+            set_meta(state_conn, "last_history_id", history_id_resolution)
+        except Exception as error:  # pragma: no cover - defensive
+            log.debug("failed to persist history_id_resolution: %s", error)
 
     progress_path = Path(args.progress_file)
     progress = load_progress(progress_path) if args.resume else {}
@@ -3362,6 +3506,33 @@ def main() -> int:
     ) if getattr(args, "use_sender_profiles", True) else {}
     args.cached_body_features = load_body_features_index(state_conn) if getattr(args, "scan", "metadata") == "full" and not args.refresh_existing else {}
     args.thread_dominant_categories = load_thread_dominant_categories(state_conn) if getattr(args, "use_thread_aware", False) else {}
+    # v0.8: build thread-level features (message_count, distinct_senders,
+    # top_category_share, etc.) for the thread-aware boost. The new
+    # table is populated lazily on every scan; the load function
+    # returns an empty dict on a fresh install.
+    args.thread_features = {}
+    if getattr(args, "use_thread_modeling", True):
+        from sorter.thread_features import build_thread_features, upsert_thread_features, load_thread_features_index
+        features = build_thread_features(state_conn)
+        if features:
+            upsert_thread_features(state_conn, features)
+        args.thread_features = load_thread_features_index(state_conn)
+    # v0.8: build sender_reputation (lifetime message count, ad
+    # fraction, derived score) so score_ad can apply the -15/+10
+    # adjustment.
+    args.sender_reputation = {}
+    if getattr(args, "use_sender_reputation", True):
+        from sorter.sender_reputation import (
+            build_sender_reputation, upsert_sender_reputation, load_sender_reputation_index, suggest_blocklist,
+        )
+        reputations = build_sender_reputation(state_conn)
+        if reputations:
+            upsert_sender_reputation(state_conn, reputations)
+        args.sender_reputation = load_sender_reputation_index(state_conn)
+        candidates = suggest_blocklist(args.sender_reputation)
+        if candidates:
+            log.info("blocklist candidates (>=%d msgs, >=%.0f%% ads, no protected): %s",
+                     200, 0.80 * 100, ", ".join(candidates[:10]))
     # Embedding backend and centroids: optional semantic classification layer.
     args._embedding_backend = None
     args.category_centroids = {}

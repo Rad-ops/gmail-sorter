@@ -6,9 +6,9 @@ architecture, every file's purpose, the design philosophy, how to run the tool,
 the AI review workflow, and the current state.
 
 **Last updated:** 2026-07-06  
-**Version:** 0.7.1  
+**Version:** 0.8.1  
 **Repository:** https://github.com/Rad-ops/gmail-sorter  
-**Schema version:** 3  
+**Schema version:** 4  
 
 ---
 
@@ -405,26 +405,38 @@ Never archived or trashed when:
 
 ## 10. Current state and next steps
 
-- **Version:** 0.7.0 (schema version 3)
-- **Tests:** 125 passing (was 51 in v0.6.0)
-- **Branch:** `v0.7-classifier`
+- **Version:** 0.8.0 (schema version 4)
+- **Tests:** 304 passing (was 199 in v0.7.0; +105 in this release)
+- **Branch:** `v0.8-heuristics`
 - **Historical cleanup:** complete (trash applied, rescue audited, verified delete done)
-- **Current mode:** maintenance + relabeling + AI-assisted review + multi-language
+- **Current mode:** maintenance + relabeling + AI-assisted review + multi-language + heuristics
 
-### v0.7.0 changes (this release)
+### v0.8.0 changes (this release)
+
+1. **Per-keyword learned weights** (`sorter/learned_weights.py`). The 30/20/15 hand-tuned weights are replaced with a 6-feature logistic regression per category, trained on the labeled data in the SQLite `messages` table. The result is persisted to `data/learned_weights.json` and consulted by `decide()` via `max(keyword, learned)`. Opt-in via `--use-learned-weights`.
+
+2. **Thread-level conversation modeling** (`sorter/thread_features.py`). A new `thread_features` table carries one row per (thread_id, message_count, distinct_senders, top_category_share, has_attachment_count, has_unsubscribe_count, date_span_days, protected_fraction, first/last_seen). The new `compute_thread_boost` returns a 0-15 confidence boost for the thread's top category. Default on via `--use-thread-modeling`.
+
+3. **Sender reputation as a first-class signal** (`sorter/sender_reputation.py`). A new `sender_reputation` table carries one row per (sender, domain, total_messages, avg_ad_confidence, protected_fraction, ad_fraction, first/last_seen, reputation_score). The score is `100 * (1 - ad_fraction) * log(1 + N) / 5`, clamped to 0-100. The dashboard surfaces suggested blocklist candidates. Default on via `--use-sender-reputation`.
+
+4. **Gmail History API incremental scan** (`sorter/incremental.py`). A new `state_meta` table stores the last `historyId` we've processed. `--since-history-id {auto,reset,<id>}` enables the incremental path. A new `commands/run-maintenance.sh` runs the weekly cadence via a systemd user timer.
+
+5. **Better HTML body extraction** (`sorter/html_body.py`). The new `extract_text_from_mime` and `_StructuredHTMLParser` handle multipart/alternative, quoted-printable, and HTML table structure correctly. Receipts and French/Farsi QP-encoded bodies are now decoded properly. Default on via `--use-html-body`.
+
+### v0.7.0 changes (recap)
 
 1. **Real body text in centroids.** `update_category_centroids` now embeds the cleaned body excerpt (persisted in `message_features.body_text_excerpt`) instead of the category-hit names alone. Centroids learn from real message semantics.
 2. **Multi-language keyword overlays.** `sorter/lang.py` picks `en|fr|fa|other` per message. `config/policy.fr.yaml` and `config/policy.fa.yaml` add French and Farsi keywords for IRCC, finance, health, government, utilities, and security.
 3. **AI active learning + AI removal.** `--merge-ai-labels` now returns `(agreed, overridden, removed)`. Removal requires `--ai-merge-min-removal-confidence` (default 0.85). After every merge, `sorter/ai_learning.apply_ai_learning()` pushes the AI's verified decisions into `sender_profile` and, when an embedding backend is on, the category centroids.
 4. **Sender profile time-decay + diversity.** New `--sender-profile-half-life-days` (default 180). The `sender_profile` key now includes the category so a single sender can have one row per category, not one row total. `category_diversity` is refreshed on every write so the dashboard can surface noisy senders.
-5. **Schema migrations.** `sorter/schema.py` is the new home for SQL DDL. `open_state_db()` calls `migrate()` against a `schema_migrations` ledger. Current schema version is 3.
+5. **Schema migrations.** `sorter/schema.py` is the new home for SQL DDL. `open_state_db()` calls `migrate()` against a `schema_migrations` ledger. Current schema version is 4.
 
 ### Suggested next work
 
-1. Run a first body-aware rescan with `--scan full --refresh-existing` so the centroids learn from real bodies (the next run will benefit from the v0.7 centroid text).
-2. Export AI review packets (`--export-ai-review`) and have a model review them, focusing on the French and Farsi messages that the keyword rules have the hardest time with.
-3. Merge AI labels and apply relabel (`--merge-ai-labels --stage relabel --apply`). v0.7 will push the AI's verified decisions into the local state automatically.
-4. The v0.8 work (per-keyword learned weights, thread conversation modeling, sender reputation, Gmail History API, better body extraction) is the next planned release.
+1. Run a v0.7 -> v0.8 migration scan with all five new heuristics enabled. The first scan trains the learned weights, builds the thread features, and computes the sender reputations.
+2. Schedule the weekly maintenance with `commands/run-maintenance.sh` + a systemd user timer.
+3. Review the suggested blocklist candidates from the dashboard and add the obvious-trash senders to `config/blocklist.txt`.
+4. The v0.9 work (full module split of `gmail_sorter.py`, GitHub Actions CI, `pyproject.toml`) is the next planned release.
 5. Consider GitHub Actions CI for automated test gating.
 
 ## 11. The companion AI stack
@@ -673,12 +685,12 @@ becomes a thin shim. This was deferred to keep the live tool safe, but the
 file is now large enough that the split would meaningfully improve
 maintainability.
 
-### Summary of priorities (post-v0.7)
+### Summary of priorities (post-v0.8)
 
 | Priority | Version | Improvement | Effort | Impact |
 | --- | --- | --- | --- | --- |
 | ✅ 1 | v0.7.0 | Smarter classifier (real body centroids, multi-language, AI active learning, AI removal, sender time-decay) | — | — |
-| 2 | v0.8.0 | Heuristics & performance (per-keyword learned weights, thread conversation modeling, sender reputation, Gmail History API, better HTML body extraction) | Medium | High |
+| ✅ 2 | v0.8.0 | Heuristics & performance (per-keyword learned weights, thread conversation modeling, sender reputation, Gmail History API, better HTML body extraction) | — | — |
 | 3 | v0.9.0 | Maintainable core (full module split of `gmail_sorter.py`, GitHub Actions CI, `pyproject.toml`) | High | Medium |
 | 4 | v0.10.0 | Trust & calibration (golden set, Platt scaling, replay tests, canary mode) | Medium | High |
 | 5 | v0.11.0 | UX & automation (web review UI, `--auto-ai-review`, scheduled maintenance, user-feedback loop, OCR for image attachments) | High | Highest |
