@@ -25,6 +25,100 @@ from sorter.incremental import (
 )
 
 
+class _FakeGmailService:
+    """Minimal mock for the Gmail service used by fetch_all_history."""
+
+    def __init__(self, history_records=None, history_id=0,
+                 profile_history_id=0, raise_on_history=False,
+                 raise_on_profile=False):
+        self._history_records = history_records or []
+        self._history_id = history_id
+        self._profile_history_id = profile_history_id
+        self._raise_on_history = raise_on_history
+        self._raise_on_profile = raise_on_profile
+        self._page_count_ref = [0]
+
+    def users(self):
+        return _FakeUsers(
+            self._profile_history_id, self._raise_on_profile,
+            self._history_records, self._history_id,
+            self._raise_on_history, self._page_count_ref,
+        )
+
+    def close(self):
+        pass
+
+
+class _FakeUsers:
+    def __init__(self, profile_history_id, raise_on_profile, history_records, history_id, raise_on_history, page_count_ref):
+        self._profile_history_id = profile_history_id
+        self._raise_on_profile = raise_on_profile
+        self._history_records = history_records
+        self._history_id = history_id
+        self._raise_on_history = raise_on_history
+        self._page_count_ref = page_count_ref
+
+    def getProfile(self, userId="me"):
+        return _FakeProfileRequest(self._profile_history_id, self._raise_on_profile)
+
+    def history(self):
+        return _FakeHistory(
+            self._history_records, self._history_id,
+            self._raise_on_history, self._page_count_ref,
+        )
+
+
+class _FakeProfileRequest:
+    def __init__(self, profile_history_id, raise_on_profile):
+        self._profile_history_id = profile_history_id
+        self._raise_on_profile = raise_on_profile
+
+    def execute(self):
+        if self._raise_on_profile:
+            raise Exception("profile error")
+        return {"historyId": str(self._profile_history_id)}
+
+
+class _FakeHistory:
+    def __init__(self, records, history_id, raise_on_history, page_count_ref):
+        self._records = records
+        self._history_id = history_id
+        self._raise_on_history = raise_on_history
+        self._page_count_ref = page_count_ref
+
+    def list(self, userId="me", startHistoryId=None, maxResults=500):
+        if self._raise_on_history:
+            return _FakeHistoryRequest([], self._history_id, raise_error=True)
+        if isinstance(self._records, list) and self._records and isinstance(self._records[0], list):
+            idx = self._page_count_ref[0]
+            self._page_count_ref[0] += 1
+            page = self._records[idx % len(self._records)]
+            has_more = idx + 1 < len(self._records)
+            return _FakeHistoryRequest(page, self._history_id, has_more=has_more)
+        return _FakeHistoryRequest(self._records, self._history_id)
+
+
+class _FakeHistoryRequest:
+    def __init__(self, records, history_id, has_more=False, raise_error=False):
+        self._records = records
+        self._history_id = history_id
+        self._has_more = has_more
+        self._raise_error = raise_error
+        self._page_token = None
+
+    def pageToken(self, token):
+        self._page_token = token
+        return self
+
+    def execute(self):
+        if self._raise_error:
+            raise Exception("history list error")
+        result = {"history": self._records, "historyId": str(self._history_id)}
+        if self._has_more:
+            result["nextPageToken"] = "token_next"
+        return result
+
+
 class StateMetaTests(unittest.TestCase):
     def test_ensure_state_meta_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,6 +313,50 @@ class RemoveDeletedMessagesTests(unittest.TestCase):
 
     def test_no_db(self):
         self.assertEqual(remove_deleted_messages(None, ["m1"]), 0)
+
+
+class FetchAllHistoryTests(unittest.TestCase):
+    """Tests for fetch_all_history with a mock Gmail service."""
+
+    def test_returns_empty_on_error(self):
+        history, latest_id = incremental.fetch_all_history(
+            _FakeGmailService(raise_on_history=True), 12345,
+        )
+        self.assertEqual(history, [])
+        self.assertEqual(latest_id, 0)
+
+    def test_single_page(self):
+        service = _FakeGmailService(
+            history_records=[{"id": 100, "messagesAdded": [{"message": {"id": "m1"}}]}],
+            history_id=99999,
+        )
+        history, latest_id = incremental.fetch_all_history(service, 12345)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(latest_id, 99999)
+
+    def test_multi_page(self):
+        service = _FakeGmailService(
+            history_records=[
+                [{"id": 100, "messagesAdded": [{"message": {"id": "m1"}}]}],
+                [{"id": 200, "messagesAdded": [{"message": {"id": "m2"}}]}],
+            ],
+            history_id=99999,
+        )
+        history, latest_id = incremental.fetch_all_history(service, 12345)
+        self.assertEqual(len(history), 2)
+        self.assertEqual(latest_id, 99999)
+
+
+class GetCurrentHistoryIdTests(unittest.TestCase):
+    """Tests for get_current_history_id."""
+
+    def test_returns_0_on_error(self):
+        service = _FakeGmailService(raise_on_profile=True)
+        self.assertEqual(incremental.get_current_history_id(service), 0)
+
+    def test_returns_history_id(self):
+        service = _FakeGmailService(profile_history_id=77777)
+        self.assertEqual(incremental.get_current_history_id(service), 77777)
 
 
 if __name__ == "__main__":

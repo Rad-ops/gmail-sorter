@@ -79,7 +79,7 @@ AI_REVIEW_BODY_EXCERPT_CHARS = 1200
 # message_features.body_text_excerpt. Used by update_category_centroids as
 # the embed text for centroid learning. The cap keeps the local cache from
 # growing unbounded on a multi-year mailbox.
-BODY_EXCERPT_FOR_FEATURES = 4000
+BODY_EXCERPT_FOR_FEATURES = policy.BODY_EXCERPT_FOR_FEATURES
 
 
 
@@ -517,7 +517,7 @@ def payload_has_attachment(payload: dict[str, Any]) -> bool:
 
 
 def payload_headers(payload: dict[str, Any]) -> dict[str, str]:
-    return {item.get("name", "").lower(): item.get("value", "") for item in payload.get("headers", [])}
+    return header_map(payload)
 
 
 def is_inline_attachment_part(payload: dict[str, Any]) -> bool:
@@ -3449,10 +3449,7 @@ def main() -> int:
     #                         mailbox state.
     #   - <numeric string>  : use the given history id explicitly.
     # The resolved value is stored on args so the rest of the
-    # pipeline can read it. The actual incremental fetch (replacing
-    # list_message_ids) is wired in a follow-up; v0.8.1 establishes
-    # the resolution + persistence path so callers see a working
-    # command today.
+    # pipeline can read it.
     history_id_resolution = ""
     if state_conn is not None:
         from sorter.incremental import get_last_history_id, set_last_history_id, set_meta
@@ -3477,26 +3474,78 @@ def main() -> int:
                 log.warning("since-history-id=%r is not 'auto', 'reset', or numeric; treating as disabled", since)
     args.history_id_resolution = history_id_resolution
 
+    # v0.8.1+: wire the actual incremental fetch via the History API.
+    # When a valid history ID is available (auto: or explicit:), we fetch
+    # only the changed events since that ID instead of a full re-list.
+    incremental_history_id = 0
+    if history_id_resolution and ":" in history_id_resolution:
+        prefix, _, suffix = history_id_resolution.partition(":")
+        if prefix in ("auto", "explicit") and suffix.isdigit():
+            incremental_history_id = int(suffix)
+
     try:
-        message_ids = list_message_ids(service, args.query, args.max_messages, args.retries, args.retry_sleep, list_throttle)
+        history_records: list = []
+        if incremental_history_id:
+            from sorter.incremental import (
+                fetch_all_history, parse_history_response,
+                collect_message_ids, apply_label_events,
+                remove_deleted_messages, set_last_history_id,
+            )
+            history_records, latest_history_id = fetch_all_history(
+                service, incremental_history_id,
+            )
+            if history_records:
+                events = parse_history_response({"history": history_records})
+                all_ids = collect_message_ids(events)
+                deleted_ids: set[str] = set()
+                for e in events:
+                    deleted_ids.update(e.messages_deleted)
+                added_or_labeled = all_ids - deleted_ids
+                message_ids = sorted(added_or_labeled)
+                applied_event_count = apply_label_events(state_conn, events)
+                if deleted_ids:
+                    remove_deleted_messages(state_conn, list(deleted_ids))
+                # Persist the latest history ID for the next incremental run.
+                if latest_history_id:
+                    set_last_history_id(state_conn, latest_history_id)
+                    set_meta(state_conn, "last_scan_at",
+                             datetime.now(timezone.utc).isoformat())
+                log.info(
+                    "incremental scan: %d events, %d added/labeled ids, "
+                    "%d label events applied, %d deleted",
+                    len(events), len(message_ids), applied_event_count, len(deleted_ids),
+                )
+            else:
+                log.info("history.list returned no records; falling back to full re-scan")
+                message_ids = list_message_ids(
+                    service, args.query, args.max_messages,
+                    args.retries, args.retry_sleep, list_throttle,
+                )
+        else:
+            message_ids = list_message_ids(
+                service, args.query, args.max_messages,
+                args.retries, args.retry_sleep, list_throttle,
+            )
     except HttpError as error:
         print(f"Failed to list messages: {error}", file=sys.stderr)
         if state_conn is not None:
             state_conn.close()
         return 1
 
-    # v0.8.1: persist the resolved history id. The current
-    # implementation stores the resolution marker (not the actual
-    # Gmail historyId) so a future incremental patch can swap in
-    # the real historyId without a schema change.
-    if state_conn is not None and history_id_resolution.startswith(("auto:", "explicit:")):
-        try:
-            from sorter.incremental import set_meta
-            from datetime import datetime as _dt, timezone as _tz
-            set_meta(state_conn, "last_scan_at", _dt.now(_tz.utc).isoformat())
-            set_meta(state_conn, "last_history_id", history_id_resolution)
-        except Exception as error:  # pragma: no cover - defensive
-            log.debug("failed to persist history_id_resolution: %s", error)
+    # Persist the current history ID for the next incremental run.
+    # If we did an incremental scan, the latest ID was already stored by
+    # fetch_all_history. For "reset" or a stale history ID, get the
+    # current ID from the user profile and persist it.
+    if state_conn is not None and (
+        history_id_resolution == "reset"
+        or (bool(incremental_history_id) and not history_records)
+    ):
+        from sorter.incremental import get_current_history_id, set_meta, set_last_history_id
+        current_hid = get_current_history_id(service)
+        if current_hid:
+            set_last_history_id(state_conn, current_hid)
+            set_meta(state_conn, "last_scan_at", datetime.now(timezone.utc).isoformat())
+            set_meta(state_conn, "last_full_scan_at", datetime.now(timezone.utc).isoformat())
 
     progress_path = Path(args.progress_file)
     progress = load_progress(progress_path) if args.resume else {}

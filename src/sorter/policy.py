@@ -271,3 +271,8 @@ DEFAULTS = {
     "trash_threshold": 90,
     "pre_2020_trash_threshold": 75,
 }
+
+# Privacy-bounded cleaned body excerpt cap. Persisted in message_features
+# so centroids learn from real message semantics instead of only category
+# names. Used by decide() and ai_learning.apply_ai_learning().
+BODY_EXCERPT_FOR_FEATURES = 4000

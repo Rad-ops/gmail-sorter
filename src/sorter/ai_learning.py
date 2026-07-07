@@ -62,7 +62,7 @@ def apply_ai_learning(
     embedding_backend: Any | None = None,
     sender_profile_weight: int = 1,
     centroid_confidence_floor: int = 70,
-    centroid_body_cap: int = policy.BODY_EXCERPT_FOR_FEATURES if hasattr(policy, "BODY_EXCERPT_FOR_FEATURES") else 4000,
+    centroid_body_cap: int = policy.BODY_EXCERPT_FOR_FEATURES,
 ) -> dict[str, int]:
     """Push AI-overridden decisions into sender_profile and category centroids.
 

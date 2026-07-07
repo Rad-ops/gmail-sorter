@@ -231,6 +231,47 @@ def remove_deleted_messages(
     return cur.rowcount or 0
 
 
+def fetch_all_history(
+    service: Any,
+    start_history_id: int,
+    max_results: int = 500,
+) -> tuple[list[dict[str, Any]], int]:
+    """Fetch all pages of Gmail history, following nextPageToken.
+
+    Returns (history_records, latest_history_id).
+    ``latest_history_id`` is the mailbox's current historyId from the
+    API response (0 if the request failed), so the caller can persist
+    it for the next incremental run.
+    Returns an empty list and 0 when the history ID is stale (404) or
+    any other error occurs, so the caller can fall back to a full
+    re-scan.
+    """
+
+    all_history: list[dict[str, Any]] = []
+    latest_history_id = 0
+    page_token: str | None = None
+    while True:
+        try:
+            request = service.users().history().list(
+                userId="me",
+                startHistoryId=start_history_id,
+                maxResults=max_results,
+            )
+            if page_token:
+                request = request.pageToken(page_token)
+            response = request.execute()
+        except Exception as error:
+            log.warning("history.list failed (probably stale historyId): %s", error)
+            return [], 0
+        if not latest_history_id:
+            latest_history_id = int(response.get("historyId", 0))
+        all_history.extend(response.get("history", []) or [])
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return all_history, latest_history_id
+
+
 def fetch_history_page(
     service: Any,
     start_history_id: int,
@@ -242,6 +283,10 @@ def fetch_history_page(
     expected to follow the ``nextPageToken`` until it disappears.
     Returns the list of history records (not the full response) so the
     caller can ``parse_history_response`` each one.
+
+    .. deprecated::
+       Use :func:`fetch_all_history` instead, which handles pagination
+       internally.
     """
 
     try:
@@ -254,6 +299,19 @@ def fetch_history_page(
     return response.get("history", []) or []
 
 
+def get_current_history_id(service: Any) -> int:
+    """Return the mailbox's current historyId via users.getProfile.
+
+    Returns 0 on any error so the caller can degrade gracefully.
+    """
+
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        return int(profile.get("historyId", 0))
+    except (Exception, ValueError):
+        return 0
+
+
 __all__ = [
     "HistoryEvent",
     "META_KEY_HISTORY_ID",
@@ -262,6 +320,7 @@ __all__ = [
     "apply_label_events",
     "collect_message_ids",
     "ensure_state_meta",
+    "fetch_all_history",
     "fetch_history_page",
     "get_last_history_id",
     "get_meta",
