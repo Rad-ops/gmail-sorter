@@ -6,9 +6,9 @@ architecture, every file's purpose, the design philosophy, how to run the tool,
 the AI review workflow, and the current state.
 
 **Last updated:** 2026-07-06  
-**Version:** 0.5.1  
+**Version:** 0.7.1  
 **Repository:** https://github.com/Rad-ops/gmail-sorter  
-**Schema version:** 1  
+**Schema version:** 3  
 
 ---
 
@@ -141,10 +141,11 @@ This writes `data/label_review_packets.jsonl`. Each line is a JSON object:
   "code_confidence": {"Shopping": 40},
   "code_reasons": [...],
   "protected": false,
-  "ai_label": "",                 // AI fills this
-  "ai_confidence": 0,             // AI fills this (0.0-1.0)
-  "ai_reason": "",                // AI fills this
-  "ai_reviewed": false            // AI sets this to true
+  "detected_language": "fr",        // v0.7: en/fr/fa/other
+  "ai_label": "",                   // AI fills this
+  "ai_confidence": 0,               // AI fills this (0.0-1.0)
+  "ai_reason": "",                  // AI fills this
+  "ai_reviewed": false              // AI sets this to true
 }
 ```
 
@@ -172,8 +173,18 @@ writes the file back. The AI should:
 ```
 
 The merge step adjusts decisions where the AI suggests a different label above
-`--ai-merge-min-confidence` (default 0.7). Protected status is never removed.
-The AI can add a category the code missed but cannot take a protected one away.
+`--ai-merge-min-confidence` (default 0.7). v0.7 also allows the AI to
+*remove* a non-protected category the code assigned, when the AI's confidence
+is at or above `--ai-merge-min-removal-confidence` (default 0.85). Protected
+status is never removed. The AI can add a category the code missed but cannot
+take a protected one away.
+
+After the merge, v0.7 runs the **active learning** pass: the AI's verified
+decisions are pushed back into the local SQLite state as sender-profile bumps
+(both `sender:` and `domain:` keys) and, when an embedding backend is on,
+as centroid contributions weighted by AI confidence. The next scan benefits
+from the AI's review without any human in the loop. Pass `--no-ai-learning`
+to disable.
 
 ## 5. File reference
 
@@ -181,11 +192,15 @@ The AI can add a category the code missed but cannot take a protected one away.
 
 | File | Purpose |
 | --- | --- |
-| `src/gmail_sorter.py` | **Runnable core** (~2900 lines). CLI, scan, decide, apply, relabel, reports, dashboard. Imports policy/keywords from the `sorter/` package. |
-| `src/sorter/__init__.py` | Package init. Re-exports `policy` and `keywords` modules. |
+| `src/gmail_sorter.py` | **Runnable core** (~3400 lines). CLI, scan, decide, apply, relabel, reports, dashboard. Imports policy/keywords from the `sorter/` package. |
+| `src/sorter/__init__.py` | Package init. Re-exports `policy`, `keywords`, `config_loader`, `embeddings`, `lang`, `schema`, and `ai_learning` modules. |
 | `src/sorter/policy.py` | **Policy data**: keyword lists (immigration, studies, ad, transactional), `CATEGORY_RULES`, `PROTECTED_CATEGORIES`, `PRIMARY_CATEGORY_PRECEDENCE`, scoring defaults. This is where you edit cleanup rules without touching code. |
 | `src/sorter/keywords.py` | **Word-boundary keyword matcher**: `keyword_hits()` with `\b` boundaries, `compile_keywords()`, `regex_hits()`. Fixes the substring bug (`exam` no longer matches `example.com`). |
-| `src/sorter/config_loader.py` | Optional `config/policy.yaml` loader. Reads overrides for keyword groups and thresholds. PyYAML optional; falls back to built-in defaults. |
+| `src/sorter/config_loader.py` | YAML policy loader. Loads `config/policy.yaml` (English overrides) and `config/policy.<lang>.yaml` (per-language overlays). `apply_overrides()` mutates policy lists; `activate_language_overlay()`/`restore_policy()` apply a single-language overlay around one `decide()` call. |
+| `src/sorter/embeddings.py` | Embedding backends (HTTP, sentence-transformers), pure-Python cosine similarity, centroid management. |
+| `src/sorter/lang.py` | **v0.7: language detection.** `detect(text) → en|fr|fa|other`. Two backends: `langdetect` if installed, pure-Python stopword-frequency fallback otherwise. The detector is *only* used to pick the keyword overlay; it never blocks or moves mail. |
+| `src/sorter/schema.py` | **v0.7: schema migrations.** Idempotent `migrate()` with a `schema_migrations` ledger. Current schema version is `3`. |
+| `src/sorter/ai_learning.py` | **v0.7: AI active learning.** `apply_ai_learning()` pushes AI-verified decisions into sender_profile and category centroids. |
 | `src/trash_rescue_audit.py` | Deep re-check of planned Trash before permanent deletion. Re-fetches messages, checks for priority/attachment/durable-record signals, can export bounded packets for local Qwen review. Separate from the main sorter. |
 | `src/apply_domain_trash_policy.py` | User-approved permanent-delete policy for obvious-trash domains. Reads rescue-audit JSON, filters by approved domain list, writes delete manifest, permanently deletes with explicit flags. |
 
@@ -193,8 +208,15 @@ The AI can add a category the code missed but cannot take a protected one away.
 
 | File | Purpose |
 | --- | --- |
-| `tests/test_gmail_sorter.py` | 40 tests: classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, relabel label diff, undo, resume, AI review export/merge, confidence/cap behavior, body cleaning. Uses a `FakeGmailService` stub so relabel apply is tested without live Gmail. |
+| `tests/test_gmail_sorter.py` | 51 tests: classification policy, word-boundary matching, sender profiles, body-aware scanning, archive gating/caps, relabel label diff, undo, resume, AI review export/merge, confidence/cap behavior, body cleaning. Uses a `FakeGmailService` stub so relabel apply is tested without live Gmail. |
 | `tests/test_trash_rescue_audit.py` | Tests for the trash rescue audit. |
+| `tests/test_schema.py` | **v0.7: schema migration tests.** Fresh DB, idempotency, v1 backward compatibility, open_state_db end-to-end path. |
+| `tests/test_body_excerpt.py` | **v0.7: body excerpt tests.** Constant, field, upsert/load round-trip, metadata-only exclusion, decide() excerpt rules. |
+| `tests/test_centroid_body.py` | **v0.7: centroid body text tests.** Centroid text contains body excerpt, legacy fallback, low-confidence skip, <3 message skip, cap enforcement, subject+snippet inclusion, catchall exclusion. |
+| `tests/test_lang.py` | **v0.7: language detection tests.** EN/FR/FA detection, empty/whitespace, short subject, adversarial input, never-raises, decide() integration with full/metadata scans, cache-excerpt path. |
+| `tests/test_language_overlay.py` | **v0.7: language overlay tests.** Pool extension, rule injection, replace mode, empty overlay, malformed input, context manager, missing-file fallback, end-to-end FR + FA → Priority Immigration, overlay-does-not-persist between messages. |
+| `tests/test_ai_learning.py` | **v0.7: AI active learning + AI removal tests.** Removal, removal-confidence threshold, protected category preservation, agreed path, sender/domain profile bumps, centroid contribution, low-confidence centroid skip, unreviewed packet skip, missing-DB no-op, catchall label exclusion. |
+| `tests/test_sender_decay.py` | **v0.7: sender profile time-decay + diversity tests.** Decay math, fallback to last_seen, min_hits filter, distinct-category counting, pre-v0.7 DB compatibility, end-to-end decide() with decayed profile. |
 
 ### Configuration
 
@@ -202,7 +224,9 @@ The AI can add a category the code missed but cannot take a protected one away.
 | --- | --- |
 | `config/allowlist.txt` | One sender email or domain per line. Anything here is protected from archive/trash. |
 | `config/blocklist.txt` | One sender email or domain per line. Treated as junk unless protected. |
-| `config/policy.yaml` | Optional YAML overrides for keyword groups and thresholds. See file for format. |
+| `config/policy.yaml` | Optional YAML overrides for English keyword groups and thresholds. See file for format. |
+| `config/policy.fr.yaml` | **v0.7: French keyword overlay.** Additive by default; per-category `replace: true` is opt-in. |
+| `config/policy.fa.yaml` | **v0.7: Farsi keyword overlay.** Additive by default; per-category `replace: true` is opt-in. |
 
 ### Commands (shell scripts)
 
@@ -381,18 +405,27 @@ Never archived or trashed when:
 
 ## 10. Current state and next steps
 
-- **Version:** 0.5.1 (schema version 1)
-- **Tests:** 40 passing
-- **Branch:** `v0.5-relabel` (PR #2 open)
+- **Version:** 0.7.0 (schema version 3)
+- **Tests:** 125 passing (was 51 in v0.6.0)
+- **Branch:** `v0.7-classifier`
 - **Historical cleanup:** complete (trash applied, rescue audited, verified delete done)
-- **Current mode:** maintenance + relabeling
+- **Current mode:** maintenance + relabeling + AI-assisted review + multi-language
+
+### v0.7.0 changes (this release)
+
+1. **Real body text in centroids.** `update_category_centroids` now embeds the cleaned body excerpt (persisted in `message_features.body_text_excerpt`) instead of the category-hit names alone. Centroids learn from real message semantics.
+2. **Multi-language keyword overlays.** `sorter/lang.py` picks `en|fr|fa|other` per message. `config/policy.fr.yaml` and `config/policy.fa.yaml` add French and Farsi keywords for IRCC, finance, health, government, utilities, and security.
+3. **AI active learning + AI removal.** `--merge-ai-labels` now returns `(agreed, overridden, removed)`. Removal requires `--ai-merge-min-removal-confidence` (default 0.85). After every merge, `sorter/ai_learning.apply_ai_learning()` pushes the AI's verified decisions into `sender_profile` and, when an embedding backend is on, the category centroids.
+4. **Sender profile time-decay + diversity.** New `--sender-profile-half-life-days` (default 180). The `sender_profile` key now includes the category so a single sender can have one row per category, not one row total. `category_diversity` is refreshed on every write so the dashboard can surface noisy senders.
+5. **Schema migrations.** `sorter/schema.py` is the new home for SQL DDL. `open_state_db()` calls `migrate()` against a `schema_migrations` ledger. Current schema version is 3.
 
 ### Suggested next work
-1. Run a full body-aware rescan (`--scan full --refresh-existing`) on the mailbox
-2. Export AI review packets (`--export-ai-review`) and have a model review them
-3. Merge AI labels and apply relabel (`--merge-ai-labels --stage relabel --apply`)
-4. Consider moving `CATEGORY_RULES` into `config/policy.yaml` for config-driven rules
-5. Consider GitHub Actions CI for automated test gating
+
+1. Run a first body-aware rescan with `--scan full --refresh-existing` so the centroids learn from real bodies (the next run will benefit from the v0.7 centroid text).
+2. Export AI review packets (`--export-ai-review`) and have a model review them, focusing on the French and Farsi messages that the keyword rules have the hardest time with.
+3. Merge AI labels and apply relabel (`--merge-ai-labels --stage relabel --apply`). v0.7 will push the AI's verified decisions into the local state automatically.
+4. The v0.8 work (per-keyword learned weights, thread conversation modeling, sender reputation, Gmail History API, better body extraction) is the next planned release.
+5. Consider GitHub Actions CI for automated test gating.
 
 ## 11. The companion AI stack
 
@@ -640,26 +673,27 @@ becomes a thin shim. This was deferred to keep the live tool safe, but the
 file is now large enough that the split would meaningfully improve
 maintainability.
 
-### Summary of priorities (my recommendation)
+### Summary of priorities (post-v0.7)
 
-| Priority | Improvement | Effort | Impact |
-| --- | --- | --- | --- |
-| 1 | ~~A. Embedding pre-classifier (hybrid)~~ ✅ Done in v0.6.0 | — | — |
-| 2 | E. Confidence calibration + golden set | Medium | High — turns confidence from a guess into a metric |
-| 3 | D. Sender reputation table | Medium | Medium — auto-suggests blocklist, stronger priors |
-| 4 | B. Trained classifier on labeled data | Medium | Medium — replaces hand-tuned weights |
-| 5 | C. Thread-level conversation modeling | Medium | Medium — more principled than plurality vote |
-| 6 | F. Full module split | Low | Low — maintainability, not accuracy |
+| Priority | Version | Improvement | Effort | Impact |
+| --- | --- | --- | --- | --- |
+| ✅ 1 | v0.7.0 | Smarter classifier (real body centroids, multi-language, AI active learning, AI removal, sender time-decay) | — | — |
+| 2 | v0.8.0 | Heuristics & performance (per-keyword learned weights, thread conversation modeling, sender reputation, Gmail History API, better HTML body extraction) | Medium | High |
+| 3 | v0.9.0 | Maintainable core (full module split of `gmail_sorter.py`, GitHub Actions CI, `pyproject.toml`) | High | Medium |
+| 4 | v0.10.0 | Trust & calibration (golden set, Platt scaling, replay tests, canary mode) | Medium | High |
+| 5 | v0.11.0 | UX & automation (web review UI, `--auto-ai-review`, scheduled maintenance, user-feedback loop, OCR for image attachments) | High | Highest |
 
-**A (embedding pre-classifier)** is now implemented in v0.6.0. It addresses
-the root cause the user identified: "we rely heavily on keywords and domains,
+**v0.7.0 (this release) is the smarter-classifier milestone.** It addresses the
+root cause the user identified: "we rely heavily on keywords and domains,
 shouldn't we rely more on context?" An embedding model captures context; the
-keyword rules stay as the explainable floor; the AI review pipeline catches
-the rest. The hybrid is the architecture that makes the sorter genuinely smart
-without sacrificing safety or explainability.
+keyword rules stay as the explainable floor; the AI review pipeline closes
+the loop with active learning. The hybrid is the architecture that makes the
+sorter genuinely smart without sacrificing safety or explainability.
 
-The next model should evaluate the **remaining** items (B–F) and decide which
-to implement next. My recommendation for the next priority is **E (confidence
-calibration + golden set)** because it turns the embedding similarity scores
-into measurable, tunable probabilities — without calibration, we can't know
-if a similarity of 0.7 actually means "70% likely correct."
+The next model should evaluate the **remaining** items (v0.8.0 heuristics &
+performance) and decide which to implement next. My recommendation for the
+next priority is **v0.8.0 (per-keyword learned weights + thread conversation
+modeling + sender reputation + Gmail History API)** because it builds on the
+v0.7 centroid work: the embeddings need learned weights to combine with the
+keyword scores, and the History API is what makes the new classifier fast
+enough to run on a cadence instead of as a one-time cleanup.

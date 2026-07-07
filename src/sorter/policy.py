@@ -16,7 +16,7 @@ from __future__ import annotations
 READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 MAIL_SCOPE = "https://mail.google.com/"
-DEFAULT_QUERY = "before:2025/12/30 -in:trash"
+DEFAULT_QUERY = "in:anywhere -in:trash"
 ROOT_LABEL = "Sorter"
 
 # Catch-all categories that describe "we did not learn anything useful" rather

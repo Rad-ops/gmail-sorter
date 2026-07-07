@@ -7,40 +7,22 @@ from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from tests.test_helpers import tracked, make_test_args
 
 import gmail_sorter
 
 
 def args(**overrides):
-    """Build a minimal argparse-like object for policy tests."""
+    """Build a minimal argparse-like object for policy tests.
 
-    defaults = {
-        "ad_threshold": 65,
-        "archive_threshold": 65,
-        "archive_min_age_days": 0,
-        "archive_skip_unread": False,
-        "trash_threshold": 90,
-        "pre_2020_trash_threshold": 75,
-        "stage": "classify",
-        "trash_obvious_ads": False,
-        "scan": "metadata",
-        "use_sender_profiles": True,
-        "sender_profiles": {},
-        "sender_profile_min_weight": 6,
-        "label_confidence": 50,
-        "max_labels_per_message": 3,
-        "cached_body_features": {},
-        "relabel_run_id": "",
-        "undo_relabel": "",
-        "relabel_since_date": "",
-        "relabel_label": "",
-        "use_thread_aware": False,
-        "thread_dominant_categories": {},
-        "_embedding_backend": None,
-        "category_centroids": {},
-    }
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
+    v0.7.1: the canonical defaults live in :mod:`tests.test_helpers`
+    so the same shape is shared across every test file. This thin
+    wrapper is kept here for backwards compatibility with tests
+    that import ``args`` from this module.
+    """
+
+    from tests.test_helpers import make_test_args
+    return make_test_args(**overrides)
 
 
 def message(payload, labels=None, snippet="", size=0):
@@ -282,9 +264,10 @@ class WordBoundaryAndSenderProfileTests(unittest.TestCase):
         # before. This is the self-improvement path for a re-run. The fixture
         # sender deliberately avoids finance keywords so only the profile can
         # add the category.
+        # v0.7: the precomputed index uses (kind, value, category) keys.
         profile_index = {
-            "sender:updates@updates.testmail.co": {"Finance": 9},
-            "domain:testmail.co": {"Finance": 3},
+            "sender:updates@updates.testmail.co:finance": {"Finance": 9},
+            "domain:testmail.co:finance": {"Finance": 3},
         }
         args_profile = args()
         args_profile.use_sender_profiles = True
@@ -305,7 +288,7 @@ class WordBoundaryAndSenderProfileTests(unittest.TestCase):
         self.assertTrue(any(r.startswith("sender_profile:Finance") for r in item.reasons))
 
     def test_sender_profile_does_not_duplicate_existing_category(self):
-        profile_index = {"sender:registrar@school.testmail.co": {"Priority Studies": 9}}
+        profile_index = {"sender:registrar@school.testmail.co:priority studies": {"Priority Studies": 9}}
         args_profile = args()
         args_profile.use_sender_profiles = True
         args_profile.sender_profiles = profile_index
@@ -324,7 +307,7 @@ class WordBoundaryAndSenderProfileTests(unittest.TestCase):
         self.assertEqual(item.categories.count("Priority Studies"), 1)
 
     def test_no_sender_profiles_flag_disables_assist(self):
-        profile_index = {"sender:updates@updates.testmail.co": {"Finance": 9}}
+        profile_index = {"sender:updates@updates.testmail.co:finance": {"Finance": 9}}
         args_profile = args()
         args_profile.use_sender_profiles = False
         args_profile.sender_profiles = profile_index
@@ -630,7 +613,7 @@ class RelabelUndoAndResumeTests(unittest.TestCase):
         service = self._service_with_labels(
             [FakeLabel("Sorter/Finance", "sl-fin"), FakeLabel("Sorter/Ads Promotions", "sl-ads")]
         )
-        conn = sqlite3.connect(":memory:")
+        conn = tracked(self, sqlite3.connect(":memory:"))
         conn.execute(
             "CREATE TABLE action_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, stage TEXT, action TEXT, message_id TEXT, status TEXT, detail TEXT)"
         )
@@ -655,7 +638,7 @@ class RelabelUndoAndResumeTests(unittest.TestCase):
         )
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            conn = gmail_sorter.open_state_db(Path(tmp) / "state.sqlite")
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "state.sqlite"))
             run_id = "20260706T120000"
             detail = json.dumps({"run_id": run_id, "removed": [], "added": ["sl-ads"], "previous_labels": []})
             conn.execute("INSERT INTO action_ledger (created_at, stage, action, message_id, status, detail) VALUES (?, 'relabel', 'relabel', 'm1', 'success', ?)", ("2026-07-06T12:00:00", detail))
@@ -751,8 +734,9 @@ class AIReviewPacketTests(unittest.TestCase):
                 "ai_reviewed": True,
             }
             path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
-            agreed, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            agreed, overridden, removed = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
             self.assertEqual(overridden, 1)
+            self.assertEqual(removed, 0)
             self.assertIn("Finance", decisions[0].categories)
             self.assertTrue(any(r.startswith("ai_override:Finance") for r in decisions[0].reasons))
 
@@ -769,8 +753,9 @@ class AIReviewPacketTests(unittest.TestCase):
                 "ai_reviewed": True,
             }
             path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
-            agreed, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            agreed, overridden, removed = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
             self.assertEqual(overridden, 0)
+            self.assertEqual(removed, 0)
             self.assertNotIn("Finance", decisions[0].categories)
 
     def test_merge_never_removes_protected_category(self):
@@ -786,7 +771,7 @@ class AIReviewPacketTests(unittest.TestCase):
                 "ai_reviewed": True,
             }
             path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
-            _, overridden = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
+            _, overridden, _ = gmail_sorter.merge_ai_labels(decisions, path, min_ai_confidence=0.7)
             # AI can add Shopping but Priority Immigration must stay.
             self.assertIn("Priority Immigration", decisions[0].categories)
             self.assertTrue(decisions[0].protected)

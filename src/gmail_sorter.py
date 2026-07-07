@@ -41,6 +41,7 @@ from sorter import policy
 from sorter.keywords import compile_keywords, contains_any, keyword_hits, regex_hits
 from sorter.config_loader import apply_overrides, load_policy_overrides
 from sorter.embeddings import compute_embedding_scores, cosine_similarity
+from sorter.schema import CURRENT_SCHEMA_VERSION, migrate
 
 
 # Re-export policy names for backwards compatibility.
@@ -65,10 +66,20 @@ CATEGORY_RULES = policy.CATEGORY_RULES
 PRIMARY_CATEGORY_PRECEDENCE = policy.PRIMARY_CATEGORY_PRECEDENCE
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.7.1"
 VERSION_CODE = "20260706"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 log = logging.getLogger("sorter")
+
+
+# v0.6: AI review packet body excerpt cap (smaller than the centroid text
+# cap so a single AI packet is small enough to ship in a bounded prompt).
+AI_REVIEW_BODY_EXCERPT_CHARS = 1200
+# v0.7: privacy-bounded cleaned body excerpt persisted to
+# message_features.body_text_excerpt. Used by update_category_centroids as
+# the embed text for centroid learning. The cap keeps the local cache from
+# growing unbounded on a multi-year mailbox.
+BODY_EXCERPT_FOR_FEATURES = 4000
 
 
 
@@ -118,6 +129,8 @@ class Decision:
     message_size_estimate: int = 0
     body_len: int = 0
     body_category_hits: list[str] = field(default_factory=list)
+    body_text_excerpt: str = ""
+    detected_language: str = ""
     list_unsubscribe: str = ""
     body_unsubscribe_links: list[str] = field(default_factory=list)
     attachment_names: list[str] = field(default_factory=list)
@@ -422,10 +435,26 @@ def clean_body_text(body_text: str, keep_chars: int = 8000) -> str:
         if _QUOTED_LINE_RE.match(line) or _ON_WROTE_RE.match(line):
             continue
         # Once we hit a footer marker, drop the rest of this block.
+        # The check is rstrip-aware: a line of just ``--`` (the
+        # post-strip form of the standard email signature separator
+        # ``-- \n``) must still match the marker ``-- ``. The rstrip
+        # # normalization lets both the bare ``--`` and the more
+        # # verbose ``-- `` (with trailing whitespace) trigger the
+        # # break.
+        lowered_raw = line.lower()
         lowered = line.strip().lower()
-        if any(lowered.startswith(marker) or lowered == marker for marker in FOOTER_MARKERS):
-            break
-        kept.append(line)
+        for marker in FOOTER_MARKERS:
+            marker_stripped = marker.rstrip()
+            if not marker_stripped:
+                continue
+            if lowered.startswith(marker) or lowered == marker:
+                break
+            if marker_stripped and (lowered == marker_stripped or lowered_raw.lstrip().startswith(marker_stripped + " ") or lowered_raw.lstrip() == marker_stripped):
+                break
+        else:
+            kept.append(line)
+            continue
+        break
     cleaned = "\n".join(kept).strip()
     return cleaned[:keep_chars]
 
@@ -891,6 +920,15 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         if cached_body:
             body_len = cached_body.get("body_len", 0)
             body_included = True
+    # Compute the cleaned body excerpt once and reuse it. The excerpt is what
+    # v0.7 stores in message_features.body_text_excerpt so the next scan can
+    # embed the real body text without re-fetching from Gmail. The excerpt is
+    # bounded to BODY_EXCERPT_FOR_FEATURES (4000 chars) and uses the same
+    # quote/footer stripping as categorization, so replies quoting a promo
+    # email do not leak the promo's body into the cached excerpt.
+    body_excerpt_for_features = ""
+    if body_included and body_text:
+        body_excerpt_for_features = clean_body_text(body_text, keep_chars=BODY_EXCERPT_FOR_FEATURES)
     ad_confidence, reasons, negative_reasons = score_ad(headers, labels, sender, sender_domain, subject, snippet, config)
     if body_included:
         # Use the cleaned body (quotes/footers stripped) for categorization so a
@@ -914,7 +952,41 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
     if getattr(args, "use_sender_profiles", True):
         profile_index = getattr(args, "sender_profiles", {}) or {}
         profile_cats = sender_profile_categories_from_index(profile_index, sender_email, registered_domain)
-    category_confidence = categorize_with_confidence(category_searchable, labels, ad_confidence, profile_cats, subject=subject, body_text=clean_body_text(body_text) if body_included else "", sender_text=f"{sender} {sender_domain}")
+    # v0.7: detect the message language once. The detector picks which
+    # language-specific keyword overlay (config/policy.<lang>.yaml) should be
+    # applied at the categorization step. It is never used to gate mail or to
+    # change the protection decision. On a cache-only scan the fresh body is
+    # empty so we fall back to the cached excerpt.
+    from sorter.lang import detect as detect_language
+    lang_source = f"{subject} {body_excerpt_for_features}"
+    if not lang_source.strip() and cached_body:
+        lang_source = f"{subject} {cached_body.get('body_text_excerpt', '')}"
+    detected_language = detect_language(lang_source)
+    # v0.7: apply the per-language keyword overlay (FR/FA) when one is
+    # configured and the detector picked a non-English language. The overlay
+    # extends or replaces the matching category's keyword list, and is
+    # restored at the end of decide() so the next message — possibly in a
+    # different language — starts from a clean policy state.
+    from sorter.config_loader import activate_language_overlay, restore_policy
+    overlay_token: dict | None = None
+    if detected_language and detected_language != "en":
+        overlay_dir = getattr(args, "_policy_config_dir", None)
+        if overlay_dir is not None:
+            from pathlib import Path
+            from sorter.config_loader import load_language_overlay
+            overlay = load_language_overlay(Path(overlay_dir), detected_language)
+            if overlay:
+                overlay_token = activate_language_overlay(overlay)
+    try:
+        category_confidence = categorize_with_confidence(
+            category_searchable, labels, ad_confidence, profile_cats,
+            subject=subject,
+            body_text=clean_body_text(body_text) if body_included else "",
+            sender_text=f"{sender} {sender_domain}",
+        )
+    finally:
+        if overlay_token is not None:
+            restore_policy(overlay_token)
     # Embedding-based semantic scoring (hybrid). When an embedding backend is
     # available and centroids have been learned, compute the cosine similarity
     # between this message's text and each category centroid. The embedding
@@ -1127,6 +1199,8 @@ def decide(message: dict[str, Any], args: argparse.Namespace, config: Config) ->
         message_size_estimate=int(message.get("sizeEstimate") or 0),
         body_len=body_len,
         body_category_hits=body_hit_categories,
+        body_text_excerpt=body_excerpt_for_features,
+        detected_language=detected_language,
         list_unsubscribe=headers.get("list-unsubscribe", ""),
         body_unsubscribe_links=body_unsubscribe_links,
         attachment_names=attachment_names,
@@ -1208,125 +1282,118 @@ def open_state_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            message_id TEXT PRIMARY KEY,
-            thread_id TEXT NOT NULL,
-            date TEXT,
-            sender TEXT,
-            sender_email TEXT,
-            sender_domain TEXT,
-            registered_domain TEXT,
-            subject TEXT,
-            categories_json TEXT NOT NULL,
-            planned_actions_json TEXT NOT NULL,
-            ad_confidence INTEGER NOT NULL,
-            protected INTEGER NOT NULL,
-            perfect_ad_match INTEGER NOT NULL,
-            has_attachment INTEGER NOT NULL,
-            has_real_attachment INTEGER NOT NULL,
-            attachment_count INTEGER NOT NULL,
-            inline_attachment_count INTEGER NOT NULL,
-            message_size_estimate INTEGER NOT NULL,
-            review_priority TEXT,
-            action_done TEXT,
-            scanned_at TEXT,
-            decision_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS action_ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            stage TEXT NOT NULL,
-            action TEXT NOT NULL,
-            message_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            detail TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS domain_review (
-            domain TEXT PRIMARY KEY,
-            registered_domain TEXT,
-            status TEXT NOT NULL DEFAULT 'unreviewed',
-            note TEXT,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sender_profile (
-            key TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            category TEXT NOT NULL,
-            hits INTEGER NOT NULL DEFAULT 0,
-            protected_hits INTEGER NOT NULL DEFAULT 0,
-            last_seen TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sender_profile_kind ON sender_profile(kind, category)"
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS message_features (
-            message_id TEXT PRIMARY KEY,
-            body_len INTEGER NOT NULL DEFAULT 0,
-            body_category_hits_json TEXT NOT NULL DEFAULT '[]',
-            body_unsubscribe_count INTEGER NOT NULL DEFAULT 0,
-            scan_mode TEXT NOT NULL DEFAULT 'metadata',
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS category_centroid (
-            category TEXT PRIMARY KEY,
-            embedding_json TEXT NOT NULL,
-            dimension INTEGER NOT NULL,
-            message_count INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
+    migrate(conn)
     return conn
 
 
-def sender_profile_key(kind: str, value: str) -> str:
-    return f"{kind}:{value.lower()}"
+def sender_profile_key(kind: str, value: str, category: str = "") -> str:
+    """Return the row key for a (kind, value, category) tuple.
+
+    v0.7 — category is now part of the key. Pre-v0.7 the primary key was
+    ``kind:value``, which meant two decisions for the same sender in
+    different categories (e.g. a friend who sends both personal mail and
+    event invites) collided on the row and lost precision. v0.7 includes
+    the category in the key so the table supports the full one-row-per-
+    (sender, category) shape that the rest of the code already assumes.
+    """
+
+    base = f"{kind}:{value.lower()}"
+    if category:
+        return f"{base}:{category.lower()}"
+    return base
 
 
-def load_sender_profile_index(conn: sqlite3.Connection | None, min_hits: int = 3) -> dict[str, dict[str, int]]:
+def load_sender_profile_index(
+    conn: sqlite3.Connection | None,
+    min_hits: int = 3,
+    half_life_days: int = 180,
+    now: datetime | None = None,
+) -> dict[str, dict[str, int]]:
     """Precompute a sender/domain -> {category: weight} index for the scan.
 
     decide() runs in worker threads without DB access, so the index is built
     once before the scan and consulted via args.sender_profiles. Sender rows
     outweigh domain rows so a specific address beats a noisy domain.
+
+    v0.7 — time decay: a profile row older than ``half_life_days`` carries
+    less weight than a recent one. The decay is
+    ``weight = base_hits * exp(-Δdays / half_life_days)``, which is smooth
+    (no cliff) and well-behaved at the boundary. A half-life of 0 disables
+    decay, preserving the pre-v0.7 flat-weight behavior. The function
+    reads the v3 ``first_seen`` column; pre-v0.7 rows fall back to
+    ``last_seen`` so the migration is invisible to the caller.
     """
 
-    index: dict[str, dict[str, int]] = defaultdict(dict)
+    index: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     if conn is None:
         return {}
+    if half_life_days <= 0:
+        # Pre-v0.7 behavior: no decay.
+        for kind, weight in (("sender", 3), ("domain", 1)):
+            prefix = f"{kind}:%"
+            cur = conn.execute(
+                "SELECT key, category, hits FROM sender_profile WHERE key LIKE ? AND hits>=?",
+                (prefix, min_hits),
+            )
+            for key, category, hits in cur.fetchall():
+                index[key][category] += int(hits) * weight
+        return {key: {cat: int(weight) for cat, weight in cats.items()} for key, cats in index.items()}
+
+    now = now or datetime.now(timezone.utc)
     for kind, weight in (("sender", 3), ("domain", 1)):
+        # v0.7: keys are (kind, value, category). LIKE prefix selects every
+        # category the sender/domain has been labeled as.
+        prefix = f"{kind}:%"
         cur = conn.execute(
-            "SELECT key, category, hits FROM sender_profile WHERE kind=? AND hits>=?",
-            (kind, min_hits),
+            "SELECT key, category, hits, COALESCE(first_seen, last_seen) FROM sender_profile WHERE key LIKE ? AND hits>=?",
+            (prefix, min_hits),
         )
-        for key, category, hits in cur.fetchall():
-            index[key][category] += hits * weight
-    return {key: dict(cats) for key, cats in index.items()}
+        for key, category, hits, first_seen_raw in cur.fetchall():
+            try:
+                first_seen_dt = datetime.fromisoformat(first_seen_raw)
+            except (TypeError, ValueError):
+                index[key][category] += int(hits) * weight
+                continue
+            if first_seen_dt.tzinfo is None:
+                first_seen_dt = first_seen_dt.replace(tzinfo=timezone.utc)
+            delta_days = max(0.0, (now - first_seen_dt).total_seconds() / 86400.0)
+            decay = 2 ** (-delta_days / half_life_days)
+            index[key][category] += int(hits) * weight * decay
+    return {key: {cat: max(1, int(round(weight))) for cat, weight in cats.items()} for key, cats in index.items()}
+
+
+def load_sender_diversity(conn: sqlite3.Connection | None) -> dict[str, int]:
+    """Return a {sender_key: distinct_category_count} map for the dashboard.
+
+    A sender with diversity > 4 is considered "noisy" and shows up in the
+    dashboard's Noisy Senders section. v0.7: keys are
+    (kind, value, category); the dashboard wants the diversity grouped by
+    the (kind, value) parent. We strip the trailing ``:category`` segment
+    in Python so the SQL stays simple.
+    """
+
+    diversity: dict[str, int] = {}
+    if conn is None:
+        return diversity
+    try:
+        cur = conn.execute(
+            "SELECT key, category FROM sender_profile WHERE hits > 0"
+        )
+    except sqlite3.OperationalError:
+        return diversity
+    parent_cats: dict[str, set[str]] = {}
+    for key, category in cur.fetchall():
+        # Strip the trailing ``:category`` segment if present. Keys always
+        # have the form ``kind:value:category`` (lowercased) in v0.7; the
+        # pre-v0.7 shape ``kind:value`` is accepted by the conditional
+        # below so older data continues to work.
+        if ":" in key:
+            segments = key.rsplit(":", 1)
+            parent = segments[0]
+        else:
+            parent = key
+        parent_cats.setdefault(parent, set()).add(category)
+    return {key: len(cats) for key, cats in parent_cats.items()}
 
 
 def load_thread_dominant_categories(conn: sqlite3.Connection | None, progress: dict[str, Decision] | None = None) -> dict[str, str]:
@@ -1371,8 +1438,16 @@ def sender_profile_categories_from_index(index: dict[str, dict[str, int]], sende
     for kind, value in (("sender", sender_email), ("domain", registered_domain)):
         if not value:
             continue
-        for category, weight in index.get(sender_profile_key(kind, value), {}).items():
-            weighted[category] += weight
+        # v0.7: the precomputed index now groups per-category under the
+        # (kind, value) key, not under a single (kind, value) row. The
+        # look-up walks every (kind, value, *) entry in the index that
+        # matches the sender.
+        prefix = f"{kind}:{value.lower()}:"
+        for key, cats in index.items():
+            if not key.startswith(prefix):
+                continue
+            for category, weight in cats.items():
+                weighted[category] += weight
     return dict(weighted)
 
 
@@ -1394,10 +1469,15 @@ def body_category_hits(body_text: str) -> dict[str, list[str]]:
 
 
 def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Decision], scan_mode: str) -> None:
-    """Cache compact, privacy-light body features per message.
+    """Cache compact body features per message.
 
-    Only the body length, the category keyword names that hit in the body, and
-    the unsubscribe count are stored. Raw body text is never persisted.
+    Persists the body length, the category keyword names that hit in the body,
+    the unsubscribe count, and a privacy-bounded cleaned body excerpt. The
+    excerpt is what the embedding centroid learner reads on the next scan so it
+    can learn from real message semantics instead of the category-hit names
+    alone. Raw body text is never persisted: the excerpt is bounded to
+    :data:`BODY_EXCERPT_FOR_FEATURES` and stripped of quoted reply chains and
+    footer markers.
     """
 
     if conn is None or not decisions:
@@ -1414,6 +1494,7 @@ def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Dec
                 json.dumps(item.body_category_hits, ensure_ascii=False),
                 len(item.body_unsubscribe_links),
                 scan_mode,
+                item.body_text_excerpt or "",
                 now,
             )
         )
@@ -1421,13 +1502,17 @@ def upsert_message_features(conn: sqlite3.Connection | None, decisions: list[Dec
         return
     conn.executemany(
         """
-        INSERT INTO message_features (message_id, body_len, body_category_hits_json, body_unsubscribe_count, scan_mode, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO message_features (
+            message_id, body_len, body_category_hits_json, body_unsubscribe_count,
+            scan_mode, body_text_excerpt, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(message_id) DO UPDATE SET
             body_len=excluded.body_len,
             body_category_hits_json=excluded.body_category_hits_json,
             body_unsubscribe_count=excluded.body_unsubscribe_count,
             scan_mode=excluded.scan_mode,
+            body_text_excerpt=excluded.body_text_excerpt,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -1448,9 +1533,9 @@ def load_body_features_index(conn: sqlite3.Connection | None) -> dict[str, dict[
     if conn is None:
         return index
     cur = conn.execute(
-        "SELECT message_id, body_len, body_category_hits_json, body_unsubscribe_count FROM message_features WHERE scan_mode='full'"
+        "SELECT message_id, body_len, body_category_hits_json, body_unsubscribe_count, body_text_excerpt FROM message_features WHERE scan_mode='full'"
     )
-    for message_id, body_len, hits_json, unsub_count in cur.fetchall():
+    for message_id, body_len, hits_json, unsub_count, body_excerpt in cur.fetchall():
         try:
             hits = json.loads(hits_json or "[]")
         except json.JSONDecodeError:
@@ -1459,6 +1544,7 @@ def load_body_features_index(conn: sqlite3.Connection | None) -> dict[str, dict[
             "body_len": int(body_len or 0),
             "body_category_hits": list(hits),
             "body_unsubscribe_count": int(unsub_count or 0),
+            "body_text_excerpt": body_excerpt or "",
         }
     return index
 
@@ -1494,15 +1580,26 @@ def update_category_centroids(
     backend: Any,
     confidence_floor: int = 70,
     max_messages_per_category: int = 500,
+    body_cap: int = BODY_EXCERPT_FOR_FEATURES,
 ) -> int:
     """Recompute per-category centroid embeddings from high-confidence decisions.
 
     For each category, collects messages with that category at confidence >=
-    floor, embeds their subject + body excerpt, averages the vectors, and stores
-    the centroid in SQLite. Returns the number of centroids updated.
+    floor, embeds their subject + snippet + the cleaned body excerpt persisted
+    in v0.7 (``body_text_excerpt``), averages the vectors, and stores the
+    centroid in SQLite. Returns the number of centroids updated.
 
     Only categories with at least 3 high-confidence messages get a centroid, so
     a new category doesn't get a noisy centroid from one message.
+
+    The text built for each message is ``subject + snippet + body_excerpt``,
+    truncated to ``body_cap`` characters. Pre-v0.7, the text was built from
+    ``subject + snippet + body_category_hits`` (the *names* of categories that
+    hit, not the body text itself). That was a real weakness: the centroids
+    never learned what a Finance message *sounds like* from real finance mail,
+    only from the subject + the literal string "Finance". With v0.7 the body
+    excerpt is persisted (see :data:`BODY_EXCERPT_FOR_FEATURES`) and the
+    centroids now embed the real body semantics.
     """
 
     if conn is None or backend is None:
@@ -1515,11 +1612,25 @@ def update_category_centroids(
         for cat, conf in item.category_confidence.items():
             if cat in NON_LABEL_CATEGORIES:
                 continue
-            if conf >= confidence_floor:
-                text = f"{item.subject} {item.snippet}"
-                if item.body_category_hits:
-                    text += f" {' '.join(item.body_category_hits)}"
-                cat_messages[cat].append(text[:2000])
+            if conf < confidence_floor:
+                continue
+            # v0.7: include the cleaned body excerpt (if any) before falling
+            # back to the legacy body_category_hits names. A message with no
+            # excerpt is rare outside of metadata-only scans; we still keep
+            # the hits fallback so the function stays correct for older
+            # decision rows.
+            text = f"{item.subject} {item.snippet}"
+            excerpt = (item.body_text_excerpt or "").strip()
+            if excerpt:
+                text = f"{text} {excerpt}"
+            elif item.body_category_hits:
+                # Legacy fallback: a pre-v0.7 decision whose body excerpt is
+                # empty but which carries category-hit names. Older centroids
+                # were learned this way; we keep the same text shape so
+                # re-scoring against them remains consistent until enough v0.7
+                # excerpts land to fully refresh the centroids.
+                text = f"{text} {' '.join(item.body_category_hits)}"
+            cat_messages[cat].append(text[:body_cap])
 
     now = datetime.now(timezone.utc).isoformat()
     updated = 0
@@ -1563,6 +1674,12 @@ def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Deci
     borderline guesses do not poison the sender history. Protected messages
     still contribute their category (immigration/studies/etc.) because those
     are exactly the labels we want to remember for a sender.
+
+    v0.7 — diversity tracking: every write to a (key, category) pair
+    increments the sender's distinct-category count so the dashboard can
+    surface "noisy" senders (diversity > 4). first_seen is set on the
+    *first* write for a key so the time-decay in
+    :func:`load_sender_profile_index` has a stable anchor.
     """
 
     if conn is None or not decisions:
@@ -1578,9 +1695,12 @@ def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Deci
             for kind, value in (("sender", item.sender_email), ("domain", item.registered_domain or item.sender_domain)):
                 if not value:
                     continue
+                # v0.7: include the category in the key so a single sender
+                # can have one row per category, not one row total.
+                key = sender_profile_key(kind, value, category)
                 rows.append(
                     (
-                        sender_profile_key(kind, value),
+                        key,
                         kind,
                         category,
                         1,
@@ -1591,17 +1711,46 @@ def update_sender_profiles(conn: sqlite3.Connection | None, decisions: list[Deci
                 )
     if not rows:
         return
+    # The UPSERT has to set first_seen to the *existing* value when there is
+    # one. SQLite does not let us reference the existing row from inside the
+    # INSERT statement (no SELECT in the VALUES clause), so we update
+    # first_seen in a follow-up pass that runs only for newly inserted rows.
+    # The primary key is ``key`` which is now (kind, value, category).
     conn.executemany(
         """
-        INSERT INTO sender_profile (key, kind, category, hits, protected_hits, last_seen, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sender_profile (key, kind, category, hits, protected_hits, last_seen, updated_at, first_seen, last_hits, category_diversity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         ON CONFLICT(key) DO UPDATE SET
             hits=sender_profile.hits+excluded.hits,
             protected_hits=sender_profile.protected_hits+excluded.protected_hits,
             last_seen=MAX(sender_profile.last_seen, excluded.last_seen),
-            updated_at=excluded.updated_at
+            updated_at=excluded.updated_at,
+            last_hits=excluded.last_hits
         """,
-        rows,
+        [(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[5], str(r[3])) for r in rows],
+    )
+    # First-seen backfill: any row that was just created gets first_seen set
+    # to last_seen (which is the date the message was received). Existing
+    # rows are untouched.
+    conn.execute(
+        """
+        UPDATE sender_profile
+        SET first_seen = last_seen
+        WHERE first_seen IS NULL OR first_seen = ''
+        """
+    )
+    # v0.7: refresh the per-sender distinct-category count. Done in a
+    # second pass so the diversity is computed against the freshly updated
+    # rows, not the pre-upsert state.
+    conn.execute(
+        """
+        UPDATE sender_profile
+        SET category_diversity = (
+            SELECT COUNT(DISTINCT category) FROM sender_profile sp2
+            WHERE sp2.key = sender_profile.key AND sp2.hits > 0
+        )
+        WHERE key IN (SELECT DISTINCT key FROM sender_profile WHERE hits > 0)
+        """
     )
     conn.commit()
 
@@ -1620,9 +1769,12 @@ def sender_profile_categories(conn: sqlite3.Connection | None, sender_email: str
     for kind, value, weight in (("sender", sender_email, 3), ("domain", registered_domain, 1)):
         if not value:
             continue
+        # v0.7: keys are now (kind, value, category). Use a LIKE prefix to
+        # match every category a sender/domain has been seen as.
+        prefix = f"{kind}:{value.lower()}:%"
         cur = conn.execute(
-            "SELECT category, hits FROM sender_profile WHERE key=? AND hits>=?",
-            (sender_profile_key(kind, value), min_hits),
+            "SELECT category, hits FROM sender_profile WHERE key LIKE ? AND hits>=?",
+            (prefix, min_hits),
         )
         for category, hits in cur.fetchall():
             weighted[category] += hits * weight
@@ -2426,7 +2578,7 @@ def load_manifest_ids(path: Path) -> set[str]:
 # They do NOT contain OAuth tokens, full body text, or attachment bytes.
 # Packets are written to data/ which is gitignored.
 
-AI_REVIEW_BODY_EXCERPT_CHARS = 1200
+
 
 
 def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: int, body_excerpt_chars: int = AI_REVIEW_BODY_EXCERPT_CHARS, sender_profiles: dict[str, dict[str, int]] | None = None, thread_dominant: dict[str, str] | None = None) -> int:
@@ -2505,17 +2657,35 @@ def export_ai_review_packets(path: Path, decisions: list[Decision], threshold: i
     return len(packets)
 
 
-def merge_ai_labels(decisions: list[Decision], path: Path, min_ai_confidence: float = 0.7) -> tuple[int, int]:
+def merge_ai_labels(
+    decisions: list[Decision],
+    path: Path,
+    min_ai_confidence: float = 0.7,
+    min_ai_removal_confidence: float = 0.85,
+) -> tuple[int, int, int]:
     """Merge AI-reviewed labels back into decisions.
 
-    Reads the reviewed JSONL and adjusts a decision when the AI suggests a
-    different label with confidence >= min_ai_confidence (0-1). Protected
-    status is never removed — the AI can add a protected category but cannot
-    take one away. Returns (agreed, overridden) counts.
+    v0.6 semantics (preserved):
+      * Additive override: the AI's label is added to ``item.categories`` if
+        it is not already there, the per-category confidence is set, and a
+        reason ``ai_override:<label>:<conf>`` is appended.
+      * Protected status is never removed — the AI can add a protected
+        category but cannot take one away.
+
+    v0.7 addition — removal pass:
+      * When ``ai_label in item.categories`` and the AI's confidence is
+        ``>= min_ai_removal_confidence`` (default 0.85, stricter than
+        ``min_ai_confidence``), the AI can drop a *non-protected* category
+        from the message. The drop is recorded as ``ai_remove:<old>:<conf>``
+        in ``reasons``. Removing a protected category is rejected even at
+        very high confidence: protection is the safety floor.
+
+    Returns ``(agreed, overridden, removed)`` where ``removed`` is the count
+    of messages the AI actively corrected by removing a wrong label.
     """
 
     if not path.exists():
-        return 0, 0
+        return 0, 0, 0
     ai_map: dict[str, dict[str, Any]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -2529,12 +2699,35 @@ def merge_ai_labels(decisions: list[Decision], path: Path, min_ai_confidence: fl
             ai_map[packet["message_id"]] = packet
     agreed = 0
     overridden = 0
+    removed = 0
     for item in decisions:
         packet = ai_map.get(item.message_id)
         if not packet:
             continue
         ai_label = packet["ai_label"]
         ai_conf = float(packet.get("ai_confidence", 0))
+        # Removal pass: AI says this label is wrong, and confidence is high.
+        if ai_label in item.categories and ai_conf >= min_ai_removal_confidence:
+            # The AI is voting against ai_label. If ai_label is protected, do
+            # not remove; protection is the safety floor.
+            if ai_label in PROTECTED_CATEGORIES:
+                agreed += 1
+                continue
+            # The AI is confirming a label the code already assigned; that
+            # is the "agreed" case, not the removal case.
+            if ai_label == item.primary_category:
+                agreed += 1
+                continue
+            # Remove the wrong label and refresh the primary if needed.
+            item.categories = [c for c in item.categories if c != ai_label]
+            item.category_confidence.pop(ai_label, None)
+            item.reasons.append(f"ai_remove:{ai_label}:{ai_conf:.2f}")
+            new_primary = pick_primary_category(item.categories) if item.categories else "Review"
+            if new_primary != item.primary_category:
+                item.primary_category = new_primary
+            item.planned_actions = [f"label:{c}" for c in labelable_categories(item.categories)]
+            removed += 1
+            continue
         if ai_label in item.categories:
             agreed += 1
             continue
@@ -2553,7 +2746,7 @@ def merge_ai_labels(decisions: list[Decision], path: Path, min_ai_confidence: fl
                 item.primary_category = new_primary
             item.planned_actions = [f"label:{c}" for c in labelable_categories(item.categories)]
             overridden += 1
-    return agreed, overridden
+    return agreed, overridden, removed
 
 
 def esc(value: Any) -> str:
@@ -3078,12 +3271,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ai-review-file", default=str(PROJECT_DIR / "data" / "label_review_packets.jsonl"), help="Path to the AI review JSONL file (export and merge both use this path).")
     parser.add_argument("--merge-ai-labels", action="store_true", help="Before apply, merge AI-reviewed labels from the review file back into decisions. The AI can add a label the code missed; protected status is never removed.")
     parser.add_argument("--ai-merge-min-confidence", type=float, default=0.7, help="Minimum AI confidence (0-1) required to override the code's label with the AI's suggestion.")
+    parser.add_argument("--ai-merge-min-removal-confidence", type=float, default=0.85, help="v0.7: minimum AI confidence (0-1) required to REMOVE a non-protected category the code already assigned. Stricter than the addition threshold because removal is harder to undo.")
+    parser.add_argument("--no-ai-learning", action="store_true", help="v0.7: disable the active-learning pass that pushes AI-verified decisions into sender_profile and category centroids.")
     parser.add_argument("--attachment-details", action="store_true", help="Fetch metadata-rich payloads for attachment names/types, not attachment bytes.")
     parser.add_argument("--scan", choices=["metadata", "full"], default="metadata", help="metadata = headers+snippet (fast); full = also read decoded body text for body-aware categorization. full costs more Gmail quota and is meant for a relabel/re-scan pass.")
     parser.add_argument("--use-sender-profiles", dest="use_sender_profiles", action="store_true", default=True, help="Use learned sender/domain category history to fix keyword misses (default on).")
     parser.add_argument("--no-sender-profiles", dest="use_sender_profiles", action="store_false", help="Disable sender-profile-assisted categorization.")
     parser.add_argument("--sender-profile-min-weight", type=int, default=6, help="Minimum learned weight required to add a profile-backed category the keywords missed.")
     parser.add_argument("--sender-profile-floor", type=int, default=65, help="Only learn profiles from decisions at or above this ad confidence (protected mail always contributes).")
+    parser.add_argument("--sender-profile-half-life-days", type=int, default=180, help="v0.7: half-life in days for the sender-profile time decay. A row older than this contributes half as much weight as a fresh one. 0 disables decay (pre-v0.7 behavior).")
     parser.add_argument("--use-thread-aware", action="store_true", default=False, help="Propagate a thread's dominant category to replies that would otherwise land in a catch-all (Review). Never overrides a real keyword match or a protected category.")
     parser.add_argument("--use-embeddings", action="store_true", default=False, help="Enable embedding-based semantic classification. Uses the local LLM embedding endpoint or sentence-transformers to compute similarity to per-category centroids learned from past decisions. Falls back to keyword-only when unavailable.")
     parser.add_argument("--embedding-endpoint", default="http://127.0.0.1:8080/v1/embeddings", help="OpenAI-compatible /v1/embeddings endpoint for the local LLM server.")
@@ -3112,6 +3308,9 @@ def main() -> int:
     except OSError:
         log.warning("could not open run log at %s", run_log)
     apply_overrides(load_policy_overrides(PROJECT_DIR / "config" / "policy.yaml"))
+    # v0.7: pass the config directory to decide() so per-language overlays
+    # (config/policy.fr.yaml, config/policy.fa.yaml) can be loaded on demand.
+    args._policy_config_dir = str(PROJECT_DIR / "config")
     log.info("gmail-sorter %s (%s) schema_version=%s", APP_VERSION, VERSION_CODE, SCHEMA_VERSION)
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)
@@ -3157,7 +3356,10 @@ def main() -> int:
 
     progress_path = Path(args.progress_file)
     progress = load_progress(progress_path) if args.resume else {}
-    args.sender_profiles = load_sender_profile_index(state_conn) if getattr(args, "use_sender_profiles", True) else {}
+    args.sender_profiles = load_sender_profile_index(
+        state_conn,
+        half_life_days=getattr(args, "sender_profile_half_life_days", 180),
+    ) if getattr(args, "use_sender_profiles", True) else {}
     args.cached_body_features = load_body_features_index(state_conn) if getattr(args, "scan", "metadata") == "full" and not args.refresh_existing else {}
     args.thread_dominant_categories = load_thread_dominant_categories(state_conn) if getattr(args, "use_thread_aware", False) else {}
     # Embedding backend and centroids: optional semantic classification layer.
@@ -3251,9 +3453,40 @@ def main() -> int:
     # between the export step and this run; see HANDOVER.md for the workflow.
     if getattr(args, "merge_ai_labels", False):
         ai_path = Path(getattr(args, "ai_review_file", ""))
-        agreed, overridden = merge_ai_labels(decisions, ai_path, min_ai_confidence=args.ai_merge_min_confidence)
-        print(f"AI label merge: {agreed} agreed, {overridden} overridden by AI suggestions.", flush=True)
+        min_removal = getattr(args, "ai_merge_min_removal_confidence", 0.85)
+        agreed, overridden, removed = merge_ai_labels(
+            decisions,
+            ai_path,
+            min_ai_confidence=args.ai_merge_min_confidence,
+            min_ai_removal_confidence=min_removal,
+        )
+        print(
+            f"AI label merge: {agreed} agreed, {overridden} added, {removed} removed.",
+            flush=True,
+        )
         upsert_state_decisions(state_conn, decisions)
+        # v0.7: active learning. Push the AI's verified decisions back into
+        # the sender profile and (when an embedding backend is on) the
+        # category centroids so the next scan benefits immediately.
+        if not getattr(args, "no_ai_learning", False):
+            from sorter.ai_learning import apply_ai_learning
+            try:
+                with ai_path.open("r", encoding="utf-8") as f:
+                    ai_packets = [json.loads(line) for line in f if line.strip()]
+            except (FileNotFoundError, json.JSONDecodeError):
+                ai_packets = []
+            report = apply_ai_learning(
+                state_conn,
+                decisions,
+                ai_packets,
+                embedding_backend=getattr(args, "_embedding_backend", None),
+            )
+            print(
+                f"AI active learning: considered {report['considered']} packets, "
+                f"{report['profile_bumps']} sender-profile bumps, "
+                f"{report['centroid_contributions']} centroid contributions.",
+                flush=True,
+            )
 
     if args.apply and args.stage in {"label", "archive", "trash"} and decisions:
         action_count = sum(
