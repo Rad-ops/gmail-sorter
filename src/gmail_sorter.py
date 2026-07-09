@@ -1343,15 +1343,49 @@ def save_progress(path: Path, decisions: dict[str, Decision]) -> None:
     path.write_text(json.dumps([asdict(item) for item in decisions.values()], indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+class _SorterSQLiteConnection(sqlite3.Connection):
+    """SQLite connection that closes quietly if a caller forgets.
+
+    Long Gmail runs explicitly close the state DB in ``main``. Tests and
+    small helper paths can still accidentally drop a connection reference;
+    closing in ``__del__`` prevents late ResourceWarning noise from masking
+    more important failures.
+    """
+
+    def __del__(self) -> None:  # pragma: no cover - exercised by GC timing
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def open_state_db(path: Path) -> sqlite3.Connection:
     """Create the local SQLite state database used for resumability/auditing."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
+    conn = sqlite3.connect(path, timeout=30, factory=_SorterSQLiteConnection)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     migrate(conn)
     return conn
+
+
+def load_or_train_learned_weights(args: argparse.Namespace, state_conn: sqlite3.Connection | None) -> dict[str, Any]:
+    """Load cached learned weights, or train them from the open state DB."""
+
+    if not getattr(args, "use_learned_weights", False):
+        return {}
+    from sorter.learned_weights import load_weights, save_weights, train_from_decisions
+
+    weights_path = Path(getattr(args, "learned_weights_file", "data/learned_weights.json"))
+    weights = load_weights(weights_path)
+    if not weights:
+        weights = train_from_decisions(state_conn)
+        if weights:
+            save_weights(weights_path, weights)
+            trained_count = sum(1 for w in weights.values() if w.confidence > 0)
+            log.info("learned-weights: trained %d categories from %d decisions", trained_count, len(weights))
+    return weights
 
 
 def sender_profile_key(kind: str, value: str, category: str = "") -> str:
@@ -2119,6 +2153,18 @@ def get_or_create_labels(service: Any, label_names: list[str], retries: int, ret
     return {name: label_ids[name] for name in label_names}
 
 
+def planned_label_categories(item: Decision) -> list[str]:
+    """Return label categories explicitly planned for a message."""
+
+    categories = []
+    for action in item.planned_actions:
+        if action.startswith("label:"):
+            category = action.split(":", 1)[1]
+            if category and category not in NON_LABEL_CATEGORIES:
+                categories.append(category)
+    return sorted(dict.fromkeys(categories))
+
+
 def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Namespace, state_conn: sqlite3.Connection | None = None) -> None:
     """Apply a reviewed decision set to Gmail.
 
@@ -2128,9 +2174,8 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
     """
 
     started = time.monotonic()
-    categories = sorted({category for item in decisions for category in item.categories})
-    label_ids = get_or_create_labels(service, [f"{ROOT_LABEL}/{category}" for category in categories], args.retries, args.retry_sleep)
-    grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[Decision]] = {}
+    planned_groups: list[tuple[Decision, list[str], tuple[str, ...]]] = []
+    needed_label_names: set[str] = set()
     trash_items: list[Decision] = []
     for item in decisions:
         # Re-check protection at the last possible moment. If a future scan bug
@@ -2138,11 +2183,26 @@ def apply_decisions(service: Any, decisions: list[Decision], args: argparse.Name
         # strips the destructive action before talking to Gmail.
         if item.protected and ("trash" in item.planned_actions or "archive" in item.planned_actions):
             item.planned_actions = [action for action in item.planned_actions if action not in {"trash", "archive"}]
-        if "trash" in item.planned_actions:
+        if args.stage == "trash" and "trash" in item.planned_actions:
             trash_items.append(item)
             continue
-        add_ids = tuple(sorted(label_ids[f"{ROOT_LABEL}/{category}"] for category in item.categories))
+        add_names: list[str] = []
+        if args.stage in {"label", "archive"}:
+            add_names = [f"{ROOT_LABEL}/{category}" for category in planned_label_categories(item)]
         remove_ids = ("INBOX",) if "archive" in item.planned_actions else ()
+        if args.stage == "label":
+            remove_ids = ()
+        if args.stage == "archive" and "archive" not in item.planned_actions:
+            add_names = []
+        if not add_names and not remove_ids:
+            continue
+        needed_label_names.update(add_names)
+        planned_groups.append((item, add_names, remove_ids))
+
+    label_ids = get_or_create_labels(service, sorted(needed_label_names), args.retries, args.retry_sleep)
+    grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[Decision]] = {}
+    for item, add_names, remove_ids in planned_groups:
+        add_ids = tuple(sorted(label_ids[name] for name in add_names))
         grouped.setdefault((add_ids, remove_ids), []).append(item)
 
     grouped_count = sum(len(items) for items in grouped.values())
@@ -2413,7 +2473,16 @@ def prune_empty_sorter_labels(service: Any, retries: int, retry_sleep: float) ->
     return pruned
 
 
-def write_csv(path: Path, decisions: list[Decision]) -> None:
+def decision_report_dict(item: Decision, include_body_excerpt: bool = False) -> dict[str, Any]:
+    """Serialize a decision for operator-facing reports."""
+
+    data = asdict(item)
+    if not include_body_excerpt:
+        data["body_text_excerpt"] = ""
+    return data
+
+
+def write_csv(path: Path, decisions: list[Decision], include_body_excerpts: bool = False) -> None:
     """Write the flat report used for spreadsheet review."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2422,18 +2491,25 @@ def write_csv(path: Path, decisions: list[Decision]) -> None:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
         for item in decisions:
-            row = asdict(item)
+            row = decision_report_dict(item, include_body_excerpts)
             for key, value in row.items():
                 if isinstance(value, list):
                     row[key] = "; ".join(str(part) for part in value)
             writer.writerow(row)
 
 
-def write_json(path: Path, decisions: list[Decision]) -> None:
+def write_json(path: Path, decisions: list[Decision], include_body_excerpts: bool = False) -> None:
     """Write the full machine-readable decision report."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps([asdict(item) for item in decisions], indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            [decision_report_dict(item, include_body_excerpts) for item in decisions],
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 def write_unsubscribe_report(path: Path, decisions: list[Decision]) -> None:
@@ -3319,6 +3395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refresh-after-days", type=int, default=7, help="Refresh cached decisions older than this many days.")
     parser.add_argument("--progress-file", default=str(PROJECT_DIR / "data" / "gmail_sorter_progress.json"))
     parser.add_argument("--save-every", type=int, default=250)
+    parser.add_argument("--include-body-excerpts-in-reports", action="store_true", help="Include cleaned body excerpts in CSV/JSON reports. Off by default so operator-facing reports do not expose message bodies.")
     parser.add_argument("--thread-check-limit", type=int, default=500)
     parser.add_argument("--manifest-dir", default=str(PROJECT_DIR / "manifests"))
     parser.add_argument("--manifest", default="", help="Optional reviewed manifest JSON to restrict an apply stage.")
@@ -3388,21 +3465,7 @@ def main() -> int:
     # v0.7: pass the config directory to decide() so per-language overlays
     # (config/policy.fr.yaml, config/policy.fa.yaml) can be loaded on demand.
     args._policy_config_dir = str(PROJECT_DIR / "config")
-    # v0.8: train (or load) the per-keyword learned weights. Training
-    # reads the labeled data from the SQLite messages table; the result
-    # is cached in JSON so subsequent scans are fast.
     args._learned_weights = {}
-    if getattr(args, "use_learned_weights", False):
-        from sorter.learned_weights import load_weights, save_weights, train_from_decisions
-        weights_path = Path(getattr(args, "learned_weights_file", "data/learned_weights.json"))
-        weights = load_weights(weights_path)
-        if not weights:
-            weights = train_from_decisions(state_conn)
-            if weights:
-                save_weights(weights_path, weights)
-                trained_count = sum(1 for w in weights.values() if w.confidence > 0)
-                log.info("learned-weights: trained %d categories from %d decisions", trained_count, len(weights))
-        args._learned_weights = weights
     log.info("gmail-sorter %s (%s) schema_version=%s", APP_VERSION, VERSION_CODE, SCHEMA_VERSION)
     if args.http_timeout > 0:
         socket.setdefaulttimeout(args.http_timeout)
@@ -3429,6 +3492,10 @@ def main() -> int:
         return 2
 
     state_conn = None if args.disable_state_db else open_state_db(Path(args.state_db))
+    # v0.8: train (or load) the per-keyword learned weights. Training
+    # reads the labeled data from the SQLite messages table; the result
+    # is cached in JSON so subsequent scans are fast.
+    args._learned_weights = load_or_train_learned_weights(args, state_conn)
 
     google_libs = load_google_libraries()
     _, _, _, build, HttpError = google_libs
@@ -3738,8 +3805,8 @@ def main() -> int:
 
     decisions.sort(key=lambda item: (item.ad_confidence, item.date, item.sender_domain), reverse=True)
     out_prefix = Path(args.out_prefix)
-    write_csv(out_prefix.with_suffix(".csv"), decisions)
-    write_json(out_prefix.with_suffix(".json"), decisions)
+    write_csv(out_prefix.with_suffix(".csv"), decisions, include_body_excerpts=args.include_body_excerpts_in_reports)
+    write_json(out_prefix.with_suffix(".json"), decisions, include_body_excerpts=args.include_body_excerpts_in_reports)
     write_sender_report(out_prefix.with_name(out_prefix.name + "_senders.csv"), decisions)
     write_storage_report(out_prefix.with_name(out_prefix.name + "_storage.csv"), decisions)
     write_unsubscribe_report(out_prefix.with_name(out_prefix.name + "_unsubscribe.csv"), decisions)

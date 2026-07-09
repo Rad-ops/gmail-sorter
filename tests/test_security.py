@@ -195,6 +195,24 @@ class RawBodyPrivacyTests(unittest.TestCase):
             # The cleaned excerpt is fine.
             self.assertIn("cleaned body excerpt", content)
 
+    def test_operator_reports_redact_body_excerpt_by_default(self):
+        decision = gmail_sorter.Decision(
+            message_id="m1", thread_id="t", date="2026-07-06",
+            sender="x", sender_email="x", sender_domain="x", registered_domain="x",
+            subject="s", snippet="",
+            body_text_excerpt="cleaned body excerpt",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "report.json"
+            csv_path = Path(tmp) / "report.csv"
+            gmail_sorter.write_json(json_path, [decision])
+            gmail_sorter.write_csv(csv_path, [decision])
+            self.assertNotIn("cleaned body excerpt", json_path.read_text())
+            self.assertNotIn("cleaned body excerpt", csv_path.read_text())
+
+            gmail_sorter.write_json(json_path, [decision], include_body_excerpts=True)
+            self.assertIn("cleaned body excerpt", json_path.read_text())
+
 
 class ActionLedgerTests(unittest.TestCase):
     """Every Gmail write must be recorded in the action_ledger."""

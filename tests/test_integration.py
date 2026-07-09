@@ -204,6 +204,53 @@ class ApplyPipelineTests(unittest.TestCase):
             self.assertIn("label", stages)
             conn.close()
 
+    def test_label_apply_uses_planned_label_actions_only(self):
+        from tests.test_gmail_sorter import args
+
+        service = FakeGmailService()
+        decisions = [
+            gmail_sorter.Decision(
+                message_id="m1", thread_id="t1", date="2026-07-06",
+                sender="Bank <noreply@bank.com>", sender_email="noreply@bank.com",
+                sender_domain="bank.com", registered_domain="bank.com",
+                subject="Statement", snippet="",
+                categories=["Finance", "Review"], primary_category="Finance",
+                category_confidence={"Finance": 90, "Review": 30},
+                planned_actions=["label:Finance"],
+            ),
+        ]
+        a = args(stage="label", apply=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
+            gmail_sorter.apply_decisions(service, decisions, a, conn)
+            self.assertIn("Sorter/Finance", service.labels)
+            self.assertNotIn("Sorter/Review", service.labels)
+
+    def test_trash_apply_does_not_apply_labels_to_non_trash_decisions(self):
+        from tests.test_gmail_sorter import args
+
+        service = FakeGmailService()
+        decisions = [
+            gmail_sorter.Decision(
+                message_id="m1", thread_id="t1", date="2026-07-06",
+                sender="Bank <noreply@bank.com>", sender_email="noreply@bank.com",
+                sender_domain="bank.com", registered_domain="bank.com",
+                subject="Statement", snippet="",
+                categories=["Finance"], primary_category="Finance",
+                category_confidence={"Finance": 90},
+                planned_actions=["label:Finance"],
+            ),
+        ]
+        a = args(stage="trash", apply=True, trash_obvious_ads=True, i_understand_trash=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
+            gmail_sorter.apply_decisions(service, decisions, a, conn)
+            self.assertNotIn("m1", service.trashed)
+            self.assertFalse(
+                any(call_name == "messages.batchModify" for call_name, _ in service.calls),
+                f"trash stage should not label non-trash decisions: {service.calls}",
+            )
+
     def test_apply_archive_calls_batch_modify(self):
         from tests.test_gmail_sorter import args, message, payload
 
@@ -231,6 +278,28 @@ class ApplyPipelineTests(unittest.TestCase):
                 f"expected a modify call, got {call_names}",
             )
             conn.close()
+
+    def test_archive_apply_does_not_create_labels_for_non_archived_decisions(self):
+        from tests.test_gmail_sorter import args
+
+        service = FakeGmailService()
+        decisions = [
+            gmail_sorter.Decision(
+                message_id="m1", thread_id="t1", date="2026-07-06",
+                sender="Doctor <doctor@example.com>", sender_email="doctor@example.com",
+                sender_domain="example.com", registered_domain="example.com",
+                subject="Appointment", snippet="",
+                categories=["Health"], primary_category="Health",
+                category_confidence={"Health": 90},
+                planned_actions=["label:Health"],
+            ),
+        ]
+        a = args(stage="archive", apply=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
+            gmail_sorter.apply_decisions(service, decisions, a, conn)
+            self.assertNotIn("Sorter/Health", service.labels)
+            self.assertFalse(any(call_name == "messages.batchModify" for call_name, _ in service.calls))
 
     def test_apply_trash_calls_trash(self):
         from tests.test_gmail_sorter import args
@@ -557,6 +626,10 @@ class ReportsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.json"
             gmail_sorter.write_json(path, decisions)
+            loaded = json.loads(path.read_text())
+            self.assertEqual(loaded[0]["body_text_excerpt"], "")
+            self.assertEqual(loaded[0]["detected_language"], "en")
+            gmail_sorter.write_json(path, decisions, include_body_excerpts=True)
             loaded = json.loads(path.read_text())
             self.assertEqual(loaded[0]["body_text_excerpt"], "excerpt text")
             self.assertEqual(loaded[0]["detected_language"], "en")

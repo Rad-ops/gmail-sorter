@@ -88,6 +88,7 @@ DEFAULT_TEST_ARGS: dict[str, Any] = {
     "refresh_existing": False,
     "refresh_after_days": 7,
     "save_every": 250,
+    "include_body_excerpts_in_reports": False,
     "apply": False,
     "http_timeout": 120.0,
     "workers": 8,

@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import gmail_sorter
+from tests.test_helpers import make_test_args
 from sorter import learned_weights
 
 
@@ -155,6 +156,14 @@ class TrainFromDecisionsTests(unittest.TestCase):
 
     def test_train_from_decisions_no_state(self):
         self.assertEqual(learned_weights.train_from_decisions(None), {})
+
+    def test_load_or_train_learned_weights_no_state_no_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = make_test_args(
+                use_learned_weights=True,
+                learned_weights_file=str(Path(tmp) / "missing.json"),
+            )
+            self.assertEqual(gmail_sorter.load_or_train_learned_weights(args, None), {})
 
     def test_train_from_decisions_undertrained(self):
         # Less than MIN_CONFIDENCE examples per category -> still

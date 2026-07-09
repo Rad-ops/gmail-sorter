@@ -12,11 +12,10 @@ v0.7.1 patch release:
    ``learned_weights_file``, and ``since_history_id``; v0.7.1
    adds them so v0.8 tests do not need to override every
    field on every call.
-3. The ``tracked()`` helper ensures every sqlite3 connection a
-   test opens is closed at teardown. Pre-v0.7.1 tests leaked
-   up to 6 connections per run, which surfaced as
-   ``ResourceWarning: unclosed database`` and failed CI when
-   ``-W error::ResourceWarning`` was set.
+3. The ``tracked()`` helper and state DB connection factory ensure sqlite3
+   connections are closed cleanly. Pre-v0.7.1 tests leaked up to 6
+   connections per run, which surfaced as ``ResourceWarning: unclosed
+   database`` and failed CI when ``-W error::ResourceWarning`` was set.
 4. The ``args()`` factory is the single source of truth — it
    delegates to ``tests.test_helpers.make_test_args`` so the
    default set can never drift between the factory and the
@@ -26,6 +25,7 @@ The four tests below are small, fast, and rely on no live
 Gmail state. They are the regression net for the v0.7.1 release.
 """
 
+import gc
 import unittest
 import warnings
 from pathlib import Path
@@ -134,6 +134,25 @@ class ResourceWarningRegressionTests(unittest.TestCase):
                 conn = tracked(self, gmail_sorter.open_state_db(Path(tmp) / "s.sqlite"))
                 # The connection is alive.
                 self.assertIsNotNone(conn)
+
+    def test_open_state_db_finalizer_closes_untracked_connection(self):
+        # Production code should still close explicitly, but the state DB
+        # connection must not emit late ResourceWarning noise if a helper drops
+        # a reference before cleanup.
+        import tempfile
+        from tests.test_gmail_sorter import gmail_sorter  # type: ignore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                conn = gmail_sorter.open_state_db(Path(tmp) / "s.sqlite")
+                conn.execute("SELECT 1").fetchone()
+                del conn
+                gc.collect()
+            self.assertEqual(
+                [w for w in caught if issubclass(w.category, ResourceWarning)],
+                [],
+            )
 
 
 if __name__ == "__main__":
